@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orbweaver architecture</title>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "neutral",
+      securityLevel: "strict",
+      flowchart: { htmlLabels: false, curve: "basis" }
+    });
+  </script>
+  <style>
+    :root {
+      --bg: #f6f4ef;
+      --panel: #fffcf7;
+      --ink: #1c1916;
+      --muted: #5c564e;
+      --line: #d9d2c6;
+      --accent: #3d5a45;
+      --accent-2: #8b4513;
+      --first: #e8f0ea;
+      --later: #f3ece4;
+      --code: #2b2926;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font: 16px/1.55 "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    a { color: var(--accent); }
+    code, pre { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86em; }
+    code { background: #efeae1; padding: 0.1em 0.35em; border-radius: 4px; }
+    pre {
+      background: var(--code);
+      color: #f3efe8;
+      padding: 1rem 1.1rem;
+      overflow-x: auto;
+      border-radius: 8px;
+      line-height: 1.4;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 16rem minmax(0, 52rem);
+      gap: 2rem;
+      max-width: 74rem;
+      margin: 0 auto;
+      padding: 2rem 1.25rem 4rem;
+    }
+    nav {
+      position: sticky;
+      top: 1rem;
+      align-self: start;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 1rem 0.9rem;
+    }
+    nav h2 { margin: 0 0 0.6rem; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-family: system-ui, sans-serif; }
+    nav a {
+      display: block;
+      text-decoration: none;
+      color: var(--ink);
+      font-family: system-ui, sans-serif;
+      font-size: 0.88rem;
+      padding: 0.28rem 0.2rem;
+      border-radius: 4px;
+    }
+    nav a:hover { background: var(--first); }
+    main h1 { font-size: 2.1rem; line-height: 1.2; margin: 0 0 0.4rem; }
+    .lede { color: var(--muted); margin: 0 0 1.5rem; }
+    .note {
+      background: var(--later);
+      border-left: 4px solid var(--accent-2);
+      padding: 0.8rem 1rem;
+      margin: 0 0 1.75rem;
+    }
+    h2 {
+      font-size: 1.45rem;
+      margin: 2.4rem 0 0.8rem;
+      padding-top: 0.4rem;
+      border-top: 1px solid var(--line);
+    }
+    h3 { font-size: 1.12rem; margin: 1.5rem 0 0.5rem; }
+    p, li { max-width: 46rem; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+      gap: 0.75rem;
+      margin: 1rem 0 1.5rem;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0.85rem 0.95rem;
+    }
+    .card dt { font-family: system-ui, sans-serif; font-size: 0.78rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--accent); margin: 0 0 0.35rem; }
+    .card dd { margin: 0; font-size: 0.95rem; }
+    .diagram {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.75rem;
+      margin: 1rem 0 1.5rem;
+      overflow-x: auto;
+    }
+    table { border-collapse: collapse; width: 100%; max-width: 46rem; background: var(--panel); }
+    th, td { border: 1px solid var(--line); padding: 0.45rem 0.65rem; text-align: left; vertical-align: top; font-size: 0.95rem; }
+    th { font-family: system-ui, sans-serif; font-size: 0.8rem; background: var(--first); }
+    .phases { list-style: none; padding: 0; margin: 1rem 0 2rem; }
+    .phases li {
+      max-width: none;
+      padding: 0.9rem 1rem;
+      margin: 0 0 0.55rem;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+    }
+    .phases .pass { background: var(--first); }
+    .phases .later { background: var(--later); }
+    .phases strong { display: block; font-family: system-ui, sans-serif; font-size: 0.82rem; letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 0.25rem; }
+    dl.api { max-width: 46rem; }
+    dl.api dt { font-family: ui-monospace, monospace; font-size: 0.9rem; margin-top: 0.7rem; }
+    dl.api dd { margin: 0.15rem 0 0 0; color: var(--muted); }
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+      nav { position: static; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <nav aria-label="On this page">
+      <h2>Contents</h2>
+      <a href="#decisions">Decisions</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#memory">Memory</a>
+      <a href="#loop">Agent loop</a>
+      <a href="#vscode">VS Code</a>
+      <a href="#telegram">Telegram and cron</a>
+      <a href="#portability">Portability</a>
+      <a href="#deploy">Deploy</a>
+      <a href="#provenance">Provenance</a>
+      <a href="#phases">Phases</a>
+    </nav>
+    <main>
+      <h1>Orbweaver architecture</h1>
+      <p class="lede">Living design document. Update this page as the implementation lands. First pass is phases 1–4 as one unit; phases 5–8 follow.</p>
+      <p class="note">Open this file in a browser (GitHub shows source, not a rendered page). Diagrams need a network connection for Mermaid from jsDelivr.</p>
+
+      <h2 id="decisions">Locked decisions</h2>
+      <div class="cards">
+        <div class="card"><dl><dt>Languages</dt><dd>Python 3.12 backend. TypeScript VS Code extension.</dd></dl></div>
+        <div class="card"><dl><dt>LLM</dt><dd>Anthropic Messages API. <code>ANTHROPIC_API_KEY</code> on the gateway only. Default Sonnet; Opus for hard planning; Haiku for cheap classify/summarize. Ollama later as an optional fallback.</dd></dl></div>
+        <div class="card"><dl><dt>Memory</dt><dd>One hybrid store: PostgreSQL 16 + pgvector. JSON-LD graph plus embedding chunks. Standardized Memory API in front of both.</dd></dl></div>
+        <div class="card"><dl><dt>Retention</dt><dd>Store decay off in the first pass (<code>λ = 0</code>). Forget is explicit only. Pinning is first-class with a 4k token cap. Automatic eviction is phase 6.</dd></dl></div>
+        <div class="card"><dl><dt>Workspaces</dt><dd>Same tools, different place. <code>LocalWorkspace</code> for VS Code (real files, inline diffs). <code>DockerWorkspace</code> for Telegram, cron, and untrusted sessions.</dd></dl></div>
+        <div class="card"><dl><dt>Process</dt><dd>Gateway and channel adapters are one FastAPI process. The agent never talks to Telegram or cron.</dd></dl></div>
+        <div class="card"><dl><dt>Auth</dt><dd>JWT for VS Code and web chat. Telegram: bot token + allowlisted user IDs; the adapter mints an internal JWT. Rate limits per identity.</dd></dl></div>
+        <div class="card"><dl><dt>Plan mode</dt><dd>Orbweaver plan mode must edit HTML and Markdown. HTML with diagrams is still an editable plan, not a one-way export.</dd></dl></div>
+        <div class="card"><dl><dt>Portability</dt><dd>UUID schema and remap-able <code>workspace_uri</code> in phase 1. Snapshot CLI and off-site backups in phase 6. Secrets never travel in the pack.</dd></dl></div>
+        <div class="card"><dl><dt>Provenance</dt><dd>Reuse OpenHands, Continue, Nanoclaw, and leak-port <em>patterns</em> (Clawd-Code, pycc, Claw Code). Track borrowed trees in <code>PROVENANCE.md</code>.</dd></dl></div>
+        <div class="card"><dl><dt>Deploy</dt><dd>Docker Compose on a work development server. Kubernetes deferred.</dd></dl></div>
+        <div class="card"><dl><dt>Agents</dt><dd>One main loop plus optional subagents. Shared context via the Memory API, not a MetaGPT-style company simulation.</dd></dl></div>
+      </div>
+
+      <h2 id="architecture">Target architecture</h2>
+      <p>VS Code and web chat speak Orbweaver’s JWT HTTP/WebSocket API. Telegram and cron speak foreign protocols; adapters translate them into the same normalized events. Both paths hit the session router.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart TB
+  subgraph clients [Clients]
+    VSCode["VS Code extension"]
+    WebChat["Web chat plus voice"]
+    Telegram["Telegram"]
+    Cron["Cron"]
+  end
+  subgraph host [Python host]
+    Gateway["FastAPI JWT HTTP and WebSocket"]
+    Channels["Channel adapters same process"]
+    Sessions["Session router"]
+    Agents["Agent loop and tools"]
+    MemoryAPI["Memory API"]
+    STT["faster-whisper"]
+  end
+  subgraph data [Shared memory]
+    PG["PostgreSQL plus pgvector"]
+    JSONLD["JSON-LD entities"]
+    Vec["Embedding chunks"]
+  end
+  subgraph exec [Workspaces]
+    LocalWS["LocalWorkspace"]
+    DockerWS["DockerWorkspace"]
+  end
+  LLM["Anthropic Claude API"]
+  VSCode --> Gateway
+  WebChat --> Gateway
+  Telegram --> Channels
+  Cron --> Channels
+  Gateway --> Sessions
+  Channels --> Sessions
+  Sessions --> Agents
+  Agents --> MemoryAPI
+  Agents --> LLM
+  Agents --> LocalWS
+  Agents --> DockerWS
+  MemoryAPI --> PG
+  PG --> JSONLD
+  PG --> Vec
+  STT --> Gateway
+        </pre>
+      </div>
+      <p>Nanoclaw lesson: channels never live inside the agent. OpenHands lesson: the event stream is source of truth for a session; memory is a separate durable layer.</p>
+
+      <h3>Message path</h3>
+      <div class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+  participant Client as "VS Code web or Telegram"
+  participant Host as "FastAPI host"
+  participant Agent as "Agent loop"
+  participant Mem as "Memory API"
+  participant LLM as "Anthropic"
+  participant WS as "Workspace"
+  Client->>Host: "Normalized user message"
+  Host->>Agent: "Append to session event stream"
+  Agent->>Mem: "Pinned working memory plus search"
+  Agent->>LLM: "tool_use loop"
+  LLM-->>Agent: "Tool call or stop"
+  Agent->>WS: "Read Write Bash ProposePatch"
+  WS-->>Agent: "Observation"
+  Agent-->>Host: "Stream events"
+  Host-->>Client: "Chat and diffs"
+        </pre>
+      </div>
+
+      <h3>Intended repository layout</h3>
+      <pre>orbweaver/
+  PROVENANCE.md
+  README.md
+  docs/architecture.html          # this document
+  docker-compose.yml
+  .github/workflows/ci.yml        # filled in phase 5
+  backend/
+    pyproject.toml
+    orbweaver/
+      api/          # FastAPI REST + WebSocket
+      auth/         # JWT, rate limit
+      channels/     # vscode, telegram, web, cron
+      agents/       # loop, tools, permissions, subagents
+      memory/       # JSON-LD graph + vector store
+      llm/          # Anthropic client + provider interface
+      workspace/    # local + docker
+      snapshot/     # export/import; CLI in phase 6
+      stt/          # faster-whisper
+      research/     # feature-watch agent (phase 7)
+      improve/      # self-improvement agent (phase 8)
+    tests/
+  vscode/
+  web/
+  deploy/compose/
+  deploy/k8s/                     # stubs until needed</pre>
+
+      <h2 id="memory">Shared memory</h2>
+      <p>Single Postgres database <code>orbweaver</code>. UUID primary keys only (no serials). Sessions and agents are JSON-LD with stable <code>@id</code>s such as <code>urn:orbweaver:session:&lt;uuid&gt;</code>.</p>
+      <table>
+        <thead><tr><th>Table</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><code>entities</code></td><td>JSON-LD documents; <code>pinned</code>. Types: Agent, Session, Task, Person, Project, Decision, Document.</td></tr>
+          <tr><td><code>triples</code></td><td>Graph edges <code>(subject, predicate, object, graph_id)</code>.</td></tr>
+          <tr><td><code>chunks</code></td><td>Text + embedding + <code>pinned</code>; <code>decay_score</code> unused until phase 6.</td></tr>
+          <tr><td><code>events</code></td><td>Append-only session event log.</td></tr>
+          <tr><td><code>jobs</code></td><td>Cron / background work.</td></tr>
+          <tr><td><code>instance_meta</code></td><td>Embedding model, dim, schema version, instance id.</td></tr>
+        </tbody>
+      </table>
+      <p><code>workspace_uri</code> is remap-able: git remote+ref, relative <code>file:./proj</code>, or a named mount. Absolute laptop paths are forbidden in stored data.</p>
+      <h3>Memory API</h3>
+      <dl class="api">
+        <dt>PUT /memory/entities</dt><dd>Upsert JSON-LD.</dd>
+        <dt>GET /memory/graph?id=&amp;depth=</dt><dd>Neighborhood walk.</dd>
+        <dt>POST /memory/search</dt><dd>Hybrid vector kNN plus optional graph expand. Pass <code>session_id</code>; rewrite the query from the last N turns plus the current user text.</dd>
+        <dt>POST /memory/remember</dt><dd>Text in, embed, optional entity links.</dd>
+        <dt>POST /memory/pin</dt><dd>Always-injected working memory.</dd>
+        <dt>POST /memory/forget</dt><dd>Explicit tombstone only. No timer in the first pass.</dd>
+      </dl>
+      <p>Embeddings: local <code>sentence-transformers</code>. Anthropic has no first-party embeddings API.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart LR
+  Search["POST memory search"] --> Vec["kNN on chunks"]
+  Search --> Graph["Optional graph expand"]
+  Vec --> Hits["Chunk hits"]
+  Graph --> Hits
+  Hits --> Recall["MemoryRecall event"]
+  Pin["Pinned entities and chunks"] --> Sys["System prompt"]
+  Recall --> Stream["Event stream"]
+        </pre>
+      </div>
+
+      <h3>Context across turns</h3>
+      <p>The conversation is the event stream (user, assistant, tools, <code>MemoryRecall</code>). Do not RAG from a blank slate each turn. Pins are a hard tax; the transcript is elastic; compaction is the valve. Compaction shrinks the <em>prompt</em>, not the database.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart LR
+  subgraph everyTurn [Every turn prompt]
+    Pinned["Pinned working memory"]
+    Recent["Recent event stream"]
+  end
+  User["Current user message"] --> Rewrite["Query rewrite last N turns"]
+  Rewrite --> Search["Memory search"]
+  Search --> Recall["MemoryRecall event"]
+  Recall --> Recent
+  Pinned --> Prompt["Model prompt"]
+  Recent --> Prompt
+        </pre>
+      </div>
+      <table>
+        <thead><tr><th>Bucket</th><th>v1 budget (Sonnet 200k)</th></tr></thead>
+        <tbody>
+          <tr><td>Output reserve</td><td>16,000 tokens</td></tr>
+          <tr><td>System + tool schemas</td><td>Measured, not a user budget (~12k typical)</td></tr>
+          <tr><td>Pinned working memory</td><td><strong>4,000 hard cap</strong> (<code>ORBWEAVER_PINNED_TOKEN_CAP</code>). Overflowing a pin is rejected.</td></tr>
+          <tr><td>Event stream</td><td>The rest (~168k). Compact at ~85% full.</td></tr>
+        </tbody>
+      </table>
+      <p>New recalls land in the event stream. Dedupe by chunk id against the uncompacted window.</p>
+
+      <h2 id="loop">Agent loop</h2>
+      <p>Wrap an existing Python harness (first choice: OpenHands Software Agent SDK). Shape it with Claude Code leak-port patterns: query/tool loop, deferred tools, permission modes, compaction, skills, MCP, plan mode, subagent spawn, session resume. Orbweaver-specific code is memory, channels, JWT, and session routing.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart TD
+  Build["Build prompt: system plus pins plus events"] --> Call["Claude tool_use"]
+  Call --> Gate{"Permission gate?"}
+  Gate -->|block| Ask["AskUser or wait"]
+  Gate -->|allow| Exec["Run tool in workspace"]
+  Exec --> Append["Append action and observation"]
+  Append --> More{"Model stop?"}
+  More -->|no| Call
+  More -->|yes| Done["Turn complete"]
+  Append --> Pressure{"Event budget about 85 percent?"}
+  Pressure -->|yes| Compact["Compact prompt; keep pins and recent raw"]
+  Compact --> Call
+        </pre>
+      </div>
+      <p>v1 tools: Read, Write, ProposePatch, Glob, Grep, Bash, WebFetch, MemorySearch, MemoryRemember, MemoryPin, MemoryForget, SpawnSubagent, AskUser.</p>
+      <p>VS Code can auto-approve reads; patches wait for accept/reject. Telegram defaults to DockerWorkspace and stricter bash.</p>
+      <p>Interfaces in phase 2: REST + WebSocket <code>/v1/sessions/{id}/events</code>, minimal <code>web/</code> chat, <code>POST /v1/stt</code> (faster-whisper).</p>
+
+      <h2 id="vscode">VS Code extension</h2>
+      <p>Fork or vendor Continue’s vertical diff manager and chat webview. Wire to Orbweaver’s session protocol.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart LR
+  Patch["ProposePatch"] --> Inline["Inline red and green diffs"]
+  Inline --> Choice{"Accept Reject or Edit"}
+  Choice -->|Accept| Keep["Keep green lines"]
+  Choice -->|Reject| Undo["Revert block"]
+  Choice -->|Edit| Tweak["User edits in place"]
+  Undo --> Corr["UserCorrection event"]
+  Tweak --> Corr
+  Corr --> Loop["Agent retries"]
+        </pre>
+      </div>
+      <ul>
+        <li>Sidebar webview chat (same protocol as <code>web/</code>).</li>
+        <li>Session start sends a portable workspace URI, never an absolute path.</li>
+        <li>Auth: stored JWT to the work-server gateway. After migrate, update the gateway URL.</li>
+        <li>Plan mode: open and iterate <code>.md</code> and <code>.html</code>.</li>
+      </ul>
+
+      <h2 id="telegram">Telegram and cron</h2>
+      <p>python-telegram-bot; allowlisted user IDs; voice notes go through STT. Cron: APScheduler or a <code>jobs</code> table polled by the host. Due jobs enqueue a synthetic user message. The host owns waking; agents only request <code>schedule_task</code> as a system action.</p>
+
+      <h2 id="portability">Instance portability</h2>
+      <p>Move memory and agents from a laptop to a server (or back) without rewriting IDs. Restore from backup is the same operation as migrate. Schema is phase 1; CLI is phase 6.</p>
+      <table>
+        <thead><tr><th>Moves</th><th>Does not move</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>entities, triples, chunks+vectors, events, jobs, agent definitions, sessions (same UUIDs), plan files, non-secret channel bindings, workspace locators</td>
+            <td><code>ANTHROPIC_API_KEY</code>, JWT signing keys, Telegram bot tokens, host paths, TLS, Compose <code>.env</code>, target Postgres password</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>Pack format: directory or <code>.orb</code> (tar+zstd). Logical JSONL dump, not <code>pg_dump</code>, so import can remap <code>workspace_uri</code> and skip secrets.</p>
+      <pre>manifest.json
+memory/entities.jsonld
+memory/triples.jsonl
+memory/chunks.jsonl
+memory/events.jsonl
+memory/jobs.jsonl
+memory/instance_meta.json
+agents/
+plans/
+workspace/remotes.json
+workspace/files/
+channels/bindings.json</pre>
+      <div class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+  participant Laptop as "Laptop instance"
+  participant Pack as "Snapshot pack"
+  participant Server as "Server instance"
+  participant Clients as "VS Code Telegram web"
+  Laptop->>Laptop: "Pause drain in-flight tool calls"
+  Laptop->>Pack: "orbweaver snapshot export"
+  Pack->>Server: "Copy .orb pack"
+  Server->>Server: "Supply secrets on the new host"
+  Server->>Server: "orbweaver snapshot import --workspace-map"
+  Server->>Server: "Resume sessions same UUIDs"
+  Clients->>Server: "Retarget gateway URL"
+        </pre>
+      </div>
+
+      <h2 id="deploy">Deployment</h2>
+      <p>First pass Compose: <code>gateway</code>, <code>postgres</code>, <code>whisper</code> (or in-process). Key from host env, never baked into the image. Bind-mount the developer workspace for LocalWorkspace; sessions still store only remap-able URIs.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart LR
+  Ext["VS Code and web"] --> Gw["gateway FastAPI"]
+  Gw --> PG["postgres"]
+  Gw --> Wh["whisper"]
+  Gw --> Files["Workspace bind mount"]
+  Gw --> Anth["Anthropic API"]
+        </pre>
+      </div>
+      <p>Phase 6 adds a <code>backup</code> service: <code>orbweaver snapshot export</code> plus rclone to B2/S3. Kubernetes is not in the first pass; <code>deploy/k8s/</code> can stay stubs.</p>
+
+      <h2 id="provenance">Provenance and later rewrite</h2>
+      <p>v1 goal is a working agent, not a clean IP surface. Prefer permissive upstreams. Copyleft or proprietary adapters are allowed if they unblock shipping; mark them <code>rewrite-if-needed</code> in <code>PROVENANCE.md</code>. A later rewrite pass replaces encumbered modules behind the same Memory API and session protocol.</p>
+
+      <h2 id="phases">Implementation phases</h2>
+      <p>Scaffold (monorepo, Compose Postgres, Anthropic ping, <code>PROVENANCE.md</code>, empty <code>snapshot/</code> package, local pytest smoke) happens at the start of the first pass.</p>
+      <ol class="phases">
+        <li class="pass"><strong>Phase 1 — Memory + API</strong> UUID PKs, JSON-LD, <code>workspace_uri</code>, Memory API, JWT, event log. Schema is snapshot-ready; no export CLI yet.</li>
+        <li class="pass"><strong>Phase 2 — Agents + chat</strong> OpenHands wrap, leak-port loop, 85% prompt compaction, LocalWorkspace, web chat, STT.</li>
+        <li class="pass"><strong>Phase 3 — VS Code</strong> Continue diffs, HTML+Markdown plan mode, workspace URI at session start.</li>
+        <li class="pass"><strong>Phase 4 — Telegram + cron</strong> In-process adapters, DockerWorkspace for untrusted sessions. End of first pass.</li>
+        <li class="later"><strong>Phase 5 — CI only</strong> GitHub Actions: ruff, mypy, pytest, compose integration, Playwright, vscode-test. Not memory workers. Not research agents.</li>
+        <li class="later"><strong>Phase 6 — Advanced memory and backups</strong> Optional store decay, snapshot export/import, off-site <code>.orb</code> packs. Restore = migrate.</li>
+        <li class="later"><strong>Phase 7 — Feature research agent</strong> Watch other harnesses, draft PRs, never auto-merge.</li>
+        <li class="later"><strong>Phase 8 — Performance-improvement agent</strong> Read Orbweaver traces, draft harness PRs, never auto-merge.</li>
+      </ol>
+    </main>
+  </div>
+</body>
+</html>
