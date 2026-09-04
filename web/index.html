@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orbweaver</title>
+  <style>
+    :root { --bg:#111; --panel:#1c1c1c; --ink:#eee; --accent:#7d9b84; --muted:#888; }
+    * { box-sizing: border-box; }
+    body { margin:0; font: 15px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+    header { padding: 0.8rem 1rem; border-bottom:1px solid #333; display:flex; gap:1rem; align-items:center; }
+    header h1 { font-size:1rem; margin:0; }
+    main { display:grid; grid-template-columns: 16rem 1fr; min-height: calc(100vh - 3rem); }
+    aside { border-right:1px solid #333; padding:1rem; }
+    aside label { display:block; font-size:0.75rem; color:var(--muted); margin-top:0.6rem; }
+    input, textarea, button { width:100%; margin-top:0.25rem; background:#2a2a2a; color:var(--ink); border:1px solid #444; border-radius:6px; padding:0.45rem 0.5rem; }
+    button { background:var(--accent); color:#111; font-weight:600; cursor:pointer; }
+    #log { padding:1rem; overflow-y:auto; max-height: calc(100vh - 8rem); }
+    .msg { margin:0.5rem 0; padding:0.6rem 0.7rem; border-radius:8px; background:var(--panel); white-space:pre-wrap; }
+    .msg.user { border-left: 3px solid var(--accent); }
+    .msg.assistant { border-left: 3px solid #c4a574; }
+    .msg.tool { border-left: 3px solid #888; color:#bbb; font-size:0.85rem; }
+    #composer { display:flex; gap:0.5rem; padding:0.75rem 1rem; border-top:1px solid #333; }
+    #composer textarea { flex:1; width:auto; min-height:3rem; }
+    #composer button { width:auto; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Orbweaver</h1>
+    <span id="status">disconnected</span>
+  </header>
+  <main>
+    <aside>
+      <label>Gateway</label>
+      <input id="base" value="">
+      <label>JWT</label>
+      <input id="token" placeholder="paste or mint">
+      <button id="mint">Mint local token</button>
+      <label>Workspace URI</label>
+      <input id="wuri" value="workspace:default">
+      <label>Workspace kind</label>
+      <input id="wkind" value="local">
+      <button id="newsession">New session</button>
+      <label>Session id</label>
+      <input id="sid">
+      <button id="mic">Record 4s for STT</button>
+    </aside>
+    <section>
+      <div id="log"></div>
+      <div id="composer">
+        <textarea id="text" placeholder="Message"></textarea>
+        <button id="send">Send</button>
+      </div>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    $("base").value = location.origin;
+    function add(kind, text) {
+      const d = document.createElement("div");
+      d.className = "msg " + kind;
+      d.textContent = kind + ": " + text;
+      $("log").appendChild(d);
+      $("log").scrollTop = $("log").scrollHeight;
+    }
+    async function api(path, opts={}) {
+      const headers = Object.assign({"content-type":"application/json"}, opts.headers||{});
+      const tok = $("token").value.trim();
+      if (tok) headers.authorization = "Bearer " + tok;
+      const res = await fetch($("base").value + path, Object.assign({}, opts, { headers }));
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+    $("mint").onclick = async () => {
+      try {
+        const r = await api("/v1/auth/token", { method:"POST", body: JSON.stringify({ sub:"web" }) });
+        $("token").value = r.token;
+        $("status").textContent = "token minted";
+      } catch (e) { $("status").textContent = String(e); }
+    };
+    $("newsession").onclick = async () => {
+      try {
+        const r = await api("/v1/sessions", { method:"POST", body: JSON.stringify({
+          workspace_uri: $("wuri").value, workspace_kind: $("wkind").value, title: "web"
+        })});
+        $("sid").value = r.id;
+        $("status").textContent = "session " + r.id;
+      } catch (e) { $("status").textContent = String(e); }
+    };
+    $("send").onclick = async () => {
+      const text = $("text").value.trim();
+      if (!text) return;
+      if (!$("sid").value) { add("tool", "create a session first"); return; }
+      add("user", text);
+      $("text").value = "";
+      try {
+        const r = await api("/v1/sessions/" + $("sid").value + "/turns", {
+          method:"POST", body: JSON.stringify({ text })
+        });
+        for (const ev of r.events) {
+          if (ev.kind === "assistant") add("assistant", ev.payload.text || "");
+          else add("tool", ev.kind + " " + JSON.stringify(ev.payload).slice(0,400));
+        }
+      } catch (e) { add("tool", String(e)); }
+    };
+    $("mic").onclick = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const rec = new MediaRecorder(stream);
+      const chunks = [];
+      rec.ondataavailable = (e) => chunks.push(e.data);
+      rec.start();
+      $("status").textContent = "recording…";
+      await new Promise((r) => setTimeout(r, 4000));
+      rec.stop();
+      await new Promise((r) => rec.onstop = r);
+      stream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+      const fd = new FormData();
+      fd.append("file", blob, "clip.webm");
+      const tok = $("token").value.trim();
+      const res = await fetch($("base").value + "/v1/stt", {
+        method: "POST",
+        headers: tok ? { authorization: "Bearer " + tok } : {},
+        body: fd
+      });
+      const data = await res.json();
+      if (data.text) { $("text").value = data.text; $("status").textContent = "transcribed"; }
+      else { $("status").textContent = JSON.stringify(data); }
+    };
+  </script>
+</body>
+</html>

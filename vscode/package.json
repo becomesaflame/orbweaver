@@ -1,0 +1,50 @@
+{
+  "name": "orbweaver",
+  "displayName": "Orbweaver",
+  "description": "Orbweaver coding agent: chat, inline diffs, HTML+Markdown plan mode",
+  "version": "0.1.0",
+  "publisher": "orbweaver",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "orbweaver.openChat", "title": "Orbweaver: Open Chat" },
+      { "command": "orbweaver.acceptDiff", "title": "Orbweaver: Accept Diff" },
+      { "command": "orbweaver.rejectDiff", "title": "Orbweaver: Reject Diff" },
+      { "command": "orbweaver.openPlan", "title": "Orbweaver: Open Plan (Markdown or HTML)" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "orbweaver", "title": "Orbweaver", "icon": "$(comment-discussion)" }
+      ]
+    },
+    "views": {
+      "orbweaver": [
+        { "type": "webview", "id": "orbweaver.chat", "name": "Chat" }
+      ]
+    },
+    "configuration": {
+      "title": "Orbweaver",
+      "properties": {
+        "orbweaver.gatewayUrl": { "type": "string", "default": "http://127.0.0.1:8080" },
+        "orbweaver.token": { "type": "string", "default": "" },
+        "orbweaver.workspaceUri": {
+          "type": "string",
+          "default": "workspace:default",
+          "description": "Portable workspace locator sent at session start (file:./rel, workspace:name, or git+https://…)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

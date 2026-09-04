@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: orbweaver
+      POSTGRES_PASSWORD: orbweaver
+      POSTGRES_DB: orbweaver
+    ports:
+      - "5432:5432"
+    volumes:
+      - orbweaver-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbweaver"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  gateway:
+    build:
+      context: .
+      dockerfile: deploy/compose/Dockerfile
+    environment:
+      ORBWEAVER_STORE: postgres
+      DATABASE_URL: postgresql://orbweaver:orbweaver@postgres:5432/orbweaver
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ORBWEAVER_JWT_SECRET: ${ORBWEAVER_JWT_SECRET:-dev-secret-change-me}
+      WORKSPACE_ROOT: /workspace
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWLIST: ${TELEGRAM_ALLOWLIST:-}
+    volumes:
+      - ${WORKSPACE_BIND:-.}:/workspace
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  orbweaver-pg:
