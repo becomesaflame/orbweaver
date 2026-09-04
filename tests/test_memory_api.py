@@ -12,7 +12,7 @@ def _store():
 
 @pytest.mark.asyncio
 async def test_memory_remember_search_pin_forget():
-        transport = ASGITransport(app=app, lifespan="off")
+    transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         tok = (await client.post("/v1/auth/token", json={"sub": "t"})).json()["token"]
         headers = {"authorization": f"Bearer {tok}"}
@@ -47,7 +47,7 @@ async def test_memory_remember_search_pin_forget():
 
 @pytest.mark.asyncio
 async def test_entity_graph_from_jsonld():
-        transport = ASGITransport(app=app, lifespan="off")
+    transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         tok = (await client.post("/v1/auth/token", json={"sub": "t"})).json()["token"]
         headers = {"authorization": f"Bearer {tok}"}
@@ -64,7 +64,11 @@ async def test_entity_graph_from_jsonld():
             headers=headers,
         )
         assert r.status_code == 200, r.text
-        graph = await client.get("/memory/graph", params={"id": "urn:orbweaver:entity:decision-1"}, headers=headers)
+        graph = await client.get(
+            "/memory/graph",
+            params={"id": "urn:orbweaver:entity:decision-1"},
+            headers=headers,
+        )
         assert graph.status_code == 200
         triples = graph.json()["triples"]
         assert any(t["o"] == project and t["p"] == "about" for t in triples)
@@ -72,7 +76,7 @@ async def test_entity_graph_from_jsonld():
 
 @pytest.mark.asyncio
 async def test_memory_requires_jwt():
-        transport = ASGITransport(app=app, lifespan="off")
+    transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         r = await client.post("/memory/search", json={"query": "x"})
         assert r.status_code == 401

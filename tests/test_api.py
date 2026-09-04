@@ -1,4 +1,3 @@
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -22,7 +21,7 @@ async def test_session_and_turn_without_anthropic(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
     monkeypatch.setattr(settings, "anthropic_api_key", "")
     (tmp_path / "hello.txt").write_text("hi", encoding="utf-8")
-    transport = ASGITransport(app=app, lifespan="off")
+    transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         tok = (await client.post("/v1/auth/token", json={"sub": "t"})).json()["token"]
         headers = {"authorization": f"Bearer {tok}"}
@@ -45,7 +44,7 @@ async def test_session_and_turn_without_anthropic(tmp_path: Path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rejects_absolute_workspace_uri():
-    transport = ASGITransport(app=app, lifespan="off")
+    transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         tok = (await client.post("/v1/auth/token", json={"sub": "t"})).json()["token"]
         r = await client.post(
