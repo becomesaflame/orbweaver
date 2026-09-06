@@ -110,6 +110,7 @@ class Store(Protocol):
     async def append_event(self, session_id: uuid.UUID, kind: str, payload: dict[str, Any]) -> Event: ...
     async def list_events(self, session_id: uuid.UUID) -> list[Event]: ...
     async def replace_events(self, session_id: uuid.UUID, events: list[Event]) -> None: ...
+    async def truncate_events(self, session_id: uuid.UUID, from_seq: int) -> None: ...
     async def put_job(self, job: Job) -> Job: ...
     async def due_jobs(self, now: datetime) -> list[Job]: ...
     async def reschedule_job(self, job: Job) -> None: ...
@@ -235,6 +236,10 @@ class MemoryStore:
     async def replace_events(self, session_id: uuid.UUID, events: list[Event]) -> None:
         self.events[session_id] = list(events)
 
+    async def truncate_events(self, session_id: uuid.UUID, from_seq: int) -> None:
+        evs = self.events.get(session_id, [])
+        self.events[session_id] = [e for e in evs if e.seq < from_seq]
+
     async def put_job(self, job: Job) -> Job:
         self.jobs[job.id] = job
         return job
@@ -301,4 +306,7 @@ def get_store() -> Store:
 def reset_store_for_tests() -> MemoryStore:
     global _STORE
     _STORE = MemoryStore()
+    from orbweaver.compact import reset_compact_state
+
+    reset_compact_state()
     return _STORE

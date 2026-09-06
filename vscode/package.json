@@ -29,7 +29,7 @@
       "title": "Orbweaver",
       "properties": {
         "orbweaver.gatewayUrl": { "type": "string", "default": "http://127.0.0.1:8080" },
-        "orbweaver.token": { "type": "string", "default": "" },
+        "orbweaver.token": { "type": "string", "default": "", "description": "JWT from `python -m orbweaver.cli mint` on the gateway host." },
         "orbweaver.workspaceUri": {
           "type": "string",
           "default": "workspace:default",

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
+from orbweaver.config import settings
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
 
 
@@ -45,7 +45,7 @@ class LocalWorkspace:
                         return hits
         return hits
 
-    def bash(self, command: str, timeout: int = 30) -> str:
+    def _raw_bash(self, command: str, timeout: int) -> str:
         proc = subprocess.run(
             command,
             shell=True,
@@ -53,9 +53,29 @@ class LocalWorkspace:
             capture_output=True,
             text=True,
             timeout=timeout,
+            check=False,
         )
-        out = (proc.stdout or "") + (proc.stderr or "")
-        return out[-8000:]
+        return ((proc.stdout or "") + (proc.stderr or ""))[-200_000:]
+
+    def bash(
+        self,
+        command: str,
+        timeout: int = 30,
+        sandbox: bool = True,
+        unsandboxed: bool = False,
+    ) -> str:
+        if unsandboxed or not sandbox or not settings.orbweaver_sandbox:
+            return self._raw_bash(command, timeout)
+        from orbweaver.sandbox.bwrap import SandboxUnavailable, is_containerized, run_sandboxed
+
+        if is_containerized():
+            return self._raw_bash(command, timeout)
+        try:
+            return run_sandboxed(command, self.root, timeout)
+        except SandboxUnavailable as e:
+            if settings.orbweaver_sandbox_fail_if_unavailable:
+                return f"sandbox_unavailable: {e}"
+            return self._raw_bash(command, timeout)
 
     def propose_patch(self, path: str, old: str, new: str) -> dict:
         current = self.read(path) if self._safe(path).exists() else ""
@@ -87,7 +107,14 @@ class DockerWorkspace:
     def propose_patch(self, path: str, old: str, new: str) -> dict:
         return self.local.propose_patch(path, old, new)
 
-    def bash(self, command: str, timeout: int = 30) -> str:
+    def bash(
+        self,
+        command: str,
+        timeout: int = 30,
+        sandbox: bool = True,
+        unsandboxed: bool = False,
+    ) -> str:
+        del sandbox, unsandboxed
         root = str(self.local.root)
         try:
             proc = subprocess.run(
@@ -107,10 +134,11 @@ class DockerWorkspace:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                check=False,
             )
         except FileNotFoundError:
             return "docker is not available on this host; bash refused for DockerWorkspace"
-        return ((proc.stdout or "") + (proc.stderr or ""))[-8000:]
+        return ((proc.stdout or "") + (proc.stderr or ""))[-200_000:]
 
 
 def make_workspace(kind: str, uri: str, workspace_root: str):

@@ -5,6 +5,7 @@ import json
 import os
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import time
@@ -17,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from orbweaver.agent import agent_turn
+from orbweaver.agent import TurnCancelled, agent_turn
 from orbweaver.auth import mint_token, require_user
 from orbweaver.config import settings
 from orbweaver.memory import remember, rewrite_search_query
@@ -30,6 +31,7 @@ from orbweaver.store import (
     new_uuid,
     session_at_id,
 )
+from orbweaver.subagent import is_subagent_session
 from orbweaver.uris import WorkspaceURIError, validate_workspace_uri
 from orbweaver.workspace import make_workspace
 
@@ -127,11 +129,23 @@ class ForgetBody(BaseModel):
 class SessionBody(BaseModel):
     workspace_uri: str
     workspace_kind: str = "local"
-    title: str = "session"
+    title: str = "New chat"
+
+
+class SessionPatch(BaseModel):
+    title: str | None = None
 
 
 class TurnBody(BaseModel):
     text: str
+
+
+class CancelTurnBody(BaseModel):
+    discard: bool = False
+
+
+class RewindBody(BaseModel):
+    from_seq: int
 
 
 class JobBody(BaseModel):
@@ -151,13 +165,93 @@ def _user(request: Request) -> dict:
     return require_user(request)
 
 
+@dataclass
+class RunningTurn:
+    cancel: asyncio.Event
+    inject: asyncio.Event = field(default_factory=asyncio.Event)
+    discard: bool = False
+    user_seq: int = 0
+
+
+_running_turns: dict[UUID, RunningTurn] = {}
+_GENERIC_TITLES = {"", "web", "session", "New chat"}
+
+
+def _event_dict(e) -> dict[str, Any]:
+    return {"id": str(e.id), "seq": e.seq, "kind": e.kind, "payload": e.payload}
+
+
+async def _revert_autotitle_if_needed(store, sess: Entity, discarded_text: str) -> None:
+    preview = discarded_text.strip().split("\n", 1)[0][:80]
+    title = str(sess.jsonld.get("title") or "").strip()
+    if title != preview:
+        return
+    events = await store.list_events(sess.id)
+    first = next((e for e in events if e.kind == "user"), None)
+    if first:
+        line = str(first.payload.get("text") or "").strip().split("\n", 1)[0][:80]
+        sess.jsonld["title"] = line or "New chat"
+    else:
+        sess.jsonld["title"] = "New chat"
+    await store.put_entity(sess)
+
+
+async def _finish_cancelled_turn(
+    store, sess: Entity, state: RunningTurn, produced: list, user_text: str
+) -> dict[str, Any]:
+    if state.discard:
+        if state.user_seq:
+            await store.truncate_events(sess.id, state.user_seq)
+            await _revert_autotitle_if_needed(store, sess, user_text)
+        return {"events": [], "status": "discarded", "user_seq": state.user_seq}
+    marker = await store.append_event(sess.id, "turn_interrupted", {"reason": "stop"})
+    produced = list(produced) + [marker]
+    return {
+        "events": [_event_dict(e) for e in produced],
+        "status": "stopped",
+        "user_seq": state.user_seq,
+    }
+
+
+
+def _preview_text(events: list) -> str:
+    for ev in events:
+        if ev.kind == "user":
+            return str(ev.payload.get("text") or "").strip()
+    return ""
+
+
+def _display_title(jsonld: dict[str, Any], preview: str = "") -> str:
+    title = str(jsonld.get("title") or "").strip()
+    if title in _GENERIC_TITLES:
+        line = (preview or "").split("\n", 1)[0].strip()
+        return line[:80] or "New chat"
+    return title or "New chat"
+
+
+async def _maybe_autotitle(store, sess: Entity, user_text: str) -> None:
+    title = str(sess.jsonld.get("title") or "").strip()
+    if title not in _GENERIC_TITLES:
+        return
+    line = user_text.strip().split("\n", 1)[0][:80]
+    if not line:
+        return
+    sess.jsonld["title"] = line
+    await store.put_entity(sess)
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/auth/token")
+@app.post("/v1/auth/token", include_in_schema=settings.orbweaver_allow_http_mint)
 async def token(body: LoginBody) -> dict[str, str]:
+    if not settings.orbweaver_allow_http_mint:
+        raise HTTPException(
+            status_code=404,
+            detail="HTTP mint is disabled; run `python -m orbweaver.cli mint` on the gateway host",
+        )
     return {"token": mint_token(body.sub)}
 
 
@@ -268,12 +362,53 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
             "@type": SESSION_TYPE,
             "workspace_uri": uri,
             "workspace_kind": body.workspace_kind,
-            "title": body.title,
+            "title": body.title or "New chat",
             "status": "active",
+            "created_at": datetime.now(UTC).isoformat(),
         },
     )
     await get_store().put_entity(ent)
-    return {"id": str(uid), "at_id": ent.at_id, "workspace_uri": uri}
+    return {"id": str(uid), "at_id": ent.at_id, "workspace_uri": uri, "title": ent.jsonld["title"]}
+
+
+@app.get("/v1/sessions")
+async def list_sessions(_u: dict = Depends(_user)) -> dict[str, Any]:
+    store = get_store()
+    out: list[dict[str, Any]] = []
+    for ent in await store.list_entities(SESSION_TYPE):
+        if is_subagent_session(ent):
+            continue
+        events = await store.list_events(ent.id)
+        preview = _preview_text(events)
+        last_at = events[-1].created_at.isoformat() if events else str(ent.jsonld.get("created_at") or "")
+        out.append(
+            {
+                "id": str(ent.id),
+                "title": _display_title(ent.jsonld, preview),
+                "workspace_uri": str(ent.jsonld.get("workspace_uri") or "workspace:default"),
+                "workspace_kind": str(ent.jsonld.get("workspace_kind") or "local"),
+                "status": str(ent.jsonld.get("status") or "active"),
+                "created_at": str(ent.jsonld.get("created_at") or ""),
+                "last_event_at": last_at,
+                "event_count": len(events),
+                "preview": preview[:80],
+            }
+        )
+    out.sort(key=lambda s: s["last_event_at"] or s["created_at"] or "", reverse=True)
+    return {"sessions": out}
+
+
+@app.patch("/v1/sessions/{session_id}")
+async def patch_session(session_id: UUID, body: SessionPatch, _u: dict = Depends(_user)) -> dict[str, Any]:
+    store = get_store()
+    sess = await store.get_entity(session_id)
+    if not sess or sess.at_type != SESSION_TYPE:
+        raise HTTPException(404, "session not found")
+    if body.title is not None:
+        title = body.title.strip()[:80] or "New chat"
+        sess.jsonld["title"] = title
+        await store.put_entity(sess)
+    return {"id": str(sess.id), "title": _display_title(sess.jsonld)}
 
 
 @app.get("/v1/sessions/{session_id}/events")
@@ -292,21 +427,119 @@ async def list_events(session_id: UUID, _u: dict = Depends(_user)) -> dict[str, 
     }
 
 
+async def _run_turn(
+    store, sess, session_id: UUID, user_text: str, *, resume: bool = False
+) -> dict[str, Any]:
+    if session_id in _running_turns:
+        raise HTTPException(409, "turn already running")
+    if not resume:
+        await _maybe_autotitle(store, sess, user_text)
+    kind = str(sess.jsonld.get("workspace_kind") or "local")
+    uri = str(sess.jsonld.get("workspace_uri"))
+    ws = make_workspace(kind, uri, settings.workspace_root)
+    state = RunningTurn(cancel=asyncio.Event())
+    _running_turns[session_id] = state
+    try:
+        events = await agent_turn(
+            store,
+            session_id,
+            user_text,
+            ws,
+            workspace_kind=kind,
+            cancel=state.cancel,
+            turn_state=state,
+            resume=resume,
+        )
+        if state.cancel.is_set():
+            return await _finish_cancelled_turn(store, sess, state, events, user_text)
+        return {
+            "events": [_event_dict(e) for e in events],
+            "status": "ok",
+            "user_seq": state.user_seq,
+        }
+    except TurnCancelled as e:
+        return await _finish_cancelled_turn(store, sess, state, e.produced, user_text)
+    except Exception as e:
+        import anthropic
+
+        if isinstance(e, anthropic.APIStatusError):
+            raise HTTPException(status_code=502, detail=e.message) from e
+        raise
+    finally:
+        current = _running_turns.get(session_id)
+        if current is state:
+            _running_turns.pop(session_id, None)
+
+
 @app.post("/v1/sessions/{session_id}/turns")
 async def turn(session_id: UUID, body: TurnBody, _u: dict = Depends(_user)) -> dict[str, Any]:
     store = get_store()
     sess = await store.get_entity(session_id)
     if not sess:
         raise HTTPException(404, "session not found")
-    kind = str(sess.jsonld.get("workspace_kind") or "local")
-    uri = str(sess.jsonld.get("workspace_uri"))
-    ws = make_workspace(kind, uri, settings.workspace_root)
-    events = await agent_turn(store, session_id, body.text, ws, workspace_kind=kind)
-    return {
-        "events": [
-            {"id": str(e.id), "kind": e.kind, "payload": e.payload} for e in events
-        ]
-    }
+    return await _run_turn(store, sess, session_id, body.text)
+
+
+@app.post("/v1/sessions/{session_id}/turns/inject")
+async def inject_turn(
+    session_id: UUID, body: TurnBody, _u: dict = Depends(_user)
+) -> dict[str, Any]:
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(400, "text is required")
+    state = _running_turns.get(session_id)
+    if not state:
+        raise HTTPException(409, "no turn is running")
+    store = get_store()
+    ev = await store.append_event(session_id, "user", {"text": text, "injected": True})
+    state.inject.set()
+    return {"status": "injected", "seq": ev.seq, "event": _event_dict(ev)}
+
+
+@app.post("/v1/sessions/{session_id}/turns/continue")
+async def continue_turn(session_id: UUID, _u: dict = Depends(_user)) -> dict[str, Any]:
+    store = get_store()
+    sess = await store.get_entity(session_id)
+    if not sess:
+        raise HTTPException(404, "session not found")
+    events = await store.list_events(session_id)
+    if not events:
+        raise HTTPException(400, "nothing to continue")
+    return await _run_turn(store, sess, session_id, "", resume=True)
+
+
+@app.post("/v1/sessions/{session_id}/turns/cancel")
+async def cancel_turn(
+    session_id: UUID, body: CancelTurnBody, _u: dict = Depends(_user)
+) -> dict[str, Any]:
+    state = _running_turns.get(session_id)
+    if not state:
+        return {"status": "idle"}
+    state.discard = body.discard
+    state.cancel.set()
+    return {"status": "cancelling", "discard": body.discard}
+
+
+@app.post("/v1/sessions/{session_id}/rewind")
+async def rewind(
+    session_id: UUID, body: RewindBody, _u: dict = Depends(_user)
+) -> dict[str, Any]:
+    if body.from_seq < 1:
+        raise HTTPException(400, "from_seq must be >= 1")
+    if session_id in _running_turns:
+        raise HTTPException(409, "turn already running")
+    store = get_store()
+    sess = await store.get_entity(session_id)
+    if not sess:
+        raise HTTPException(404, "session not found")
+    events = await store.list_events(session_id)
+    discarded = next((e for e in events if e.seq == body.from_seq), None)
+    await store.truncate_events(session_id, body.from_seq)
+    text = ""
+    if discarded and discarded.kind == "user":
+        text = str(discarded.payload.get("text") or "")
+        await _revert_autotitle_if_needed(store, sess, text)
+    return {"status": "ok", "text": text}
 
 
 @app.post("/v1/sessions/{session_id}/correction")

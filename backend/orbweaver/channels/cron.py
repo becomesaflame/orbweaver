@@ -18,10 +18,8 @@ def _parse_recurrence(rec: str | None, due: datetime) -> datetime | None:
     if not rec:
         return None
     rec = rec.strip().lower()
-    if rec.startswith("every "):
-        rec = rec[6:]
-    if rec.endswith("s"):
-        rec = rec[:-1]
+    rec = rec.removeprefix("every ")
+    rec = rec.removesuffix("s")
     mapping = {"minute": 60, "hour": 3600, "day": 86400}
     if rec in mapping:
         return due + timedelta(seconds=mapping[rec])
@@ -41,7 +39,15 @@ async def sweep() -> None:
                 uri = str(sess.jsonld.get("workspace_uri") or "workspace:default")
                 ws = make_workspace(kind, uri, settings.workspace_root)
                 await store.append_event(session_id, "cron", {"job_id": str(job.id)})
-                await agent_turn(store, session_id, message, ws, workspace_kind=kind)
+                events = await agent_turn(
+                    store, session_id, message, ws, workspace_kind=kind, headless=True
+                )
+                aborted = next((e for e in events if e.kind == "turn_aborted"), None)
+                chat_id = sess.jsonld.get("telegram_chat_id")
+                if aborted and chat_id:
+                    from orbweaver.channels.telegram import notify_telegram_chat, texts_for_reply
+
+                    await notify_telegram_chat(int(chat_id), texts_for_reply(events))
         nxt = _parse_recurrence(job.recurrence, job.due_at)
         if nxt:
             job.due_at = nxt

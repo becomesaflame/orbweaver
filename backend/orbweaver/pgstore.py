@@ -276,6 +276,15 @@ class PostgresStore:
                         json.dumps(ev.payload),
                     )
 
+    async def truncate_events(self, session_id: uuid.UUID, from_seq: int) -> None:
+        pool = self._pool_req()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM events WHERE session_id=$1 AND seq>=$2",
+                session_id,
+                from_seq,
+            )
+
     async def put_job(self, job: Job) -> Job:
         pool = self._pool_req()
         async with pool.acquire() as conn:

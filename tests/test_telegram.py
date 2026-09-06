@@ -1,5 +1,4 @@
 import pytest
-
 from orbweaver.channels.telegram import session_for_telegram_user, user_allowed
 from orbweaver.config import settings
 from orbweaver.store import reset_store_for_tests
@@ -21,4 +20,8 @@ async def test_telegram_session_reuse():
     c = await session_for_telegram_user(store, 7)
     assert a.id == b.id
     assert a.jsonld["workspace_kind"] == "docker"
+    assert a.jsonld["telegram_chat_id"] == 42
+    updated = await session_for_telegram_user(store, 42, chat_id=999)
+    assert updated.id == a.id
+    assert updated.jsonld["telegram_chat_id"] == 999
     assert c.id != a.id

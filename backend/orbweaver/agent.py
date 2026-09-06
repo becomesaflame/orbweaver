@@ -1,16 +1,30 @@
-"""Anthropic tool-calling agent loop with pin injection and compaction."""
+"""Anthropic tool-calling agent loop with pin injection, permissions, and compaction."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Any, Callable
+from typing import Any
 from uuid import UUID
 
+from orbweaver.compact import (
+    events_to_messages,
+    live_events,
+    maybe_compact,
+    persist_tool_result,
+    prompt_events,
+    record_usage,
+    rehydrate_messages,
+    usage_input_tokens,
+)
 from orbweaver.config import settings
 from orbweaver.memory import pinned_prompt, remember, rewrite_search_query
+from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
+from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.store import Event, Job, Store, new_uuid
-from orbweaver.tokens import estimate_tokens
 
 TOOL_SPEC = [
     {
@@ -33,7 +47,7 @@ TOOL_SPEC = [
     },
     {
         "name": "ProposePatch",
-        "description": "Propose a search-replace patch. Does not write until the user accepts in VS Code.",
+        "description": "Propose a search-replace patch (also applied as a review overlay in VS Code).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -64,10 +78,14 @@ TOOL_SPEC = [
     },
     {
         "name": "Bash",
-        "description": "Run a shell command in the workspace.",
+        "description": "Run a shell command in the workspace. Sandboxed by default (no network). "
+        "Set unsandboxed true only when network or host access is required; that path is classified.",
         "input_schema": {
             "type": "object",
-            "properties": {"command": {"type": "string"}},
+            "properties": {
+                "command": {"type": "string"},
+                "unsandboxed": {"type": "boolean"},
+            },
             "required": ["command"],
         },
     },
@@ -130,10 +148,16 @@ TOOL_SPEC = [
     },
     {
         "name": "SpawnSubagent",
-        "description": "Record a subagent task (runs inline in v1).",
+        "description": (
+            "Spawn a nested agent with its own event stream to complete a focused task. "
+            "Shares this workspace and memory. Returns a summary. Nested spawns are not allowed."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {"task": {"type": "string"}},
+            "properties": {
+                "task": {"type": "string"},
+                "label": {"type": "string", "description": "Short name for the child run."},
+            },
             "required": ["task"],
         },
     },
@@ -154,84 +178,39 @@ TOOL_SPEC = [
 
 
 def _events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
-    pending_tool: list[dict[str, Any]] = []
-    for ev in events:
-        k = ev.kind
-        p = ev.payload
-        if k == "user":
-            messages.append({"role": "user", "content": p.get("text") or p.get("content") or ""})
-        elif k == "assistant":
-            messages.append({"role": "assistant", "content": p.get("text") or ""})
-        elif k == "tool_call":
-            pending_tool.append(
-                {
-                    "type": "tool_use",
-                    "id": p.get("id") or str(ev.id),
-                    "name": p.get("name"),
-                    "input": p.get("input") or {},
-                }
-            )
-        elif k in {"tool_result", "MemoryRecall"}:
-            if pending_tool:
-                messages.append({"role": "assistant", "content": pending_tool})
-                pending_tool = []
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": p.get("tool_use_id") or p.get("id") or "unknown",
-                            "content": p.get("content") or p.get("text") or json.dumps(p)[:8000],
-                        }
-                    ],
-                }
-            )
-        elif k == "UserCorrection":
-            messages.append(
-                {
-                    "role": "user",
-                    "content": f"User correction: {p.get('text') or json.dumps(p)}",
-                }
-            )
-        elif k == "compact_summary":
-            messages.append(
-                {"role": "user", "content": f"[compacted earlier turns]\n{p.get('text')}"}
-            )
-    if pending_tool:
-        messages.append({"role": "assistant", "content": pending_tool})
-    return messages
+    """Build Anthropic messages from a (possibly projected) event list."""
+    return events_to_messages(events)
 
 
-def event_token_count(events: list[Event]) -> int:
-    return estimate_tokens(json.dumps([e.payload for e in events], default=str))
+STATIC_SYSTEM = (
+    "You are Orbweaver, a coding agent. Use tools to read and patch the workspace. "
+    "In auto mode, in-project Write applies immediately. Prefer ProposePatch when a "
+    "visible diff overlay helps the user. Use MemorySearch when past decisions might "
+    "matter. Keep pins small. If a tool is blocked, find a safer path; do not try to "
+    "bypass the permission gate."
+)
 
 
-async def maybe_compact(store: Store, session_id: UUID) -> Event | None:
-    events = await store.list_events(session_id)
-    budget = int(settings.event_budget * settings.compact_ratio)
-    if event_token_count(events) <= budget:
-        return None
-    keep = max(8, len(events) // 5)
-    dropped, kept = events[:-keep], events[-keep:]
-    summary = "Summary of earlier events:\n" + "\n".join(
-        f"- {e.kind}: {json.dumps(e.payload, default=str)[:240]}" for e in dropped[-40:]
+def build_agent_system(pins: str, extra: str = "") -> list[dict[str, Any]]:
+    rest = pins or "(no pinned memory)"
+    if extra:
+        rest = rest + "\n\n" + extra
+    return [
+        {"type": "text", "text": STATIC_SYSTEM, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": rest},
+    ]
+
+
+def _blocked_tool_result(decision) -> str:
+    if decision.behavior == "ask":
+        return (
+            "This action needs user approval and was not executed. "
+            f"Reason: {decision.reason}. Ask the user, or pick a safer approach."
+        )
+    return (
+        f"Blocked by permission gate ({decision.fast_path}): {decision.reason}. "
+        "Treat this boundary in good faith. Find a safer path; do not route around the block."
     )
-    await remember(store, summary, source=f"compact:{session_id}")
-    summary_ev = Event(
-        id=new_uuid(),
-        session_id=session_id,
-        seq=1,
-        kind="compact_summary",
-        payload={"text": summary},
-    )
-    new_events = [summary_ev]
-    for i, e in enumerate(kept, start=2):
-        e.seq = i
-        new_events.append(e)
-    await store.replace_events(session_id, new_events)
-    return summary_ev
 
 
 async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
@@ -241,26 +220,25 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "Read":
         return ws.read(inp["path"])[:20000]
     if name == "Write":
-        if ctx.get("workspace_kind") == "local" and not ctx.get("auto_write"):
-            return json.dumps({"status": "needs_approval", "path": inp["path"]})
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
     if name == "ProposePatch":
         result = ws.propose_patch(inp["path"], inp.get("old_string") or "", inp["new_string"])
-        return json.dumps(result)[:15000]
+        return json.dumps(result)[:200_000]
     if name == "Glob":
         return "\n".join(ws.glob(inp["pattern"])[:200])
     if name == "Grep":
         return "\n".join(ws.grep(inp["pattern"], inp.get("glob") or "**/*"))
     if name == "Bash":
-        return ws.bash(inp["command"])
+        unsandboxed = bool(inp.get("unsandboxed"))
+        return ws.bash(inp["command"], unsandboxed=unsandboxed)
     if name == "WebFetch":
         import httpx
 
-        r = httpx.get(inp["url"], timeout=20.0, follow_redirects=True)
-        return r.text[:15000]
+        r = httpx.get(inp["url"], timeout=20.0, follow_redirects=True)  # noqa: ASYNC210
+        return r.text[:500_000]
     if name == "MemorySearch":
-        events = await store.list_events(session_id)
+        events = live_events(await store.list_events(session_id))
         already = set()
         for ev in events:
             if ev.kind == "MemoryRecall":
@@ -301,10 +279,12 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "AskUser":
         return json.dumps({"ask": inp["question"]})
     if name == "SpawnSubagent":
-        return f"subagent task recorded (inline v1): {inp['task'][:500]}"
+        from orbweaver.subagent import run_subagent
+
+        return await run_subagent(inp, ctx)
     if name == "ScheduleTask":
         try:
-            due = datetime.fromisoformat(str(inp["due_at"]).replace("Z", "+00:00"))
+            due = datetime.fromisoformat(str(inp["due_at"]).replace("Z", "+00:00"))  # noqa: FURB162
             if due.tzinfo is None:
                 due = due.replace(tzinfo=UTC)
         except ValueError as e:
@@ -321,6 +301,67 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     return f"unknown tool {name}"
 
 
+class TurnCancelled(Exception):
+    """Raised when the user stops or discards an in-flight turn."""
+
+    def __init__(self, produced: list[Event] | None = None):
+        super().__init__("turn cancelled")
+        self.produced = produced or []
+
+
+class TurnInjected(Exception):
+    """Current LLM call aborted so a mid-turn follow-up can join this query."""
+
+
+def _raise_if_cancelled(
+    cancel: asyncio.Event | None, produced: list[Event] | None = None
+) -> None:
+    if cancel is not None and cancel.is_set():
+        raise TurnCancelled(produced)
+
+
+async def _await_or_cancel(
+    coro,
+    cancel: asyncio.Event | None,
+    produced: list[Event] | None = None,
+    inject: asyncio.Event | None = None,
+):
+    if cancel is None and inject is None:
+        return await coro
+    _raise_if_cancelled(cancel, produced)
+    task = asyncio.create_task(coro)
+    watchers: set[asyncio.Task] = set()
+    if cancel is not None:
+        watchers.add(asyncio.create_task(cancel.wait()))
+    if inject is not None:
+        watchers.add(asyncio.create_task(inject.wait()))
+    if not watchers:
+        return await task
+    try:
+        done, _pending = await asyncio.wait(
+            {task, *watchers}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if task not in done:
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+            if cancel is not None and cancel.is_set():
+                raise TurnCancelled(produced)
+            raise TurnInjected()
+        for w in watchers:
+            w.cancel()
+            with suppress(asyncio.CancelledError):
+                await w
+        return task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        for w in watchers:
+            w.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+        raise
+
+
 async def agent_turn(
     store: Store,
     session_id: UUID,
@@ -328,16 +369,48 @@ async def agent_turn(
     workspace,
     workspace_kind: str = "local",
     emit: Callable[[dict[str, Any]], None] | None = None,
+    cancel: asyncio.Event | None = None,
+    turn_state: Any | None = None,
+    resume: bool = False,
+    headless: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    system_extra: str = "",
+    max_rounds: int = 24,
+    subagent_depth: int = 0,
 ) -> list[Event]:
-    await store.append_event(session_id, "user", {"text": user_text})
-    await maybe_compact(store, session_id)
+    _raise_if_cancelled(cancel)
+    if resume:
+        if turn_state is not None:
+            for ev in reversed(await store.list_events(session_id)):
+                if ev.kind == "user":
+                    turn_state.user_seq = ev.seq
+                    if not user_text:
+                        user_text = str(ev.payload.get("text") or "")
+                    break
+    else:
+        user_ev = await store.append_event(session_id, "user", {"text": user_text})
+        if turn_state is not None:
+            turn_state.user_seq = user_ev.seq
     produced: list[Event] = []
 
     def fire(ev: Event) -> None:
         produced.append(ev)
         if emit:
-            emit({"kind": ev.kind, "payload": ev.payload, "id": str(ev.id)})
+            emit({"kind": ev.kind, "payload": ev.payload, "id": str(ev.id), "seq": ev.seq})
 
+    def check() -> None:
+        _raise_if_cancelled(cancel, produced)
+
+    def inject_event() -> asyncio.Event | None:
+        return getattr(turn_state, "inject", None) if turn_state is not None else None
+
+    async def record_abort(exc: TurnAborted) -> None:
+        payload = dict(exc.payload)
+        payload.setdefault("text", exc.message)
+        fire(await store.append_event(session_id, "turn_aborted", payload))
+        fire(await store.append_event(session_id, "assistant", {"text": exc.message}))
+
+    check()
     if not settings.anthropic_api_key:
         ev = await store.append_event(
             session_id,
@@ -345,7 +418,7 @@ async def agent_turn(
             {
                 "text": (
                     "ANTHROPIC_API_KEY is not set. Echo: "
-                    + user_text[:500]
+                    + (user_text or "")[:500]
                     + "\nSet the key to enable the Claude tool loop."
                 )
             },
@@ -355,71 +428,171 @@ async def agent_turn(
 
     import anthropic
 
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    headers = {}
+    if settings.anthropic_workspace_id.strip():
+        headers["anthropic-workspace-id"] = settings.anthropic_workspace_id.strip()
+    client = anthropic.AsyncAnthropic(
+        api_key=settings.anthropic_api_key, default_headers=headers or None
+    )
+    denial_state = denial_state_for(session_id)
     ctx = {
         "workspace": workspace,
         "store": store,
         "session_id": session_id,
         "workspace_kind": workspace_kind,
-        "auto_write": workspace_kind == "docker",
+        "auto_write": True,
+        "headless": headless,
+        "denial_state": denial_state,
+        "events": [],
+        "cancel": cancel,
+        "fire": fire,
+        "subagent_depth": subagent_depth,
     }
     pins = await pinned_prompt(store)
-    system = (
-        "You are Orbweaver, a coding agent. Use tools to read and patch the workspace. "
-        "Prefer ProposePatch for file edits so the user can accept/reject in VS Code. "
-        "Use MemorySearch when past decisions might matter. Keep pins small.\n\n"
-        + (pins or "(no pinned memory)")
-    )
-
-    for _ in range(16):
-        events = await store.list_events(session_id)
-        messages = _events_to_messages(events)
-        if not messages:
-            messages = [{"role": "user", "content": user_text}]
-        resp = client.messages.create(
-            model=settings.orbweaver_model,
-            max_tokens=4096,
-            system=system,
-            tools=TOOL_SPEC,
-            messages=messages,
+    system = build_agent_system(pins, system_extra)
+    active_tools = tools if tools is not None else TOOL_SPEC
+    if not resume:
+        await maybe_compact(
+            store, session_id, client=client, workspace=workspace, system=system
         )
-        tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
-        texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
-        if texts:
-            ev = await store.append_event(session_id, "assistant", {"text": "\n".join(texts)})
-            fire(ev)
-        if not tool_uses:
-            break
-        for block in tool_uses:
-            call_ev = await store.append_event(
-                session_id,
-                "tool_call",
-                {"id": block.id, "name": block.name, "input": block.input},
-            )
-            fire(call_ev)
-            result = await run_tools(block.name, dict(block.input), ctx)
-            kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
-            payload = {"tool_use_id": block.id, "name": block.name, "content": result}
-            if kind == "MemoryRecall":
+        if turn_state is not None:
+            for ev in reversed(await store.list_events(session_id)):
+                if ev.kind == "user":
+                    turn_state.user_seq = ev.seq
+                    break
+
+    try:
+        for _ in range(max_rounds):
+            check()
+            inj = inject_event()
+            if inj is not None:
+                inj.clear()
+            events = await store.list_events(session_id)
+            ctx["events"] = events
+            messages = events_to_messages(prompt_events(events))
+            messages = rehydrate_messages(messages, events, workspace)
+            if not messages:
+                messages = [{"role": "user", "content": user_text}]
+            try:
+                resp = await _await_or_cancel(
+                    client.messages.create(
+                        model=settings.orbweaver_model,
+                        max_tokens=4096,
+                        system=system,
+                        tools=active_tools,
+                        messages=messages,
+                    ),
+                    cancel,
+                    produced,
+                    inject=inj,
+                )
+            except TurnInjected:
+                continue
+            last_seq = events[-1].seq if events else 0
+            record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
+            tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
+            texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+            if texts:
+                ev = await store.append_event(session_id, "assistant", {"text": "\n".join(texts)})
+                fire(ev)
+            check()
+            if not tool_uses:
+                break
+            stop_after_ask = False
+            for block in tool_uses:
+                check()
+                call_ev = await store.append_event(
+                    session_id,
+                    "tool_call",
+                    {"id": block.id, "name": block.name, "input": block.input},
+                )
+                fire(call_ev)
+                ctx["events"] = await store.list_events(session_id)
                 try:
-                    parsed = json.loads(result)
-                    payload["chunk_ids"] = parsed.get("chunk_ids") or []
-                    payload["text"] = parsed.get("text") or result
-                except json.JSONDecodeError:
-                    payload["text"] = result
-            res_ev = await store.append_event(session_id, kind, payload)
-            fire(res_ev)
-            if block.name == "ProposePatch":
+                    decision = await can_use_tool(block.name, dict(block.input), ctx)
+                except TurnAborted as e:
+                    await record_abort(e)
+                    return produced
                 fire(
                     await store.append_event(
-                        session_id, "patch_proposal", {"tool_use_id": block.id, "content": result}
+                        session_id,
+                        "permission_decision",
+                        {
+                            "tool_use_id": block.id,
+                            "name": block.name,
+                            "behavior": decision.behavior,
+                            "reason": decision.reason,
+                            "fast_path": decision.fast_path,
+                        },
                     )
                 )
-            if block.name == "ScheduleTask":
+                persisted_path = None
+                if decision.behavior != "allow":
+                    result = _blocked_tool_result(decision)
+                    if decision.behavior == "ask":
+                        stop_after_ask = True
+                else:
+                    result = await run_tools(block.name, dict(block.input), ctx)
+                    result, persisted_path = persist_tool_result(
+                        workspace, str(block.id), block.name, result
+                    )
+                    probed = await probe_tool_output(block.name, result)
+                    result = probed["output"]
+                    if probed.get("flagged"):
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "injection_warning",
+                                {"tool_use_id": block.id, "name": block.name},
+                            )
+                        )
+                check()
+                kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
+                payload = {"tool_use_id": block.id, "name": block.name, "content": result}
+                if decision.behavior == "allow" and persisted_path:
+                    payload["persisted_path"] = persisted_path
+                if kind == "MemoryRecall":
+                    try:
+                        parsed = json.loads(result)
+                        payload["chunk_ids"] = parsed.get("chunk_ids") or []
+                        payload["text"] = parsed.get("text") or result
+                    except json.JSONDecodeError:
+                        payload["text"] = result
+                res_ev = await store.append_event(session_id, kind, payload)
+                fire(res_ev)
+                if block.name == "ProposePatch" and decision.behavior == "allow":
+                    fire(
+                        await store.append_event(
+                            session_id, "patch_proposal", {"tool_use_id": block.id, "content": result}
+                        )
+                    )
+                if block.name == "ScheduleTask" and decision.behavior == "allow":
+                    fire(
+                        await store.append_event(
+                            session_id, "schedule_request", {"input": dict(block.input)}
+                        )
+                    )
+            if stop_after_ask:
                 fire(
                     await store.append_event(
-                        session_id, "schedule_request", {"input": dict(block.input)}
+                        session_id,
+                        "assistant",
+                        {
+                            "text": (
+                                "I need your approval before continuing. "
+                                "Reply with what you want done."
+                            )
+                        },
                     )
                 )
-        await maybe_compact(store, session_id)
-    return produced
+                break
+            await maybe_compact(
+                store, session_id, client=client, workspace=workspace, system=system
+            )
+        return produced
+    except TurnAborted as e:
+        await record_abort(e)
+        return produced
+    except TurnCancelled as e:
+        e.produced = produced
+        raise

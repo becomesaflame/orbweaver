@@ -34,6 +34,15 @@ async def test_forget(store):
     assert await store.get_chunk(c.id) is None
 
 
+@pytest.mark.asyncio
+async def test_truncate_events(store):
+    sid = new_uuid()
+    a = await store.append_event(sid, "user", {"text": "one"})
+    await store.append_event(sid, "assistant", {"text": "two"})
+    await store.truncate_events(sid, a.seq)
+    assert await store.list_events(sid) == []
+
+
 def test_search_query_uses_conversation():
     sid = new_uuid()
     events = [

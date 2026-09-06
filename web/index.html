@@ -5,64 +5,386 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Orbweaver</title>
   <style>
-    :root { --bg:#111; --panel:#1c1c1c; --ink:#eee; --accent:#7d9b84; --muted:#888; }
+    :root {
+      --bg:#111; --rail:#161616; --panel:#1c1c1c; --ink:#eee; --accent:#7d9b84;
+      --muted:#888; --line:#2e2e2e; --hover:#222; --active:#2a2a2a;
+    }
     * { box-sizing: border-box; }
-    body { margin:0; font: 15px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--ink); }
-    header { padding: 0.8rem 1rem; border-bottom:1px solid #333; display:flex; gap:1rem; align-items:center; }
-    header h1 { font-size:1rem; margin:0; }
-    main { display:grid; grid-template-columns: 16rem 1fr; min-height: calc(100vh - 3rem); }
-    aside { border-right:1px solid #333; padding:1rem; }
-    aside label { display:block; font-size:0.75rem; color:var(--muted); margin-top:0.6rem; }
-    input, textarea, button { width:100%; margin-top:0.25rem; background:#2a2a2a; color:var(--ink); border:1px solid #444; border-radius:6px; padding:0.45rem 0.5rem; }
-    button { background:var(--accent); color:#111; font-weight:600; cursor:pointer; }
-    #log { padding:1rem; overflow-y:auto; max-height: calc(100vh - 8rem); }
-    .msg { margin:0.5rem 0; padding:0.6rem 0.7rem; border-radius:8px; background:var(--panel); white-space:pre-wrap; }
-    .msg.user { border-left: 3px solid var(--accent); }
-    .msg.assistant { border-left: 3px solid #c4a574; }
-    .msg.tool { border-left: 3px solid #888; color:#bbb; font-size:0.85rem; }
-    #composer { display:flex; gap:0.5rem; padding:0.75rem 1rem; border-top:1px solid #333; }
-    #composer textarea { flex:1; width:auto; min-height:3rem; }
-    #composer button { width:auto; }
+    html, body { height:100%; margin:0; }
+    body {
+      font: 14px/1.45 system-ui, sans-serif;
+      background:var(--bg); color:var(--ink);
+      display:flex;
+    }
+    #rail {
+      width:17.5rem; min-width:17.5rem; background:var(--rail);
+      border-right:1px solid var(--line);
+      display:flex; flex-direction:column;
+    }
+    .brand {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:0.85rem 0.9rem 0.4rem;
+    }
+    .brand h1 { font-size:0.95rem; margin:0; font-weight:650; letter-spacing:0.01em; }
+    .rail-actions { padding:0.35rem 0.7rem 0.5rem; display:flex; flex-direction:column; gap:0.35rem; }
+    button {
+      font: inherit; color:var(--ink); background:transparent;
+      border:0; border-radius:8px; padding:0.45rem 0.6rem; cursor:pointer; text-align:left;
+    }
+    button:hover { background:var(--hover); }
+    .btn-new {
+      background:var(--accent); color:#111; font-weight:650;
+      display:flex; align-items:center; gap:0.45rem;
+    }
+    .btn-new:hover { filter:brightness(1.05); background:var(--accent); }
+    .search {
+      width:100%; background:#1f1f1f; color:var(--ink);
+      border:1px solid var(--line); border-radius:8px;
+      padding:0.4rem 0.55rem; font:inherit;
+    }
+    .search::placeholder { color:#666; }
+    .rail-list { flex:1; overflow-y:auto; padding:0.25rem 0.45rem 0.8rem; }
+    .sec-label {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:0.55rem 0.45rem 0.25rem;
+      font-size:0.7rem; letter-spacing:0.04em; text-transform:uppercase; color:var(--muted);
+    }
+    .icon-btn { padding:0.15rem 0.3rem; color:var(--muted); border-radius:6px; }
+    .ws { margin-bottom:0.2rem; }
+    .ws-head {
+      width:100%; display:flex; align-items:center; gap:0.4rem;
+      color:#cfcfcf; padding:0.35rem 0.4rem; border-radius:8px;
+    }
+    .ws-head .chev { width:0.7rem; color:var(--muted); flex:none; }
+    .ws-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
+    .ws-kind { font-size:0.7rem; color:var(--muted); flex:none; }
+    .chat {
+      width:100%; display:flex; align-items:center; gap:0.4rem;
+      padding:0.38rem 0.45rem 0.38rem 1.35rem; border-radius:8px; color:#ddd;
+    }
+    .chat.active { background:var(--active); color:#fff; }
+    .chat-title { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .chat-time { font-size:0.7rem; color:var(--muted); flex:none; }
+    .more { color:var(--muted); font-size:0.8rem; padding:0.2rem 0.45rem 0.35rem 1.35rem; }
+    .empty { color:var(--muted); padding:1rem 0.7rem; font-size:0.85rem; }
+    .rail-foot { border-top:1px solid var(--line); padding:0.55rem 0.7rem 0.8rem; }
+    .conn-toggle {
+      width:100%; display:flex; align-items:center; gap:0.5rem; color:#ddd;
+    }
+    .dot { width:0.5rem; height:0.5rem; border-radius:50%; background:#555; flex:none; }
+    .dot.ok { background:var(--accent); }
+    #settings { margin-top:0.45rem; }
+    #settings.hidden { display:none; }
+    #settings label { display:block; font-size:0.7rem; color:var(--muted); margin-top:0.45rem; }
+    #settings input, #settings textarea {
+      width:100%; margin-top:0.2rem; background:#1f1f1f; color:var(--ink);
+      border:1px solid var(--line); border-radius:6px; padding:0.35rem 0.45rem; font:inherit;
+    }
+    .mic { width:100%; margin-top:0.5rem; background:var(--panel); }
+    #stage { flex:1; min-width:0; display:flex; flex-direction:column; }
+    header.chat-bar {
+      padding:0.75rem 1.1rem; border-bottom:1px solid var(--line);
+      display:flex; gap:1rem; align-items:baseline;
+    }
+    header.chat-bar h2 { font-size:0.95rem; margin:0; font-weight:600; }
+    #status { color:var(--muted); font-size:0.8rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    #log { flex:1; overflow-y:auto; padding:1rem 1.15rem; }
+    .msg { margin:0.5rem 0; padding:0.65rem 0.75rem; border-radius:8px; background:var(--panel); }
+    .msg-body { white-space:pre-wrap; }
+    .msg.user { border-left:3px solid var(--accent); }
+    .msg.assistant { border-left:3px solid #c4a574; }
+    .msg.tool { border-left:3px solid #888; color:#bbb; font-size:0.85rem; }
+    .placeholder { color:var(--muted); padding:3rem 1rem; text-align:center; }
+    #composer textarea {
+      flex:1; min-height:3.2rem; resize:vertical; background:#1f1f1f; color:var(--ink);
+      border:1px solid var(--line); border-radius:8px; padding:0.55rem 0.65rem; font:inherit;
+    }
+    #dock { border-top:1px solid var(--line); }
+    #followups { padding:0.5rem 1rem 0; display:flex; flex-direction:column; gap:0.3rem; }
+    #followups.hidden { display:none; }
+    .q-item {
+      display:flex; align-items:center; gap:0.4rem;
+      background:var(--panel); border-radius:8px; padding:0.35rem 0.55rem;
+      border-left:3px solid #c4a574;
+    }
+    .q-lab { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; font-size:0.85rem; color:#ddd; }
+    .q-item button { color:var(--muted); padding:0.1rem 0.4rem; }
+    #composer { display:flex; gap:0.5rem; padding:0.75rem 1rem 0.35rem; border-top:0; }
+    .composer-btns { display:flex; flex-direction:column; gap:0.35rem; justify-content:flex-end; }
+    #send { width:auto; background:var(--accent); color:#111; font-weight:650; padding:0.55rem 0.9rem; min-width:6.6rem; }
+    #send:hover { background:var(--accent); filter:brightness(1.05); }
+    #send.stop { background:#6a4040; color:#f2f2f2; }
+    #send.stop:hover { filter:none; background:#7a4a4a; }
+    .ghost {
+      background:var(--panel); color:var(--ink); font-weight:600;
+      padding:0.4rem 0.7rem; white-space:nowrap; min-width:6.6rem;
+    }
+    .ghost:hover { background:var(--hover); }
+    .ghost:disabled { opacity:0.4; cursor:default; }
+    .ghost.hidden, #continue.hidden, #queue-btn.hidden, #inject.hidden { display:none; }
+    #composer-hint { padding:0 1rem 0.75rem; font-size:0.75rem; color:var(--muted); min-height:1.15rem; }
+    .msg.injected { border-left-color:#8aa0c8; }
+    .msg-actions { display:flex; gap:0.25rem; margin-top:0.4rem; }
+    .msg-actions button {
+      font-size:0.75rem; color:var(--muted); padding:0.12rem 0.45rem; border-radius:6px;
+    }
+    .msg-actions button:hover { color:var(--ink); }
+    .msg.working, .msg.stopped {
+      color:var(--muted); font-style:italic; background:transparent; border-left-color:#555;
+    }
   </style>
 </head>
 <body>
-  <header>
-    <h1>Orbweaver</h1>
-    <span id="status">disconnected</span>
-  </header>
-  <main>
-    <aside>
-      <label>Gateway</label>
-      <input id="base" value="">
-      <label>JWT</label>
-      <input id="token" placeholder="paste or mint">
-      <button id="mint">Mint local token</button>
-      <label>Workspace URI</label>
-      <input id="wuri" value="workspace:default">
-      <label>Workspace kind</label>
-      <input id="wkind" value="local">
-      <button id="newsession">New session</button>
-      <label>Session id</label>
-      <input id="sid">
-      <button id="mic">Record 4s for STT</button>
-    </aside>
-    <section>
-      <div id="log"></div>
-      <div id="composer">
-        <textarea id="text" placeholder="Message"></textarea>
-        <button id="send">Send</button>
+  <aside id="rail">
+    <div class="brand"><h1>Orbweaver</h1></div>
+    <div class="rail-actions">
+      <button type="button" class="btn-new" id="newsession">+ New chat</button>
+      <input id="search" class="search" placeholder="Search chats" autocomplete="off">
+    </div>
+    <div class="rail-list" id="session-list">
+      <div class="empty">Paste a JWT in Connection to load chats.</div>
+    </div>
+    <div class="rail-foot">
+      <button type="button" class="conn-toggle" id="settings-toggle">
+        <span class="dot" id="conn-dot"></span>
+        <span id="conn-label">Connection</span>
+      </button>
+      <div id="settings" class="hidden">
+        <label>Gateway</label>
+        <input id="base" value="">
+        <label>JWT (from `python -m orbweaver.cli mint`)</label>
+        <input id="token" placeholder="paste token from gateway host">
+        <label>Workspace URI</label>
+        <input id="wuri" value="workspace:default">
+        <label>Workspace kind</label>
+        <input id="wkind" value="local">
+        <label>Session id</label>
+        <input id="sid">
+        <button type="button" class="mic" id="mic">Record 4s for STT</button>
       </div>
-    </section>
-  </main>
+    </div>
+  </aside>
+  <div id="stage">
+    <header class="chat-bar">
+      <h2 id="chat-title">New chat</h2>
+      <span id="status">disconnected</span>
+    </header>
+    <div id="log"></div>
+    <div id="dock">
+      <div id="followups" class="hidden"></div>
+      <div id="composer">
+        <textarea id="text" placeholder="Message (Shift+Enter for newline)"></textarea>
+        <div class="composer-btns">
+          <button type="button" id="queue-btn" class="ghost hidden" title="Run after this turn finishes">Queue</button>
+          <button type="button" id="inject" class="ghost hidden" title="Fold into the live turn (Ctrl+Enter)">Add to turn</button>
+          <button type="button" id="continue" class="ghost hidden" title="Resume the stopped turn">Continue</button>
+          <button type="button" id="send">Send</button>
+        </div>
+      </div>
+      <div id="composer-hint"></div>
+    </div>
+  </div>
   <script>
     const $ = (id) => document.getElementById(id);
+    const LS = {
+      jwt: "orbweaver.jwt", sid: "orbweaver.sid", wuri: "orbweaver.wuri",
+      wkind: "orbweaver.wkind", collapsed: "orbweaver.collapsedWs", expanded: "orbweaver.expandedWs"
+    };
+    let sessions = [];
+    let inFlight = null;
+    let stoppedSids = new Set();
+    const followupQueues = new Map();
+    let collapsed = new Set(JSON.parse(localStorage.getItem(LS.collapsed) || "[]"));
+    let expandedExtra = new Set(JSON.parse(localStorage.getItem(LS.expanded) || "[]"));
     $("base").value = location.origin;
-    function add(kind, text) {
+    const savedTok = localStorage.getItem(LS.jwt);
+    if (savedTok) $("token").value = savedTok;
+    const savedSid = localStorage.getItem(LS.sid);
+    if (savedSid) $("sid").value = savedSid;
+    const savedWuri = localStorage.getItem(LS.wuri);
+    if (savedWuri) $("wuri").value = savedWuri;
+    const savedWkind = localStorage.getItem(LS.wkind);
+    if (savedWkind) $("wkind").value = savedWkind;
+    const hashSid = (location.hash.match(/^#\/s\/([0-9a-f-]{36})$/i) || [])[1];
+    if (hashSid) $("sid").value = hashSid;
+    if (!$("token").value.trim()) $("settings").classList.remove("hidden");
+
+    function persistSid() {
+      const sid = $("sid").value.trim();
+      if (sid) localStorage.setItem(LS.sid, sid);
+      else localStorage.removeItem(LS.sid);
+    }
+    function persistWorkspace() {
+      localStorage.setItem(LS.wuri, $("wuri").value.trim());
+      localStorage.setItem(LS.wkind, $("wkind").value.trim());
+    }
+    function persistCollapsed() {
+      localStorage.setItem(LS.collapsed, JSON.stringify([...collapsed]));
+      localStorage.setItem(LS.expanded, JSON.stringify([...expandedExtra]));
+    }
+    $("token").addEventListener("input", () => {
+      localStorage.setItem(LS.jwt, $("token").value.trim());
+      refreshSessions();
+    });
+    $("wuri").addEventListener("input", persistWorkspace);
+    $("wkind").addEventListener("input", persistWorkspace);
+    $("sid").addEventListener("input", persistSid);
+    $("sid").addEventListener("change", () => { persistSid(); loadHistory(); refreshSessions(); });
+    window.addEventListener("beforeunload", persistSid);
+    $("settings-toggle").onclick = () => $("settings").classList.toggle("hidden");
+    $("search").addEventListener("input", paintSessions);
+
+    function add(kind, text, opts={}) {
       const d = document.createElement("div");
-      d.className = "msg " + kind;
-      d.textContent = kind + ": " + text;
+      d.className = "msg " + kind + (opts.extraClass ? " " + opts.extraClass : "");
+      if (opts.seq != null) d.dataset.seq = String(opts.seq);
+      const body = document.createElement("div");
+      body.className = "msg-body";
+      body.textContent = kind + ": " + text;
+      d.appendChild(body);
       $("log").appendChild(d);
       $("log").scrollTop = $("log").scrollHeight;
+      return d;
+    }
+    function attachUserActions(el, text, seq, pending) {
+      el.querySelectorAll(".msg-actions").forEach((n) => n.remove());
+      const actions = document.createElement("div");
+      actions.className = "msg-actions";
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.textContent = "Edit";
+      edit.title = pending ? "Pause and edit this prompt" : "Edit this prompt";
+      edit.onclick = (ev) => { ev.stopPropagation(); editPrompt(text, seq, el); };
+      actions.appendChild(edit);
+      if (pending) {
+        const cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.textContent = "Cancel";
+        cancel.title = "Discard this prompt";
+        cancel.onclick = (ev) => { ev.stopPropagation(); cancelPrompt(); };
+        actions.appendChild(cancel);
+      }
+      el.appendChild(actions);
+    }
+    function renderEvent(ev) {
+      const p = ev.payload || {};
+      if (ev.kind === "user" || ev.kind === "assistant") {
+        const extra = p.injected ? "injected" : "";
+        const el = add(ev.kind, p.text || "", { seq: ev.seq, extraClass: extra });
+        if (ev.kind === "user") attachUserActions(el, p.text || "", ev.seq, false);
+      } else if (ev.kind === "turn_aborted") {
+        add("assistant", p.text || "Turn aborted", { seq: ev.seq, extraClass: "stopped" });
+      } else if (ev.kind === "turn_interrupted") {
+        renderStopped(ev.seq);
+      } else {
+        add("tool", ev.kind + " " + JSON.stringify(p).slice(0,400), { seq: ev.seq });
+      }
+    }
+    function renderStopped(seq) {
+      const el = add("assistant", "Stopped", { extraClass: "stopped", seq: seq });
+      const actions = document.createElement("div");
+      actions.className = "msg-actions";
+      const cont = document.createElement("button");
+      cont.type = "button";
+      cont.textContent = "Continue";
+      cont.onclick = () => continueTurn();
+      actions.appendChild(cont);
+      el.appendChild(actions);
+      return el;
+    }
+    function qlist(sid) {
+      if (!sid) return [];
+      if (!followupQueues.has(sid)) {
+        try {
+          const raw = sessionStorage.getItem("orbweaver.queue." + sid);
+          followupQueues.set(sid, raw ? JSON.parse(raw) : []);
+        } catch (e) { followupQueues.set(sid, []); }
+      }
+      return followupQueues.get(sid);
+    }
+    function persistQueue(sid) {
+      const items = qlist(sid);
+      const key = "orbweaver.queue." + sid;
+      if (items.length) sessionStorage.setItem(key, JSON.stringify(items));
+      else sessionStorage.removeItem(key);
+    }
+    function paintFollowups() {
+      const root = $("followups");
+      const sid = currentSid();
+      const items = qlist(sid);
+      root.replaceChildren();
+      if (!items.length) { root.classList.add("hidden"); return; }
+      root.classList.remove("hidden");
+      items.forEach((item, i) => {
+        const row = document.createElement("div");
+        row.className = "q-item";
+        const lab = document.createElement("span");
+        lab.className = "q-lab";
+        lab.textContent = (i === 0 ? "Queued: " : "Then: ") + item.text;
+        lab.title = "Click to edit";
+        lab.onclick = () => {
+          restoreComposer(item.text);
+          items.splice(i, 1);
+          persistQueue(sid);
+          paintFollowups();
+          syncComposer();
+        };
+        const x = document.createElement("button");
+        x.type = "button";
+        x.textContent = "×";
+        x.title = "Remove from queue";
+        x.onclick = () => { items.splice(i, 1); persistQueue(sid); paintFollowups(); };
+        row.append(lab, x);
+        root.appendChild(row);
+      });
+    }
+    function enqueue(text) {
+      const sid = currentSid();
+      if (!sid || !text) return;
+      qlist(sid).push({ id: String(Date.now()) + "-" + Math.random().toString(16).slice(2), text });
+      persistQueue(sid);
+      $("text").value = "";
+      paintFollowups();
+      syncComposer();
+    }
+    function syncComposer() {
+      const busy = !!(inFlight && inFlight.sid === currentSid());
+      const stopped = !busy && stoppedSids.has(currentSid());
+      const hasText = !!$("text").value.trim();
+      $("send").textContent = busy ? "Stop" : "Send";
+      $("send").classList.toggle("stop", busy);
+      $("send").title = busy ? "Stop generating (Esc)" : "Send";
+      $("queue-btn").classList.toggle("hidden", !busy);
+      $("inject").classList.toggle("hidden", !busy);
+      $("queue-btn").disabled = !hasText;
+      $("inject").disabled = !hasText;
+      $("continue").classList.toggle("hidden", !stopped);
+      $("text").placeholder = busy
+        ? "Enter queues · Ctrl+Enter adds to this turn"
+        : (stopped ? "Continue this turn, or type a new message" : "Message (Shift+Enter for newline)");
+      $("composer-hint").textContent = busy
+        ? "Enter queues for after this turn · Ctrl+Enter injects now · Esc stops"
+        : (stopped ? "Continue resumes · Edit the prompt to restart · Enter sends a new turn" : "");
+      paintFollowups();
+    }
+    function setBusy(_on) { syncComposer(); }
+    function restoreComposer(text) {
+      $("text").value = text;
+      $("text").focus();
+      const ta = $("text");
+      ta.selectionStart = ta.selectionEnd = ta.value.length;
+    }
+    function dropFromSeq(seq) {
+      if (seq == null) return;
+      for (const node of [...$("log").children]) {
+        const s = Number(node.dataset.seq);
+        if (Number.isFinite(s) && s >= seq) node.remove();
+      }
+    }
+    function ensurePlaceholder() {
+      if (!$("log").querySelector(".msg")) {
+        $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
+      }
     }
     async function api(path, opts={}) {
       const headers = Object.assign({"content-type":"application/json"}, opts.headers||{});
@@ -72,38 +394,410 @@
       if (!res.ok) throw new Error(await res.text());
       return res.json();
     }
-    $("mint").onclick = async () => {
+    function wsKey(s) { return (s.workspace_uri || "") + "\\n" + (s.workspace_kind || ""); }
+    function wsLabel(uri) {
+      return String(uri || "workspace:default").replace(/^workspace:/, "");
+    }
+    function timeAgo(iso) {
+      if (!iso) return "";
+      const t = Date.parse(iso);
+      if (!Number.isFinite(t)) return "";
+      const sec = Math.max(0, (Date.now() - t) / 1000);
+      if (sec < 45) return "now";
+      if (sec < 3600) return Math.floor(sec / 60) + "m";
+      if (sec < 86400) return Math.floor(sec / 3600) + "h";
+      if (sec < 86400 * 14) return Math.floor(sec / 86400) + "d";
+      return new Date(t).toLocaleDateString();
+    }
+    function currentSid() { return $("sid").value.trim(); }
+    function currentSession() { return sessions.find((s) => s.id === currentSid()); }
+
+    function setActive(session, opts={}) {
+      $("sid").value = session.id;
+      persistSid();
+      $("wuri").value = session.workspace_uri || $("wuri").value;
+      $("wkind").value = session.workspace_kind || $("wkind").value;
+      persistWorkspace();
+      $("chat-title").textContent = session.title || "New chat";
+      history.replaceState(null, "", "#/s/" + session.id);
+      paintSessions();
+      setBusy(false);
+      if (!opts.skipHistory) loadHistory();
+    }
+
+    function paintSessions() {
+      const q = $("search").value.trim().toLowerCase();
+      const root = $("session-list");
+      root.replaceChildren();
+      const filtered = q
+        ? sessions.filter((s) => (s.title + " " + s.workspace_uri).toLowerCase().includes(q))
+        : sessions;
+      if (!filtered.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = $("token").value.trim()
+          ? (sessions.length ? "No chats match." : "No chats yet. Start one with New chat.")
+          : "Paste a JWT in Connection to load chats.";
+        root.appendChild(empty);
+        return;
+      }
+      const groups = new Map();
+      for (const s of filtered) {
+        const k = wsKey(s);
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(s);
+      }
+      const head = document.createElement("div");
+      head.className = "sec-label";
+      head.innerHTML = "<span>Workspaces</span>";
+      root.appendChild(head);
+      for (const [key, items] of groups) {
+        const first = items[0];
+        const wrap = document.createElement("div");
+        wrap.className = "ws";
+        const isCollapsed = !q && collapsed.has(key) && !items.some((s) => s.id === currentSid());
+        const row = document.createElement("div");
+        row.className = "ws-head";
+        row.style.display = "flex";
+        const headBtn = document.createElement("button");
+        headBtn.type = "button";
+        headBtn.className = "ws-head";
+        headBtn.style.flex = "1";
+        headBtn.innerHTML =
+          '<span class="chev">' + (isCollapsed ? "▸" : "▾") + "</span>" +
+          '<span class="ws-name"></span><span class="ws-kind"></span>';
+        headBtn.querySelector(".ws-name").textContent = wsLabel(first.workspace_uri);
+        headBtn.querySelector(".ws-kind").textContent = first.workspace_kind || "";
+        headBtn.onclick = () => {
+          if (collapsed.has(key)) collapsed.delete(key);
+          else collapsed.add(key);
+          persistCollapsed();
+          $("wuri").value = first.workspace_uri;
+          $("wkind").value = first.workspace_kind;
+          persistWorkspace();
+          paintSessions();
+        };
+        const addWs = document.createElement("button");
+        addWs.type = "button";
+        addWs.className = "icon-btn";
+        addWs.title = "New chat in this workspace";
+        addWs.textContent = "+";
+        addWs.onclick = () => {
+          createSession(first.workspace_uri, first.workspace_kind).catch((err) => {
+            $("status").textContent = String(err);
+          });
+        };
+        row.append(headBtn, addWs);
+        wrap.appendChild(row);
+        if (!isCollapsed) {
+          const limit = expandedExtra.has(key) || q ? items.length : 6;
+          items.slice(0, limit).forEach((s) => wrap.appendChild(chatButton(s)));
+          if (items.length > limit) {
+            const more = document.createElement("button");
+            more.type = "button";
+            more.className = "more";
+            more.textContent = "More";
+            more.onclick = () => { expandedExtra.add(key); persistCollapsed(); paintSessions(); };
+            wrap.appendChild(more);
+          }
+        }
+        root.appendChild(wrap);
+      }
+    }
+
+    function chatButton(s) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "chat" + (s.id === currentSid() ? " active" : "");
+      b.title = "Double-click to rename";
+      const title = document.createElement("span");
+      title.className = "chat-title";
+      title.textContent = s.title || "New chat";
+      const time = document.createElement("span");
+      time.className = "chat-time";
+      time.textContent = timeAgo(s.last_event_at || s.created_at);
+      b.append(title, time);
+      b.onclick = () => setActive(s);
+      b.ondblclick = async (e) => {
+        e.preventDefault();
+        const next = prompt("Rename chat", s.title || "");
+        if (next == null) return;
+        const title = next.trim();
+        if (!title) return;
+        try {
+          await api("/v1/sessions/" + s.id, { method:"PATCH", body: JSON.stringify({ title }) });
+          await refreshSessions();
+        } catch (err) { $("status").textContent = String(err); }
+      };
+      return b;
+    }
+
+    async function refreshSessions() {
+      if (!$("token").value.trim()) {
+        sessions = [];
+        paintSessions();
+        $("conn-dot").classList.remove("ok");
+        return;
+      }
       try {
-        const r = await api("/v1/auth/token", { method:"POST", body: JSON.stringify({ sub:"web" }) });
-        $("token").value = r.token;
-        $("status").textContent = "token minted";
-      } catch (e) { $("status").textContent = String(e); }
-    };
-    $("newsession").onclick = async () => {
+        const r = await api("/v1/sessions");
+        sessions = r.sessions || [];
+        $("conn-dot").classList.add("ok");
+        const cur = currentSession();
+        if (cur) $("chat-title").textContent = cur.title || "New chat";
+        paintSessions();
+      } catch (e) {
+        $("conn-dot").classList.remove("ok");
+        $("status").textContent = String(e);
+        paintSessions();
+      }
+    }
+
+    async function loadHistory() {
+      const sid = currentSid();
+      if (!sid) {
+        $("status").textContent = "disconnected";
+        $("log").innerHTML = '<div class="placeholder">Start a new chat or pick one from the left.</div>';
+        return;
+      }
+      if (!$("token").value.trim()) {
+        $("status").textContent = "paste a JWT from python -m orbweaver.cli mint";
+        return;
+      }
       try {
-        const r = await api("/v1/sessions", { method:"POST", body: JSON.stringify({
-          workspace_uri: $("wuri").value, workspace_kind: $("wkind").value, title: "web"
-        })});
-        $("sid").value = r.id;
-        $("status").textContent = "session " + r.id;
+        const r = await api("/v1/sessions/" + sid + "/events");
+        if (inFlight && inFlight.sid === sid) { syncComposer(); return; }
+        $("log").replaceChildren();
+        const evs = r.events || [];
+        stoppedSids.delete(sid);
+        if (!evs.length) {
+          $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
+        } else {
+          for (const ev of evs) renderEvent(ev);
+          const last = evs[evs.length - 1];
+          if (last.kind !== "assistant") stoppedSids.add(sid);
+        }
+        $("status").textContent = "";
+        syncComposer();
+        const cur = currentSession();
+        if (cur) $("chat-title").textContent = cur.title || "New chat";
       } catch (e) { $("status").textContent = String(e); }
+    }
+
+    async function createSession(uri, kind) {
+      if (!$("token").value.trim()) {
+        $("settings").classList.remove("hidden");
+        $("status").textContent = "paste a JWT from python -m orbweaver.cli mint";
+        return;
+      }
+      persistWorkspace();
+      const r = await api("/v1/sessions", {
+        method:"POST",
+        body: JSON.stringify({
+          workspace_uri: uri || $("wuri").value,
+          workspace_kind: kind || $("wkind").value,
+          title: "New chat"
+        })
+      });
+      const session = {
+        id: r.id,
+        title: r.title || "New chat",
+        workspace_uri: r.workspace_uri || uri || $("wuri").value,
+        workspace_kind: kind || $("wkind").value,
+        created_at: new Date().toISOString(),
+        last_event_at: "",
+        event_count: 0
+      };
+      sessions = [session, ...sessions.filter((s) => s.id !== session.id)];
+      $("log").replaceChildren();
+      $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
+      setActive(session, { skipHistory: true });
+      $("status").textContent = "";
+      $("text").focus();
+      refreshSessions();
+    }
+
+    $("newsession").onclick = () => {
+      createSession($("wuri").value, $("wkind").value).catch((e) => {
+        $("status").textContent = String(e);
+      });
     };
-    $("send").onclick = async () => {
+
+    async function requestCancel(discard) {
+      const flight = inFlight;
+      if (!flight) return;
+      try {
+        await api("/v1/sessions/" + flight.sid + "/turns/cancel", {
+          method:"POST", body: JSON.stringify({ discard: !!discard })
+        });
+      } catch (e) { $("status").textContent = String(e); }
+    }
+    function stopTurn() { requestCancel(false); }
+    function cancelPrompt() { requestCancel(true); }
+    async function editPrompt(text, seq, el) {
+      restoreComposer(text);
+      const pending = !!(inFlight && el && el.classList.contains("pending"));
+      const sid = currentSid();
+      if (inFlight) {
+        const wait = inFlight.done;
+        await requestCancel(true);
+        if (wait) await wait;
+      }
+      stoppedSids.delete(sid);
+      if (pending || seq == null) { syncComposer(); return; }
+      try {
+        await api("/v1/sessions/" + sid + "/rewind", {
+          method:"POST", body: JSON.stringify({ from_seq: seq })
+        });
+        dropFromSeq(seq);
+        ensurePlaceholder();
+        await refreshSessions();
+      } catch (e) { $("status").textContent = String(e); }
+      syncComposer();
+    }
+    async function injectNow() {
       const text = $("text").value.trim();
-      if (!text) return;
-      if (!$("sid").value) { add("tool", "create a session first"); return; }
-      add("user", text);
+      if (!text || !inFlight) return;
+      const sid = inFlight.sid;
       $("text").value = "";
+      syncComposer();
       try {
-        const r = await api("/v1/sessions/" + $("sid").value + "/turns", {
+        const r = await api("/v1/sessions/" + sid + "/turns/inject", {
           method:"POST", body: JSON.stringify({ text })
         });
-        for (const ev of r.events) {
-          if (ev.kind === "assistant") add("assistant", ev.payload.text || "");
-          else add("tool", ev.kind + " " + JSON.stringify(ev.payload).slice(0,400));
+        if (currentSid() === sid) {
+          const working = $("log").querySelector(".msg.working");
+          const el = add("user", text, { seq: r.seq, extraClass: "injected" });
+          attachUserActions(el, text, r.seq, false);
+          if (working) $("log").appendChild(working);
         }
-      } catch (e) { add("tool", String(e)); }
-    };
+      } catch (e) {
+        restoreComposer(text);
+        $("status").textContent = String(e);
+      }
+    }
+    async function continueTurn() {
+      if (inFlight) return;
+      const sid = currentSid();
+      if (!sid) return;
+      stoppedSids.delete(sid);
+      const ph = $("log").querySelector(".placeholder");
+      if (ph) ph.remove();
+      $("log").querySelectorAll(".msg.stopped").forEach((n) => n.remove());
+      const workingEl = add("assistant", "Working…", { extraClass: "working" });
+      let resolveDone;
+      const done = new Promise((r) => { resolveDone = r; });
+      inFlight = { sid, text: "", userEl: null, workingEl, done };
+      syncComposer();
+      $("status").textContent = "working…";
+      try {
+        const r = await api("/v1/sessions/" + sid + "/turns/continue", { method:"POST", body: "{}" });
+        if (workingEl.parentNode) workingEl.remove();
+        if (currentSid() === sid) {
+          for (const ev of r.events || []) renderEvent(ev);
+          if (r.status === "stopped") stoppedSids.add(sid);
+        }
+        await refreshSessions();
+        await drainQueue(sid, r.status);
+      } catch (e) {
+        if (workingEl.parentNode) workingEl.remove();
+        if (currentSid() === sid) add("tool", String(e));
+      } finally {
+        if (inFlight && inFlight.sid === sid) inFlight = null;
+        if (resolveDone) resolveDone();
+        syncComposer();
+        if ($("status").textContent === "working…") $("status").textContent = "";
+      }
+    }
+    async function drainQueue(sid, status) {
+      if (status !== "ok") return;
+      if (currentSid() !== sid) return;
+      const items = qlist(sid);
+      if (!items.length) return;
+      const next = items.shift();
+      persistQueue(sid);
+      paintFollowups();
+      $("text").value = next.text;
+      await send();
+    }
+    async function send() {
+      if (inFlight) return;
+      const text = $("text").value.trim();
+      if (!text) return;
+      if (!currentSid()) {
+        try { await createSession($("wuri").value, $("wkind").value); }
+        catch (e) { add("tool", String(e)); return; }
+      }
+      persistSid();
+      const sid = currentSid();
+      stoppedSids.delete(sid);
+      const ph = $("log").querySelector(".placeholder");
+      if (ph) ph.remove();
+      $("text").value = "";
+      const userEl = add("user", text, { extraClass: "pending" });
+      attachUserActions(userEl, text, null, true);
+      const workingEl = add("assistant", "Working…", { extraClass: "working" });
+      let resolveDone;
+      const done = new Promise((r) => { resolveDone = r; });
+      inFlight = { sid, text, userEl, workingEl, done };
+      syncComposer();
+      $("status").textContent = "working…";
+      try {
+        const r = await api("/v1/sessions/" + sid + "/turns", {
+          method:"POST", body: JSON.stringify({ text })
+        });
+        const stillHere = currentSid() === sid;
+        if (workingEl.parentNode) workingEl.remove();
+        if (userEl) userEl.classList.remove("pending");
+        if (r.status === "discarded") {
+          if (userEl && userEl.parentNode) userEl.remove();
+          if (stillHere) ensurePlaceholder();
+        } else if (stillHere) {
+          if (userEl && r.user_seq != null) userEl.dataset.seq = String(r.user_seq);
+          if (userEl) attachUserActions(userEl, text, r.user_seq, false);
+          const events = r.events || [];
+          if (r.status === "stopped") stoppedSids.add(sid);
+          for (const ev of events) renderEvent(ev);
+        }
+        await refreshSessions();
+        if (stillHere) {
+          const cur = currentSession();
+          if (cur) $("chat-title").textContent = cur.title || "New chat";
+        }
+        await drainQueue(sid, r.status);
+      } catch (e) {
+        if (workingEl.parentNode) workingEl.remove();
+        if (userEl) userEl.classList.remove("pending");
+        if (currentSid() === sid) add("tool", String(e));
+      } finally {
+        if (inFlight && inFlight.sid === sid) inFlight = null;
+        if (resolveDone) resolveDone();
+        syncComposer();
+        if ($("status").textContent === "working…") $("status").textContent = "";
+      }
+    }
+    $("send").onclick = () => { if (inFlight && inFlight.sid === currentSid()) stopTurn(); else send(); };
+    $("queue-btn").onclick = () => enqueue($("text").value.trim());
+    $("inject").onclick = () => injectNow();
+    $("continue").onclick = () => continueTurn();
+    $("text").addEventListener("input", syncComposer);
+    $("text").addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && inFlight) { e.preventDefault(); stopTurn(); return; }
+      if (e.key !== "Enter" || e.repeat || e.isComposing) return;
+      if (e.shiftKey) return;
+      const busy = !!(inFlight && inFlight.sid === currentSid());
+      if (busy && (e.ctrlKey || e.metaKey)) { e.preventDefault(); injectNow(); return; }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      e.preventDefault();
+      if (busy) enqueue($("text").value.trim());
+      else send();
+    });
+    window.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape" || !inFlight) return;
+      if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+      e.preventDefault();
+      stopTurn();
+    });
     $("mic").onclick = async () => {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const rec = new MediaRecorder(stream);
@@ -128,6 +822,15 @@
       if (data.text) { $("text").value = data.text; $("status").textContent = "transcribed"; }
       else { $("status").textContent = JSON.stringify(data); }
     };
+
+    (async function boot() {
+      await refreshSessions();
+      if (!currentSid() && sessions.length) {
+        setActive(sessions[0], { skipHistory: true });
+      }
+      await loadHistory();
+      syncComposer();
+    })();
   </script>
 </body>
 </html>

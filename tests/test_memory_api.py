@@ -11,11 +11,10 @@ def _store():
 
 
 @pytest.mark.asyncio
-async def test_memory_remember_search_pin_forget():
+async def test_memory_remember_search_pin_forget(auth_header):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        tok = (await client.post("/v1/auth/token", json={"sub": "t"})).json()["token"]
-        headers = {"authorization": f"Bearer {tok}"}
+        headers = auth_header
         remembered = await client.post(
             "/memory/remember",
             json={"text": "the airbed firmware uses co3ntrol-rs", "source": "test"},
@@ -46,11 +45,10 @@ async def test_memory_remember_search_pin_forget():
 
 
 @pytest.mark.asyncio
-async def test_entity_graph_from_jsonld():
+async def test_entity_graph_from_jsonld(auth_header):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        tok = (await client.post("/v1/auth/token", json={"sub": "t"})).json()["token"]
-        headers = {"authorization": f"Bearer {tok}"}
+        headers = auth_header
         project = "urn:orbweaver:entity:project-airbed"
         r = await client.put(
             "/memory/entities",

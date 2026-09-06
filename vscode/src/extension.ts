@@ -71,8 +71,7 @@ async function ensureSession(): Promise<string> {
   if (sessionId) return sessionId;
   const { token } = cfg();
   if (!token) {
-    const minted = await request("POST", "/v1/auth/token", { sub: "vscode" });
-    await vscode.workspace.getConfiguration("orbweaver").update("token", minted.token, true);
+    throw new Error("Set orbweaver.token to a JWT from `python -m orbweaver.cli mint` on the gateway host");
   }
   const created = await request("POST", "/v1/sessions", {
     workspace_uri: workspaceUri(),
@@ -158,7 +157,18 @@ document.getElementById("s").onclick = () => {
 window.addEventListener("message", (e) => {
   const m = e.data;
   const p = document.createElement("pre");
-  p.textContent = JSON.stringify(m, null, 2);
+  if (m.type === "events" && Array.isArray(m.events)) {
+    const bits = [];
+    for (const ev of m.events) {
+      const text = ev.payload && ev.payload.text;
+      if (ev.kind === "assistant" || ev.kind === "turn_aborted") {
+        bits.push((ev.kind === "turn_aborted" ? "aborted: " : "") + (text || JSON.stringify(ev.payload)));
+      }
+    }
+    p.textContent = bits.length ? bits.join("\n\n") : JSON.stringify(m, null, 2);
+  } else {
+    p.textContent = JSON.stringify(m, null, 2);
+  }
   log.appendChild(p);
 });
 </script>

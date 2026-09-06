@@ -18,7 +18,15 @@ export ANTHROPIC_API_KEY=...    # optional; without it the loop echoes
 python3 -m orbweaver.cli serve
 ```
 
-Open http://127.0.0.1:8080/ — mint a JWT, create a session (`workspace:default` or `file:./rel`), send a turn.
+Mint a JWT on the gateway host (not over HTTP):
+
+```bash
+python3 -m orbweaver.cli mint
+```
+
+Open the web UI, paste the token, create a session (`workspace:default` or `file:./rel`), send a turn. HTTP minting is off unless `ORBWEAVER_ALLOW_HTTP_MINT=true`.
+
+For a VPS, bind `ORBWEAVER_HOST=127.0.0.1` and publish the UI on your Tailscale interface (`tailscale serve http://127.0.0.1:8080`) instead of `0.0.0.0`.
 
 ### Postgres
 
@@ -36,11 +44,33 @@ export DATABASE_URL=postgresql://orbweaver:orbweaver@localhost:5432/orbweaver
 cd vscode && npm install && npx tsc -p .
 ```
 
-Then **Install from VSIX** or **Run Extension** from the `vscode/` folder. Set `orbweaver.gatewayUrl` and optionally `orbweaver.token`. Default workspace URI is `workspace:default` (override with `orbweaver.workspaceUri`). Commands: Open Chat, Accept/Reject Diff, Open Plan (Markdown or HTML).
+Then **Install from VSIX** or **Run Extension** from the `vscode/` folder. Set `orbweaver.gatewayUrl` and `orbweaver.token` (from `python -m orbweaver.cli mint`). Default workspace URI is `workspace:default` (override with `orbweaver.workspaceUri`). Commands: Open Chat, Accept/Reject Diff, Open Plan (Markdown or HTML).
 
 ### Telegram
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWLIST` (comma-separated user ids). Sessions use `DockerWorkspace`. Voice notes go through `/v1/stt` when `faster-whisper` is installed (`pip install -e ".[stt]"`).
+
+### Permissions and sandbox
+
+Default mode is **auto**: in-project writes apply immediately; a transcript classifier (Sonnet, `ORBWEAVER_CLASSIFIER_MODEL`) reviews unsandboxed Bash, WebFetch, and `SpawnSubagent`. A separate Haiku injection probe (`ORBWEAVER_INJECTION_PROBE_MODEL`) warns on untrusted tool output. Telegram/cron abort after repeated classifier denials and **always tell the user why**.
+
+Linux Bash for `LocalWorkspace` runs in **bubblewrap** with filesystem isolation and **no network**. Commands that need the network retry unsandboxed only after the classifier allows it. On this host (Ubuntu with AppArmor userns restrictions):
+
+```bash
+sudo apt-get install -y bubblewrap
+sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+EOF
+sudo systemctl reload apparmor
+```
+
+If bubblewrap cannot start, local Bash fails closed (`ORBWEAVER_SANDBOX_FAIL_IF_UNAVAILABLE=true`). DockerWorkspace still uses Docker when the binary exists. Nested bwrap is skipped inside Compose containers.
 
 ### Tests
 

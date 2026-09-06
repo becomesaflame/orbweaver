@@ -158,7 +158,7 @@
       <h2 id="decisions">Locked decisions</h2>
       <div class="cards">
         <div class="card"><dl><dt>Languages</dt><dd>Python 3.12 backend. TypeScript VS Code extension.</dd></dl></div>
-        <div class="card"><dl><dt>LLM</dt><dd>Anthropic Messages API. <code>ANTHROPIC_API_KEY</code> on the gateway only. Default Sonnet; Opus for hard planning; Haiku for cheap classify/summarize. Ollama later as an optional fallback.</dd></dl></div>
+        <div class="card"><dl><dt>LLM</dt><dd>Anthropic Messages API. <code>ANTHROPIC_API_KEY</code> on the gateway only. Agent model: <code>ORBWEAVER_MODEL</code> (default Sonnet). Transcript classifier: <code>ORBWEAVER_CLASSIFIER_MODEL</code> (default Sonnet, independent). Injection probe: <code>ORBWEAVER_INJECTION_PROBE_MODEL</code> (default Haiku). Compaction summarizer: <code>ORBWEAVER_COMPACT_MODEL</code> (default Haiku). Ollama later as an optional fallback.</dd></dl></div>
         <div class="card"><dl><dt>Memory</dt><dd>One hybrid store: PostgreSQL 16 + pgvector. JSON-LD graph plus embedding chunks. Standardized Memory API in front of both.</dd></dl></div>
         <div class="card"><dl><dt>Retention</dt><dd>Store decay off in the first pass (<code>λ = 0</code>). Forget is explicit only. Pinning is first-class with a 4k token cap. Automatic eviction is phase 6.</dd></dl></div>
         <div class="card"><dl><dt>Workspaces</dt><dd>Same tools, different place. <code>LocalWorkspace</code> for VS Code (real files, inline diffs). <code>DockerWorkspace</code> for Telegram, cron, and untrusted sessions.</dd></dl></div>
@@ -166,7 +166,7 @@
         <div class="card"><dl><dt>Auth</dt><dd>JWT for VS Code and web chat. Telegram: bot token + allowlisted user IDs; the adapter mints an internal JWT. Rate limits per identity.</dd></dl></div>
         <div class="card"><dl><dt>Plan mode</dt><dd>Orbweaver plan mode must edit HTML and Markdown. HTML with diagrams is still an editable plan, not a one-way export.</dd></dl></div>
         <div class="card"><dl><dt>Portability</dt><dd>UUID schema and remap-able <code>workspace_uri</code> in phase 1. Snapshot CLI and off-site backups in phase 6. Secrets never travel in the pack.</dd></dl></div>
-        <div class="card"><dl><dt>Provenance</dt><dd>Reuse OpenHands, Continue, Nanoclaw, and leak-port <em>patterns</em> (Clawd-Code, pycc, Claw Code). Track borrowed trees in <code>PROVENANCE.md</code>.</dd></dl></div>
+        <div class="card"><dl><dt>Provenance</dt><dd>Original Python agent loop. Claude Code leak-port <em>patterns</em> for permissions, sandbox, and classifier (Clawd-Code, pycc, Claw Code) — no leaked TypeScript copied. VS Code diffs reimplemented from Continue APIs. Track borrowed trees in <code>PROVENANCE.md</code>.</dd></dl></div>
         <div class="card"><dl><dt>Deploy</dt><dd>Docker Compose on a work development server. Kubernetes deferred.</dd></dl></div>
         <div class="card"><dl><dt>Agents</dt><dd>One main loop plus optional subagents. Shared context via the Memory API, not a MetaGPT-style company simulation.</dd></dl></div>
       </div>
@@ -306,7 +306,7 @@ flowchart LR
       </div>
 
       <h3>Context across turns</h3>
-      <p>The conversation is the event stream (user, assistant, tools, <code>MemoryRecall</code>). Do not RAG from a blank slate each turn. Pins are a hard tax; the transcript is elastic; compaction is the valve. Compaction shrinks the <em>prompt</em>, not the database.</p>
+      <p>The conversation is the event stream (user, assistant, tools, <code>MemoryRecall</code>). Do not RAG from a blank slate each turn. Pins are a hard tax; the transcript is elastic; compaction is the valve. Compaction shrinks the <em>prompt</em>, not the database: a <code>compact_boundary</code> marks the live window; dropped events stay in the session log.</p>
       <div class="diagram">
         <pre class="mermaid">
 flowchart LR
@@ -328,35 +328,44 @@ flowchart LR
           <tr><td>Output reserve</td><td>16,000 tokens</td></tr>
           <tr><td>System + tool schemas</td><td>Measured, not a user budget (~12k typical)</td></tr>
           <tr><td>Pinned working memory</td><td><strong>4,000 hard cap</strong> (<code>ORBWEAVER_PINNED_TOKEN_CAP</code>). Overflowing a pin is rejected.</td></tr>
-          <tr><td>Event stream</td><td>The rest (~168k). Compact at ~85% full.</td></tr>
+          <tr><td>Event stream</td><td>The rest (~168k). Compact at ~85% full. Microcompact stubs old tool results in the prompt; oversized tool output is persisted under <code>.orbweaver/tool-results/</code>. Session notes (Haiku) are preferred; full compact is last resort with extractive fallback. After a boundary, recently read files are re-injected under a token cap.</td></tr>
         </tbody>
       </table>
       <p>New recalls land in the event stream. Dedupe by chunk id against the uncompacted window.</p>
 
       <h2 id="loop">Agent loop</h2>
-      <p>Wrap an existing Python harness (first choice: OpenHands Software Agent SDK). Shape it with Claude Code leak-port patterns: query/tool loop, deferred tools, permission modes, compaction, skills, MCP, plan mode, subagent spawn, session resume. Orbweaver-specific code is memory, channels, JWT, and session routing.</p>
+      <p>Original Python harness in <code>backend/orbweaver/agent.py</code>: Anthropic Messages API, <code>TOOL_SPEC</code>, <code>run_tools</code>, prompt-projection compaction in <code>orbweaver.compact</code>. Claude Code leak-port patterns shape permissions, bubblewrap sandboxing, the transcript classifier, the injection probe, and the compact cascade (boundary, microcompact, session notes, cached full compact). OpenHands is not a dependency. Orbweaver-specific code is memory, channels, JWT, and session routing.</p>
       <div class="diagram">
         <pre class="mermaid">
 flowchart TD
   Build["Build prompt: system plus pins plus events"] --> Call["Claude tool_use"]
-  Call --> Gate{"Permission gate?"}
-  Gate -->|block| Ask["AskUser or wait"]
-  Gate -->|allow| Exec["Run tool in workspace"]
-  Exec --> Append["Append action and observation"]
+  Call --> Deny{"deny or ask rule?"}
+  Deny -->|deny| Block["tool_result blocked"]
+  Deny -->|ask interactive| Ask["AskUser"]
+  Deny -->|ask headless| Abort["Abort and notify"]
+  Deny -->|no| Fast{"allowlist, in-project edit, or sandboxed bash?"}
+  Fast -->|yes| Exec["Run tool in workspace"]
+  Fast -->|no| Clf["Two-stage transcript classifier"]
+  Clf -->|block| Block
+  Clf -->|allow| Exec
+  Exec --> Probe["Injection probe on output"]
+  Probe --> Append["Append action and observation"]
+  Block --> Append
   Append --> More{"Model stop?"}
   More -->|no| Call
   More -->|yes| Done["Turn complete"]
-  Append --> Pressure{"Event budget about 85 percent?"}
-  Pressure -->|yes| Compact["Compact prompt; keep pins and recent raw"]
+  Append --> Pressure{"Live prompt about 85 percent?"}
+  Pressure -->|yes| Compact["Append compact_boundary; keep pins and recent raw"]
   Compact --> Call
         </pre>
       </div>
-      <p>v1 tools: Read, Write, ProposePatch, Glob, Grep, Bash, WebFetch, MemorySearch, MemoryRemember, MemoryPin, MemoryForget, SpawnSubagent, AskUser.</p>
-      <p>VS Code can auto-approve reads; patches wait for accept/reject. Telegram defaults to DockerWorkspace and stricter bash.</p>
+      <p>Default permission mode is <code>auto</code>. Deny/ask/allowlist run first. In-project Write and ProposePatch auto-allow. Bash that can run in bubblewrap (network off) auto-allows; unsandboxed or networked bash goes to the classifier (<code>ORBWEAVER_CLASSIFIER_MODEL</code>). After execution, a Haiku injection probe may prepend a warning on Read/Bash/WebFetch/MemorySearch output. The classifier never sees tool results. <code>SpawnSubagent</code> runs a nested <code>agent_turn</code> (depth 1) on a child Session that shares the parent workspace and Memory API; child sessions are hidden from the session list. Outbound handoff classification gates the spawn; <code>review_subagent_return</code> warns on the child's tool transcript before the parent sees results.</p>
+      <p>v1 tools: Read, Write, ProposePatch, Glob, Grep, Bash, WebFetch, MemorySearch, MemoryRemember, MemoryPin, MemoryForget, SpawnSubagent, AskUser, ScheduleTask.</p>
+      <p>VS Code: in auto mode in-project writes apply immediately; inline diffs are an optional overlay, not a blocking gate. Telegram and cron are headless: classifier denial limits abort the turn and notify the user. Telegram defaults to DockerWorkspace.</p>
       <p>Interfaces in phase 2: REST + WebSocket <code>/v1/sessions/{id}/events</code>, minimal <code>web/</code> chat, <code>POST /v1/stt</code> (faster-whisper).</p>
 
       <h2 id="vscode">VS Code extension</h2>
-      <p>Fork or vendor Continue’s vertical diff manager and chat webview. Wire to Orbweaver’s session protocol.</p>
+      <p>Chat webview plus inline decorations reimplemented against VS Code APIs (Continue’s vertical-diff <em>pattern</em>, not a vendor copy). Wire to Orbweaver’s session protocol.</p>
       <div class="diagram">
         <pre class="mermaid">
 flowchart LR
@@ -442,7 +451,7 @@ flowchart LR
       <p>Scaffold (monorepo, Compose Postgres, Anthropic ping, <code>PROVENANCE.md</code>, empty <code>snapshot/</code> package, local pytest smoke) happens at the start of the first pass.</p>
       <ol class="phases">
         <li class="pass"><strong>Phase 1 — Memory + API</strong> UUID PKs, JSON-LD, <code>workspace_uri</code>, Memory API, JWT, event log. Schema is snapshot-ready; no export CLI yet.</li>
-        <li class="pass"><strong>Phase 2 — Agents + chat</strong> OpenHands wrap, leak-port loop, 85% prompt compaction, LocalWorkspace, web chat, STT.</li>
+        <li class="pass"><strong>Phase 2 — Agents + chat</strong> Original Python loop, leak-port permissions/sandbox/classifier, prompt-projection compaction (boundary, microcompact, session notes, Haiku summary), LocalWorkspace, web chat, STT.</li>
         <li class="pass"><strong>Phase 3 — VS Code</strong> Continue diffs, HTML+Markdown plan mode, workspace URI at session start.</li>
         <li class="pass"><strong>Phase 4 — Telegram + cron</strong> In-process adapters, DockerWorkspace for untrusted sessions. End of first pass.</li>
         <li class="later"><strong>Phase 5 — CI only</strong> GitHub Actions: ruff, mypy, pytest, compose integration, Playwright, vscode-test. Not memory workers. Not research agents.</li>
