@@ -14,6 +14,10 @@ if [[ -x backend/.venv/bin/pip ]]; then
   (cd backend && .venv/bin/pip install -e ".[dev]")
 fi
 
+uid="$(id -u)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
 if systemctl --user cat orbweaver.service >/dev/null 2>&1; then
   systemctl --user restart orbweaver
 else
