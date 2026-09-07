@@ -26,28 +26,33 @@ Work on a **feature branch**. Do not commit on `main`.
 4. Push the feature branch. Open a **draft PR into `main`** as soon as there
    is something to review. Keep pushing the feature branch; CI tests run on
    the PR while it is draft.
-5. When the feature is ready: squash, mark the PR ready, merge into `main`.
-   Never force-push. Never rewrite history. Never push `main`.
+5. When the feature is ready: mark the PR ready and **enable auto-merge
+   (squash)** (`gh pr merge --squash --auto`). GitHub merges when `test`
+   is green. Do not click Merge yourself. Never force-push. Never rewrite
+   history. Never push `main`.
 
-Do not `git push origin HEAD:main` from a feature branch. The PR squash-merge
-is what updates production.
+Do not `git push origin HEAD:main` from a feature branch. The auto-merged
+squash is what updates production.
 
 ## CI pipeline
 
-Workflow: `.github/workflows/ci.yml`.
+Workflows: `.github/workflows/ci.yml` (PRs only) and
+`.github/workflows/deploy.yml` (`main` pushes only).
 
 ```
 feature branch  --PR into main-->  tests (GitHub-hosted)
-squash-merge into main          -->  push to main
-                                 -->  if LIVE_HOST_DEPLOY: self-hosted runner
-                                      on lampropeltis runs deploy/update-live.sh
+ready + auto-merge              -->  GitHub squash-merges when test is green
+push to main                    -->  if LIVE_HOST_DEPLOY: self-hosted runner
+                                     on lampropeltis runs deploy/update-live.sh
 ```
 
-PR checks are the merge gate. Deploy runs on the `main` push after merge
-(GitHub's merge is not an Actions `GITHUB_TOKEN` push, so that workflow does
-start). There is no `release-candidate` branch and no promote job.
+Pytest on the PR is the merge gate. Auto-merge is what lands the SHA; there
+is no Actions job that merges PRs. Deploy is a separate workflow so a PR
+does not show skipped promote/deploy checks. GitHub's merge is not an
+Actions `GITHUB_TOKEN` push, so deploy does start.
 
-Failed PR tests mean do not merge. `main` stays on the last green SHA.
+Failed PR tests mean auto-merge waits (or the PR stays open). `main` stays
+on the last green SHA.
 
 The live host pulls `origin/main`, checks out `main`, and restarts
 `orbweaver.service`. Agents do not deploy.
@@ -73,6 +78,7 @@ deployed.
 
 ## Trust and permissions
 
-Pushing the feature branch and opening/merging a PR into `main` is allowed
-when the user asked to land or ship the work. Pushing `main`, force-push,
-history rewrite, editing systemd, and restarting the gateway are not.
+Pushing the feature branch, opening a PR into `main`, and enabling squash
+auto-merge is allowed when the user asked to land or ship the work. Pushing
+`main`, force-push, history rewrite, editing systemd, and restarting the
+gateway are not.
