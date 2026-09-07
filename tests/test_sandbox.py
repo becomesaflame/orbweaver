@@ -18,6 +18,14 @@ def test_bwrap_argv_has_isolation(tmp_path: Path):
     assert "--ro-bind" in argv and "/" in argv
     assert argv[argv.index("--tmpfs") + 1] == "/tmp" or "/run" in argv
     assert "--tmpfs" in argv and "/run" in argv
+    root_i = next(
+        i
+        for i, a in enumerate(argv[:-2])
+        if a == "--ro-bind" and argv[i + 1] == "/" and argv[i + 2] == "/"
+    )
+    dev_i = argv.index("--dev")
+    assert argv[dev_i + 1] == "/dev"
+    assert root_i < dev_i, "host --ro-bind / / must not clobber --dev /dev"
 
 
 def test_bwrap_full_network_skips_unshare_net(tmp_path: Path):
