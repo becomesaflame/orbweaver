@@ -111,7 +111,6 @@ def build_bwrap_argv(
     ]
     if not full_network:
         argv.extend(["--unshare-net"])
-    argv.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
     if host_root:
         argv.extend(["--ro-bind", "/", "/"])
     else:
@@ -127,6 +126,8 @@ def build_bwrap_argv(
                 "/etc/group",
             ]
         )
+    # After the host bind: a private /dev (so /dev/null is writable), /proc, and /tmp.
+    argv.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
     argv.extend(["--tmpfs", "/run"])
     if not _is_run_symlink():
         argv.extend(["--tmpfs", "/var/run"])
