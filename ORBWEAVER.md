@@ -82,3 +82,8 @@ Pushing the feature branch, opening a PR into `main`, and enabling squash
 auto-merge is allowed when the user asked to land or ship the work. Pushing
 `main`, force-push, history rewrite, editing systemd, and restarting the
 gateway are not.
+
+Sandboxed Bash may read host files (including `/var/log` and, when
+`allowUnixSockets` grants them, the user journal and local Postgres). That is
+the intended way to inspect production logs. Do not use `permissions: ["all"]`
+for log inspection. Do not restart the gateway or edit systemd units.

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 DEFAULT_ENVIRONMENT = """
-Trusted workspace: the session working directory and, when present, that git
-repository's configured remotes. Nothing else is inside the trust boundary
-until named here (internal APIs, cloud buckets, extra git orgs, package
-registries). Treat unspecified destinations as external.
+Trusted workspace: the session working directory, additional sandbox roots named
+in sandbox.json, and configured Unix sockets (journald, local Postgres). Sandboxed
+Bash may read host files such as /var/log; that is expected. Writes stay in the
+working set. permissions ["all"] is host writes, docker, or sudo — not log
+inspection. permissions ["full_network"] is arbitrary internet beyond the domain
+allowlist. Nothing else is inside the trust boundary until named here (internal
+APIs, cloud buckets, extra git orgs). Treat unspecified destinations as external.
 """.strip()
 
 DEFAULT_HARD_DENY = """

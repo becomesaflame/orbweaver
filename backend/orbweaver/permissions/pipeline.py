@@ -16,6 +16,7 @@ from orbweaver.permissions.rules import (
     ask_rules,
     deny_rules,
     in_project_path,
+    in_working_set,
     is_critical_rm,
     matching_rule,
     path_is_always_denied,
@@ -83,8 +84,23 @@ def _abort(ctx: dict[str, Any], reason_code: str, decision: PermissionDecision, 
     raise TurnAborted(text, payload)
 
 
-def bash_sandboxable(inp: dict[str, Any], workspace_kind: str) -> bool:
+def bash_permissions(inp: dict[str, Any]) -> frozenset[str]:
+    out: set[str] = set()
     if inp.get("unsandboxed") is True or str(inp.get("unsandboxed")).lower() in {"1", "true"}:
+        out.add("all")
+    raw = inp.get("permissions") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    for item in raw:
+        val = str(item).strip().lower()
+        if val in {"all", "full_network"}:
+            out.add(val)
+    return frozenset(out)
+
+
+def bash_sandboxable(inp: dict[str, Any], workspace_kind: str) -> bool:
+    perms = bash_permissions(inp)
+    if perms & {"all", "full_network"}:
         return False
     if is_critical_rm(str(inp.get("command") or "")):
         return False
@@ -136,7 +152,21 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
     if name in SAFE_ALLOWLIST:
         if name == "Read" and path_is_always_denied(str(inp.get("path") or "")):
             return PermissionDecision("deny", "path denied", "deny_rule")
-        return PermissionDecision("allow", "safe tool allowlist", "allowlist")
+        if name == "Read" and workspace and not in_working_set(str(inp.get("path") or ""), workspace):
+            if not getattr(workspace, "host_reads", True):
+                return PermissionDecision("deny", f"path denied: {inp.get('path')}", "deny_rule")
+        elif name in {"Glob", "Grep"}:
+            glob_pat = str(inp.get("glob") or inp.get("pattern") or "")
+            if (
+                workspace
+                and glob_pat.startswith(("/", "~"))
+                and not in_working_set(glob_pat, workspace)
+            ):
+                pass
+            else:
+                return PermissionDecision("allow", "safe tool allowlist", "allowlist")
+        else:
+            return PermissionDecision("allow", "safe tool allowlist", "allowlist")
 
     if name in {"Write", "ProposePatch"} and workspace and in_project_path(str(inp.get("path") or ""), workspace):
         return PermissionDecision("allow", "in-project file edit", "acceptEdits")
@@ -151,7 +181,7 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
         and settings.orbweaver_sandbox
         and settings.orbweaver_sandbox_fail_if_unavailable
         and not sandbox_available()
-        and not (inp.get("unsandboxed") is True)
+        and not bash_permissions(inp)
         and not is_critical_rm(str(inp.get("command") or ""))
     ):
         return PermissionDecision(

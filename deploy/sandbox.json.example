@@ -1,0 +1,15 @@
+{
+  "additionalReadonlyPaths": [],
+  "additionalReadwritePaths": [],
+  "denyRead": ["~/.ssh", "~/.gnupg", "~/.aws"],
+  "allowUnixSockets": [
+    "/run/user/1000/systemd/journal/socket",
+    "/run/postgresql/.s.PGSQL.5432"
+  ],
+  "networkPolicy": {
+    "default": "deny",
+    "includeDefaults": true,
+    "allow": [],
+    "deny": []
+  }
+}

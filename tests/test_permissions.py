@@ -5,7 +5,11 @@ import pytest
 from orbweaver.config import settings
 from orbweaver.permissions.denial import DenialTrackingState, reset_denial_states
 from orbweaver.permissions.pipeline import TurnAborted, can_use_tool
-from orbweaver.permissions.rules import is_critical_rm, path_is_always_denied
+from orbweaver.permissions.rules import (
+    in_working_set,
+    is_critical_rm,
+    path_is_always_denied,
+)
 from orbweaver.store import Event
 from orbweaver.workspace import DockerWorkspace, LocalWorkspace
 
@@ -200,3 +204,63 @@ async def test_in_project_write_docker_skips_classifier(tmp_path, monkeypatch):
     decision = await can_use_tool("Write", {"path": "src/a.py", "content": "x"}, ctx)
     assert decision.behavior == "allow"
     assert decision.fast_path == "acceptEdits"
+
+
+@pytest.mark.asyncio
+async def test_unsandboxed_and_permissions_all_use_classifier(tmp_path, monkeypatch):
+    seen = {}
+
+    async def classify(*_a, **kwargs):
+        seen["ran"] = True
+        return {"should_block": False, "reason": "ok", "stage": "fast"}
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", classify)
+    monkeypatch.setattr("orbweaver.permissions.pipeline.sandbox_available", lambda: True)
+    d1 = await can_use_tool("Bash", {"command": "journalctl --user -n 1"}, _ctx(tmp_path))
+    assert d1.fast_path == "sandbox"
+    assert "ran" not in seen
+    d2 = await can_use_tool(
+        "Bash",
+        {"command": "docker ps", "permissions": ["all"]},
+        _ctx(tmp_path),
+    )
+    assert d2.behavior == "allow"
+    assert d2.fast_path == "classifier"
+    d3 = await can_use_tool(
+        "Bash",
+        {"command": "curl https://example.com", "permissions": ["full_network"]},
+        _ctx(tmp_path),
+    )
+    assert d3.fast_path == "classifier"
+    d4 = await can_use_tool("Bash", {"command": "id", "unsandboxed": True}, _ctx(tmp_path))
+    assert d4.fast_path == "classifier"
+
+
+@pytest.mark.asyncio
+async def test_read_outside_working_set_is_classified(tmp_path, monkeypatch):
+    async def classify(*_a, **_k):
+        return {"should_block": False, "reason": "host read ok", "stage": "fast"}
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", classify)
+    decision = await can_use_tool("Read", {"path": "/var/log/syslog"}, _ctx(tmp_path))
+    assert decision.behavior == "allow"
+    assert decision.fast_path == "classifier"
+
+
+@pytest.mark.asyncio
+async def test_read_in_workspace_still_allowlisted(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x", encoding="utf-8")
+    decision = await can_use_tool("Read", {"path": "src/a.py"}, _ctx(tmp_path))
+    assert decision.fast_path == "allowlist"
+
+
+def test_in_working_set_relative(tmp_path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    assert in_working_set("src/a.py", ws)
+    assert in_working_set("src/a.py", ws, write=True)
+    assert not in_working_set("/etc/passwd", ws, write=True)
