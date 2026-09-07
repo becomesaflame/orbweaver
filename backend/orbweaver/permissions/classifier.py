@@ -170,7 +170,6 @@ async def classify_action(
         stage1 = await client.messages.create(
             model=model,
             max_tokens=64,
-            temperature=0,
             system=system,
             messages=[
                 *prefix,
@@ -194,7 +193,6 @@ async def classify_action(
         stage2 = await client.messages.create(
             model=model,
             max_tokens=4096,
-            temperature=0,
             system=system,
             messages=[
                 *prefix,

@@ -1,6 +1,8 @@
 import json
 from uuid import uuid4
 
+import pytest
+
 from orbweaver.permissions.classifier import (
     build_transcript,
     parse_block,
@@ -67,3 +69,44 @@ def test_parse_block_and_projection():
     assert parse_block("nope") is None
     assert to_classifier_input("Bash", {"command": "echo hi"}) == "echo hi"
     assert to_classifier_input("Glob", {"pattern": "*"}) == ""
+
+
+@pytest.mark.asyncio
+async def test_classify_action_does_not_pass_temperature(monkeypatch):
+    from types import SimpleNamespace
+
+    from orbweaver.config import settings
+    from orbweaver.permissions.classifier import classify_action
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+
+    class StrictClient:
+        def __init__(self):
+            self.messages = self
+            self.kwargs = []
+
+        async def create(self, **kwargs):
+            if "temperature" in kwargs:
+                raise TypeError(
+                    "AsyncMessages.create() got an unexpected keyword argument 'temperature'"
+                )
+            self.kwargs.append(kwargs)
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="<block>no</block>")]
+            )
+
+    client = StrictClient()
+    sid = uuid4()
+    events = [
+        Event(id=uuid4(), session_id=sid, seq=1, kind="user", payload={"text": "sync git"})
+    ]
+    result = await classify_action(
+        events,
+        "Bash",
+        {"command": "git fetch --all && git pull", "unsandboxed": True},
+        client=client,
+    )
+    assert result["should_block"] is False
+    assert result["stage"] == "fast"
+    assert client.kwargs
+    assert all("temperature" not in kw for kw in client.kwargs)

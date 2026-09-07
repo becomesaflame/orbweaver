@@ -59,7 +59,6 @@ async def probe_tool_output(name: str, output: str, *, client=None) -> dict[str,
         resp = await client.messages.create(
             model=settings.orbweaver_injection_probe_model,
             max_tokens=32,
-            temperature=0,
             system=INJECTION_PROBE_SYSTEM,
             messages=[{"role": "user", "content": payload}],
         )
