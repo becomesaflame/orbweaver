@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover
     review_subagent_return = None
 
 CHILD_BLOCKED_TOOLS = frozenset({"SpawnSubagent", "AskUser", "ScheduleTask"})
-SUBAGENT_MAX_ROUNDS = 16
+SUBAGENT_MAX_ROUNDS = 24
 RESULT_TEXT_CAP = 8000
 SUBAGENT_SYSTEM_EXTRA = (
     "You are an Orbweaver subagent. Complete the assigned task using tools. "
@@ -140,6 +140,8 @@ async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         status = "cancelled"
 
     child_events = await store.list_events(child_id)
+    if status == "ok" and any(e.kind == "turn_aborted" for e in child_events):
+        status = "aborted"
     for ev in child_events:
         if ev.kind != "patch_proposal":
             continue

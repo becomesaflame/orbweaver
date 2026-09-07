@@ -18,6 +18,7 @@ DEFAULT_ALLOWED_DOMAINS: tuple[str, ...] = (
     "debian.org",
     "files.pythonhosted.org",
     "ghcr.io",
+    "*.github.com",
     "github.com",
     "gitlab.com",
     "golang.org",

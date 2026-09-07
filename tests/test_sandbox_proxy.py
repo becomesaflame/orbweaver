@@ -17,7 +17,8 @@ from orbweaver.sandbox.proxy import (
 
 def test_host_match_and_deny_wins():
     assert host_matches("pypi.org", "pypi.org")
-    assert host_matches("files.pythonhosted.org", "*.pythonhosted.org")
+    assert host_matches("api.github.com", "*.github.com")
+    assert host_matches("github.com", "*.github.com")
     assert host_matches("pythonhosted.org", "*.pythonhosted.org")
     assert not host_matches("evilpythonhosted.org", "*.pythonhosted.org")
     net = NetworkPolicy(default="deny", include_defaults=True, allow=("example.com",), deny=("*.evil.com",))

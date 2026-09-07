@@ -159,6 +159,33 @@ async def test_cancel_during_child_returns_cancelled(ws, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_child_abort_reports_aborted_status(ws, monkeypatch):
+    store = reset_store_for_tests()
+    monkeypatch.setattr("orbweaver.subagent.review_subagent_return", _passthrough_review)
+
+    async def fake_turn(store, session_id, user_text, workspace, **kwargs):
+        await store.append_event(
+            session_id,
+            "turn_aborted",
+            {"text": "Stopped this turn after 1 blocked actions."},
+        )
+        await store.append_event(
+            session_id,
+            "assistant",
+            {"text": "Stopped this turn after 1 blocked actions."},
+        )
+        return []
+
+    monkeypatch.setattr("orbweaver.agent.agent_turn", fake_turn)
+    sid = uuid4()
+    await store.put_entity(_parent_entity(store, sid))
+    result = await run_tools("SpawnSubagent", {"task": "push main"}, _ctx(store, ws, sid))
+    body = json.loads(result)
+    assert body["status"] == "aborted"
+    assert "Stopped this turn" in body["text"]
+
+
+@pytest.mark.asyncio
 async def test_child_patch_proposal_copied_to_parent(ws, monkeypatch):
     store = reset_store_for_tests()
     monkeypatch.setattr("orbweaver.subagent.review_subagent_return", _passthrough_review)

@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     orbweaver_injection_probe_model: str = "claude-haiku-4-5"
     orbweaver_permission_mode: str = "auto"
     orbweaver_permission_deny: str = ""
-    orbweaver_permission_ask: str = "Bash(git push *)"
+    orbweaver_permission_ask: str = ""
     orbweaver_permission_allow: str = ""
     orbweaver_automode_environment: str = "$defaults"
     orbweaver_automode_soft_deny: str = "$defaults"

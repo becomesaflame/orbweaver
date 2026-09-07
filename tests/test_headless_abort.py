@@ -99,6 +99,23 @@ async def test_headless_ask_abort_persists_events(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_round_cap_appends_assistant(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    resp = SimpleNamespace(content=[_ToolUse("Glob", {"pattern": "*"})])
+
+    def factory(*a, **k):
+        return _FakeAnthropic([resp, resp], *a, **k)
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", factory)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    events = await agent_turn(store, sid, "list files", ws, max_rounds=2)
+    texts = [e.payload.get("text") for e in events if e.kind == "assistant"]
+    assert any("Stopped after 2 tool rounds" in (t or "") for t in texts)
+
+
+@pytest.mark.asyncio
 async def test_denied_spawn_never_reaches_stub(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
 
