@@ -5,7 +5,6 @@ import pytest
 from PIL import Image
 
 from orbweaver.channels.telegram import (
-    apply_telegram_workspace_kind,
     notify_telegram_photo,
     send_session_photo,
     session_for_telegram_user,
@@ -14,7 +13,7 @@ from orbweaver.channels.telegram import (
 from orbweaver.config import settings
 from orbweaver.image import save_inbound_image
 from orbweaver.store import reset_store_for_tests
-from orbweaver.workspace import LocalWorkspace
+from orbweaver.workspace import LocalWorkspace, apply_local_workspace_kind
 
 
 def _png_bytes() -> bytes:
@@ -52,7 +51,7 @@ async def test_telegram_session_migrates_docker_kind():
     ent = await session_for_telegram_user(store, 42)
     ent.jsonld["workspace_kind"] = "docker"
     await store.put_entity(ent)
-    assert apply_telegram_workspace_kind({"workspace_kind": "docker"}) is True
+    assert apply_local_workspace_kind({"workspace_kind": "docker"}) is True
     migrated = await session_for_telegram_user(store, 42)
     assert migrated.id == ent.id
     assert migrated.jsonld["workspace_kind"] == "local"

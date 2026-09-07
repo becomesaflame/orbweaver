@@ -53,6 +53,22 @@ async def test_rejects_absolute_workspace_uri(auth_header):
         assert r.status_code == 400
 
 
+@pytest.mark.asyncio
+async def test_docker_workspace_kind_coerced_to_local(auth_header):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.post(
+            "/v1/sessions",
+            json={"workspace_uri": "workspace:default", "workspace_kind": "docker"},
+            headers=auth_header,
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["id"]
+        listed = await client.get("/v1/sessions", headers=auth_header)
+        row = next(s for s in listed.json()["sessions"] if s["id"] == sid)
+        assert row["workspace_kind"] == "local"
+
+
 def test_local_workspace_read_write(tmp_path: Path):
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     ws.write("a.txt", "hello")

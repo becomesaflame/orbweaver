@@ -8,7 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from orbweaver.agent import agent_turn
 from orbweaver.config import settings
 from orbweaver.store import get_store
-from orbweaver.workspace import make_workspace
+from orbweaver.workspace import bind_workspace
 
 log = logging.getLogger(__name__)
 _scheduler: AsyncIOScheduler | None = None
@@ -35,18 +35,9 @@ async def sweep() -> None:
         if session_id:
             sess = await store.get_entity(session_id)
             if sess:
-                kind = str(sess.jsonld.get("workspace_kind") or "local")
-                if sess.jsonld.get("telegram_user_id") is not None:
-                    from orbweaver.channels.telegram import (
-                        TELEGRAM_WORKSPACE_KIND,
-                        apply_telegram_workspace_kind,
-                    )
-
-                    if apply_telegram_workspace_kind(sess.jsonld):
-                        await store.put_entity(sess)
-                    kind = TELEGRAM_WORKSPACE_KIND
-                uri = str(sess.jsonld.get("workspace_uri") or "workspace:default")
-                ws = make_workspace(kind, uri, settings.workspace_root)
+                ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
+                if changed:
+                    await store.put_entity(sess)
                 await store.append_event(session_id, "cron", {"job_id": str(job.id)})
                 events = await agent_turn(
                     store, session_id, message, ws, workspace_kind=kind, headless=True

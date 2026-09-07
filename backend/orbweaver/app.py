@@ -39,7 +39,7 @@ from orbweaver.uris import (
     mkdir_workspace,
     validate_workspace_uri,
 )
-from orbweaver.workspace import make_workspace
+from orbweaver.workspace import bind_workspace, normalize_workspace_kind
 
 def _web_dir() -> Path:
     env = os.environ.get("ORBWEAVER_WEB_DIR")
@@ -390,7 +390,7 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
             "@id": session_at_id(uid),
             "@type": SESSION_TYPE,
             "workspace_uri": uri,
-            "workspace_kind": body.workspace_kind,
+            "workspace_kind": normalize_workspace_kind(body.workspace_kind),
             "title": body.title or "New chat",
             "status": "active",
             "created_at": datetime.now(UTC).isoformat(),
@@ -415,7 +415,7 @@ async def list_sessions(_u: dict = Depends(_user)) -> dict[str, Any]:
                 "id": str(ent.id),
                 "title": _display_title(ent.jsonld, preview),
                 "workspace_uri": str(ent.jsonld.get("workspace_uri") or "workspace:default"),
-                "workspace_kind": str(ent.jsonld.get("workspace_kind") or "local"),
+                "workspace_kind": normalize_workspace_kind(ent.jsonld.get("workspace_kind")),
                 "status": str(ent.jsonld.get("status") or "active"),
                 "created_at": str(ent.jsonld.get("created_at") or ""),
                 "last_event_at": last_at,
@@ -463,9 +463,9 @@ async def _run_turn(
         raise HTTPException(409, "turn already running")
     if not resume:
         await _maybe_autotitle(store, sess, user_text)
-    kind = str(sess.jsonld.get("workspace_kind") or "local")
-    uri = str(sess.jsonld.get("workspace_uri"))
-    ws = make_workspace(kind, uri, settings.workspace_root)
+    ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
+    if changed:
+        await store.put_entity(sess)
     state = RunningTurn(cancel=asyncio.Event())
     _running_turns[session_id] = state
     try:
@@ -606,9 +606,9 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
             text = data.get("text") or ""
             if not text:
                 continue
-            kind = str(sess.jsonld.get("workspace_kind") or "local")
-            uri = str(sess.jsonld.get("workspace_uri"))
-            ws = make_workspace(kind, uri, settings.workspace_root)
+            ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
+            if changed:
+                await store.put_entity(sess)
 
             def emit(msg: dict[str, Any]) -> None:
                 asyncio.get_event_loop().create_task(websocket.send_json(msg))

@@ -3,7 +3,7 @@ from pathlib import Path
 from orbweaver.config import settings
 from orbweaver.sandbox.bwrap import build_bwrap_argv, sandbox_available
 from orbweaver.sandbox.policy import SandboxPolicy
-from orbweaver.workspace import DockerWorkspace, LocalWorkspace
+from orbweaver.workspace import LocalWorkspace
 
 
 def test_bwrap_argv_has_isolation(tmp_path: Path):
@@ -86,18 +86,6 @@ def test_local_bash_fail_closed_without_bwrap(tmp_path: Path, monkeypatch):
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     out = ws.bash("echo hi")
     assert "sandbox_unavailable" in out
-
-
-def test_docker_bash_without_binary(tmp_path: Path, monkeypatch):
-    def boom(*_a, **_k):
-        raise FileNotFoundError("docker")
-
-    monkeypatch.setattr("orbweaver.workspace.subprocess.run", boom)
-    ws = DockerWorkspace("workspace:default", str(tmp_path))
-    ws.write("x.txt", "ok")
-    assert ws.read("x.txt") == "ok"
-    out = ws.bash("echo hi", permissions=["all"])
-    assert "docker is not available" in out
 
 
 def test_sandbox_available_in_container(monkeypatch):

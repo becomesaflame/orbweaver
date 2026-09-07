@@ -1,4 +1,4 @@
-"""Local and Docker workspaces."""
+"""Session workspaces (LocalWorkspace plus bubblewrap Bash)."""
 
 from __future__ import annotations
 
@@ -170,72 +170,29 @@ class LocalWorkspace:
         return {"ok": True, "path": path, "old": old, "new": new, "updated": updated}
 
 
-class DockerWorkspace:
-    """Untrusted sessions: run bash in a throwaway container with the tree mounted."""
+WORKSPACE_KIND_LOCAL = "local"
 
-    host_reads = False
 
-    def __init__(self, workspace_uri: str, workspace_root: str, image: str = "python:3.12-slim") -> None:
-        self.local = LocalWorkspace(workspace_uri, workspace_root, host_reads=False)
-        self.image = image
+def normalize_workspace_kind(kind: str | None) -> str:
+    """DockerWorkspace is gone; leftover 'docker' rows become local."""
+    del kind
+    return WORKSPACE_KIND_LOCAL
 
-    def read(self, path: str) -> str:
-        return self.local.read(path)
 
-    def write(self, path: str, content: str) -> None:
-        return self.local.write(path, content)
+def apply_local_workspace_kind(jsonld: dict) -> bool:
+    if jsonld.get("workspace_kind") == WORKSPACE_KIND_LOCAL:
+        return False
+    jsonld["workspace_kind"] = WORKSPACE_KIND_LOCAL
+    return True
 
-    def write_bytes(self, path: str, data: bytes) -> str:
-        return self.local.write_bytes(path, data)
 
-    def read_bytes(self, path: str) -> bytes:
-        return self.local.read_bytes(path)
-
-    def glob(self, pattern: str) -> list[str]:
-        return self.local.glob(pattern)
-
-    def grep(self, pattern: str, glob: str = "**/*") -> list[str]:
-        return self.local.grep(pattern, glob)
-
-    def propose_patch(self, path: str, old: str, new: str) -> dict:
-        return self.local.propose_patch(path, old, new)
-
-    def bash(
-        self,
-        command: str,
-        timeout: int = 30,
-        sandbox: bool = True,
-        unsandboxed: bool = False,
-        permissions: list[str] | tuple[str, ...] | None = None,
-    ) -> str:
-        del sandbox, unsandboxed, permissions
-        root = str(self.local.root)
-        try:
-            proc = subprocess.run(
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "-v",
-                    f"{root}:/work:rw",
-                    "-w",
-                    "/work",
-                    self.image,
-                    "bash",
-                    "-lc",
-                    command,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except FileNotFoundError:
-            return "docker is not available on this host; bash refused for DockerWorkspace"
-        return ((proc.stdout or "") + (proc.stderr or ""))[-200_000:]
+def bind_workspace(jsonld: dict, workspace_root: str):
+    """LocalWorkspace for this session; persist if jsonld.workspace_kind was rewritten."""
+    changed = apply_local_workspace_kind(jsonld)
+    uri = str(jsonld.get("workspace_uri") or "workspace:default")
+    return LocalWorkspace(uri, workspace_root), WORKSPACE_KIND_LOCAL, changed
 
 
 def make_workspace(kind: str, uri: str, workspace_root: str):
-    if kind == "docker":
-        return DockerWorkspace(uri, workspace_root)
+    del kind
     return LocalWorkspace(uri, workspace_root)

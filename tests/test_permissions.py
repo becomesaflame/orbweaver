@@ -12,7 +12,7 @@ from orbweaver.permissions.rules import (
     path_is_always_denied,
 )
 from orbweaver.store import Event
-from orbweaver.workspace import DockerWorkspace, LocalWorkspace
+from orbweaver.workspace import LocalWorkspace
 
 
 def _ctx(tmp_path: Path, *, headless=False, kind="local"):
@@ -235,19 +235,6 @@ def test_critical_rm_and_deny_names():
     assert not is_protected_git_push("git push origin feature/telegram-local-bash")
     assert not is_protected_git_push("git push -u origin HEAD")
     assert not is_protected_git_push("pytest -q")
-
-
-@pytest.mark.asyncio
-async def test_in_project_write_docker_skips_classifier(tmp_path, monkeypatch):
-    async def boom(*_a, **_k):
-        raise AssertionError("classifier should not run")
-
-    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
-    ctx = _ctx(tmp_path, kind="docker")
-    ctx["workspace"] = DockerWorkspace("workspace:default", str(tmp_path))
-    decision = await can_use_tool("Write", {"path": "src/a.py", "content": "x"}, ctx)
-    assert decision.behavior == "allow"
-    assert decision.fast_path == "acceptEdits"
 
 
 @pytest.mark.asyncio

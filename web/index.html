@@ -167,11 +167,10 @@
       display:flex; flex-wrap:wrap; gap:0.45rem; align-items:center;
       padding:0.7rem 1rem 0.9rem; border-top:1px solid var(--line);
     }
-    #ws-modal footer input, #ws-modal footer select {
+    #ws-modal footer input {
       background:#1f1f1f; color:var(--ink); border:1px solid var(--line);
       border-radius:6px; padding:0.35rem 0.45rem; font:inherit;
     }
-    #ws-kind { min-width:6rem; }
     #ws-new-name { flex:1; min-width:8rem; }
     #ws-modal .grow { flex:1; }
     #ws-use { background:var(--accent); color:#111; font-weight:650; }
@@ -221,10 +220,6 @@
       <div id="ws-host"></div>
       <div id="ws-dirs"></div>
       <footer>
-        <select id="ws-kind" title="Workspace kind">
-          <option value="local">local</option>
-          <option value="docker">docker</option>
-        </select>
         <input id="ws-new-name" placeholder="New folder name">
         <button type="button" class="ghost" id="ws-mkdir">Create</button>
         <span class="grow"></span>
@@ -283,7 +278,8 @@
     const savedWuri = localStorage.getItem(LS.wuri);
     if (savedWuri) $("wuri").value = savedWuri;
     const savedWkind = localStorage.getItem(LS.wkind);
-    if (savedWkind) $("wkind").value = savedWkind;
+    if (savedWkind && savedWkind !== "docker") $("wkind").value = savedWkind;
+    else $("wkind").value = "local";
     const hashSid = (location.hash.match(/^#\/s\/([0-9a-f-]{36})$/i) || [])[1];
     if (hashSid) $("sid").value = hashSid;
     if (!$("token").value.trim()) $("settings").classList.remove("hidden");
@@ -294,8 +290,9 @@
       else localStorage.removeItem(LS.sid);
     }
     function persistWorkspace() {
+      if ($("wkind").value.trim() === "docker") $("wkind").value = "local";
       localStorage.setItem(LS.wuri, $("wuri").value.trim());
-      localStorage.setItem(LS.wkind, $("wkind").value.trim());
+      localStorage.setItem(LS.wkind, $("wkind").value.trim() || "local");
     }
     function persistCollapsed() {
       localStorage.setItem(LS.collapsed, JSON.stringify([...collapsed]));
@@ -682,7 +679,7 @@
         method:"POST",
         body: JSON.stringify({
           workspace_uri: uri || $("wuri").value,
-          workspace_kind: kind || $("wkind").value,
+          workspace_kind: "local",
           title: "New chat"
         })
       });
@@ -690,7 +687,7 @@
         id: r.id,
         title: r.title || "New chat",
         workspace_uri: r.workspace_uri || uri || $("wuri").value,
-        workspace_kind: kind || $("wkind").value,
+        workspace_kind: "local",
         created_at: new Date().toISOString(),
         last_event_at: "",
         event_count: 0
@@ -720,7 +717,6 @@
         $("status").textContent = "paste a JWT from python -m orbweaver.cli mint";
         return;
       }
-      $("ws-kind").value = $("wkind").value === "docker" ? "docker" : "local";
       $("ws-new-name").value = "";
       $("ws-modal").classList.remove("hidden");
       await loadPicker("");
@@ -789,7 +785,7 @@
     });
     $("ws-use").onclick = () => {
       const uri = $("ws-use").dataset.uri || "workspace:default";
-      const kind = $("ws-kind").value || "local";
+      const kind = "local";
       $("wuri").value = uri;
       $("wkind").value = kind;
       persistWorkspace();
