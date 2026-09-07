@@ -660,6 +660,19 @@ async def agent_turn(
             await maybe_compact(
                 store, session_id, client=client, workspace=workspace, system=system
             )
+        else:
+            fire(
+                await store.append_event(
+                    session_id,
+                    "assistant",
+                    {
+                        "text": (
+                            f"Stopped after {max_rounds} tool rounds without a final answer. "
+                            "Continue in a follow-up, or spawn a subagent with a narrower task."
+                        )
+                    },
+                )
+            )
         return produced
     except TurnAborted as e:
         await record_abort(e)

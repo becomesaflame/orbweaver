@@ -18,6 +18,7 @@ from orbweaver.permissions.rules import (
     in_project_path,
     in_working_set,
     is_critical_rm,
+    is_protected_git_push,
     matching_rule,
     path_is_always_denied,
 )
@@ -135,6 +136,17 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
         return PermissionDecision("deny", f"denied by rule {deny_hit[0]}({deny_hit[1] or '*'})", "deny_rule")
 
     ask_hit = matching_rule(ask_rules(), name, inp)
+    cmd = str(inp.get("command") or "") if name == "Bash" else ""
+    if (
+        ask_hit
+        and name == "Bash"
+        and (ask_hit[1] or "").replace(" ", "") in {"gitpush*", "gitpush"}
+        and not is_protected_git_push(cmd)
+    ):
+        # Legacy ORBWEAVER_PERMISSION_ASK=Bash(git push *) must not block feature branches.
+        ask_hit = None
+    if name == "Bash" and is_protected_git_push(cmd):
+        ask_hit = ask_hit or ("Bash", "protected git push")
     if ask_hit:
         decision = PermissionDecision(
             "ask",

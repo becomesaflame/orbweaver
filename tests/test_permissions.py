@@ -8,6 +8,7 @@ from orbweaver.permissions.pipeline import TurnAborted, can_use_tool
 from orbweaver.permissions.rules import (
     in_working_set,
     is_critical_rm,
+    is_protected_git_push,
     path_is_always_denied,
 )
 from orbweaver.store import Event
@@ -91,7 +92,7 @@ async def test_git_push_ask_headless_aborts(tmp_path, monkeypatch):
     with pytest.raises(TurnAborted) as ei:
         await can_use_tool(
             "Bash",
-            {"command": "git push origin feature"},
+            {"command": "git push origin main"},
             _ctx(tmp_path, headless=True),
         )
     assert "Stopped this turn" in ei.value.message
@@ -132,6 +133,39 @@ async def test_env_path_denied(tmp_path, monkeypatch):
     monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
     decision = await can_use_tool("Write", {"path": ".env", "content": "x"}, _ctx(tmp_path))
     assert decision.behavior == "deny"
+
+
+@pytest.mark.asyncio
+async def test_feature_branch_push_is_sandboxed(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run for feature-branch push")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    monkeypatch.setattr("orbweaver.permissions.pipeline.sandbox_available", lambda: True)
+    decision = await can_use_tool(
+        "Bash",
+        {"command": "git push -u origin feature/telegram-local-bash"},
+        _ctx(tmp_path, headless=True),
+    )
+    assert decision.behavior == "allow"
+    assert decision.fast_path == "sandbox"
+
+
+@pytest.mark.asyncio
+async def test_legacy_git_push_glob_skips_feature_branch(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("legacy git push glob must not reach classifier")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    monkeypatch.setattr("orbweaver.permissions.pipeline.sandbox_available", lambda: True)
+    monkeypatch.setattr(settings, "orbweaver_permission_ask", "Bash(git push *)")
+    decision = await can_use_tool(
+        "Bash",
+        {"command": "git push origin HEAD"},
+        _ctx(tmp_path, headless=True),
+    )
+    assert decision.behavior == "allow"
+    assert decision.fast_path == "sandbox"
 
 
 @pytest.mark.asyncio
@@ -191,6 +225,16 @@ def test_critical_rm_and_deny_names():
     assert not is_critical_rm("rm -rf ./build")
     assert path_is_always_denied(".env")
     assert path_is_always_denied(".ssh/id_rsa")
+    assert is_protected_git_push("git push origin main")
+    assert is_protected_git_push("git push -u origin master")
+    assert is_protected_git_push("git push origin HEAD:main")
+    assert is_protected_git_push("git push origin feature:main")
+    assert is_protected_git_push("git push --force origin feature")
+    assert is_protected_git_push("git push -f origin foo")
+    assert is_protected_git_push("git push origin +main")
+    assert not is_protected_git_push("git push origin feature/telegram-local-bash")
+    assert not is_protected_git_push("git push -u origin HEAD")
+    assert not is_protected_git_push("pytest -q")
 
 
 @pytest.mark.asyncio

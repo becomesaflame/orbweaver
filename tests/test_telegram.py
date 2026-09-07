@@ -5,6 +5,7 @@ import pytest
 from PIL import Image
 
 from orbweaver.channels.telegram import (
+    apply_telegram_workspace_kind,
     notify_telegram_photo,
     send_session_photo,
     session_for_telegram_user,
@@ -37,12 +38,24 @@ async def test_telegram_session_reuse():
     b = await session_for_telegram_user(store, 42)
     c = await session_for_telegram_user(store, 7)
     assert a.id == b.id
-    assert a.jsonld["workspace_kind"] == "docker"
+    assert a.jsonld["workspace_kind"] == "local"
     assert a.jsonld["telegram_chat_id"] == 42
     updated = await session_for_telegram_user(store, 42, chat_id=999)
     assert updated.id == a.id
     assert updated.jsonld["telegram_chat_id"] == 999
     assert c.id != a.id
+
+
+@pytest.mark.asyncio
+async def test_telegram_session_migrates_docker_kind():
+    store = reset_store_for_tests()
+    ent = await session_for_telegram_user(store, 42)
+    ent.jsonld["workspace_kind"] = "docker"
+    await store.put_entity(ent)
+    assert apply_telegram_workspace_kind({"workspace_kind": "docker"}) is True
+    migrated = await session_for_telegram_user(store, 42)
+    assert migrated.id == ent.id
+    assert migrated.jsonld["workspace_kind"] == "local"
 
 
 class _Resp:

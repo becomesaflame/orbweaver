@@ -35,7 +35,16 @@ async def sweep() -> None:
         if session_id:
             sess = await store.get_entity(session_id)
             if sess:
-                kind = str(sess.jsonld.get("workspace_kind") or "docker")
+                kind = str(sess.jsonld.get("workspace_kind") or "local")
+                if sess.jsonld.get("telegram_user_id") is not None:
+                    from orbweaver.channels.telegram import (
+                        TELEGRAM_WORKSPACE_KIND,
+                        apply_telegram_workspace_kind,
+                    )
+
+                    if apply_telegram_workspace_kind(sess.jsonld):
+                        await store.put_entity(sess)
+                    kind = TELEGRAM_WORKSPACE_KIND
                 uri = str(sess.jsonld.get("workspace_uri") or "workspace:default")
                 ws = make_workspace(kind, uri, settings.workspace_root)
                 await store.append_event(session_id, "cron", {"job_id": str(job.id)})
