@@ -44,8 +44,10 @@ class TurnAborted(Exception):
 def summarize_input(name: str, inp: dict[str, Any]) -> str:
     if name == "Bash":
         return str(inp.get("command") or "")[:240]
-    if name in {"Read", "Write", "ProposePatch"}:
+    if name in {"Read", "Write", "ProposePatch", "SendPhoto"}:
         return str(inp.get("path") or "")[:240]
+    if name == "GenerateImage":
+        return str(inp.get("prompt") or "")[:240]
     if name == "WebFetch":
         return str(inp.get("url") or "")[:240]
     if name == "SpawnSubagent":
@@ -100,12 +102,17 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
     events: list[Event] = ctx.get("events") or []
     mode = (settings.orbweaver_permission_mode or "auto").strip().lower()
 
-    if name in {"Read", "Write", "ProposePatch"}:
+    if name in {"Read", "Write", "ProposePatch", "SendPhoto"}:
         path = str(inp.get("path") or "")
         if path_is_always_denied(path):
             return PermissionDecision("deny", f"path denied: {path}", "deny_rule")
         if name != "Read" and workspace and not in_project_path(path, workspace):
             return PermissionDecision("deny", f"path denied: {path}", "deny_rule")
+
+    if name == "GenerateImage":
+        out_path = str(inp.get("path") or "attachments/generated.png")
+        if path_is_always_denied(out_path) or (workspace and not in_project_path(out_path, workspace)):
+            return PermissionDecision("deny", f"path denied: {out_path}", "deny_rule")
 
     deny_hit = matching_rule(deny_rules(), name, inp)
     if deny_hit:

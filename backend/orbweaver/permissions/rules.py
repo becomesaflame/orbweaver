@@ -19,6 +19,8 @@ SAFE_ALLOWLIST = frozenset(
         "MemoryRemember",
         "MemoryPin",
         "MemoryForget",
+        "SendPhoto",
+        "GenerateImage",
     }
 )
 
@@ -95,8 +97,10 @@ def parse_rules(blob: str) -> list[tuple[str, str | None]]:
 def _subject(tool: str, inp: dict[str, Any]) -> str:
     if tool == "Bash":
         return str(inp.get("command") or "")
-    if tool in {"Read", "Write", "ProposePatch"}:
+    if tool in {"Read", "Write", "ProposePatch", "SendPhoto"}:
         return str(inp.get("path") or "")
+    if tool == "GenerateImage":
+        return str(inp.get("prompt") or inp.get("path") or "")
     if tool == "WebFetch":
         return str(inp.get("url") or "")
     if tool == "SpawnSubagent":

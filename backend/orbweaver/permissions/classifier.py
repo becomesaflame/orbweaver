@@ -55,8 +55,10 @@ def load_project_intent(workspace) -> str:
 def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
     if name == "Bash":
         return str(inp.get("command") or "")
-    if name in {"Read", "Write", "ProposePatch"}:
+    if name in {"Read", "Write", "ProposePatch", "SendPhoto"}:
         return {"path": inp.get("path")}
+    if name == "GenerateImage":
+        return {"prompt": inp.get("prompt"), "path": inp.get("path")}
     if name == "WebFetch":
         return {"url": inp.get("url")}
     if name == "SpawnSubagent":

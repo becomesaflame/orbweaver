@@ -199,3 +199,5 @@ def test_parent_tool_spec_still_includes_spawn():
     names = {t["name"] for t in TOOL_SPEC}
     assert "SpawnSubagent" in names
     assert "AskUser" in names
+    assert "SendPhoto" in names
+    assert "GenerateImage" in names

@@ -38,6 +38,27 @@ async def test_allowlist_skips_classifier(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_photo_allowlisted(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    decision = await can_use_tool("SendPhoto", {"path": "attachments/a.jpg"}, _ctx(tmp_path))
+    assert decision.behavior == "allow"
+    assert decision.fast_path == "allowlist"
+
+
+@pytest.mark.asyncio
+async def test_send_photo_denies_env(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    decision = await can_use_tool("SendPhoto", {"path": ".env"}, _ctx(tmp_path))
+    assert decision.behavior == "deny"
+
+
+@pytest.mark.asyncio
 async def test_in_project_write_skips_classifier(tmp_path, monkeypatch):
     async def boom(*_a, **_k):
         raise AssertionError("classifier should not run")

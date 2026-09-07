@@ -28,6 +28,15 @@ class LocalWorkspace:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
+    def write_bytes(self, path: str, data: bytes) -> str:
+        p = self._safe(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return str(p.relative_to(self.root))
+
+    def read_bytes(self, path: str) -> bytes:
+        return self._safe(path).read_bytes()
+
     def glob(self, pattern: str) -> list[str]:
         return [str(p.relative_to(self.root)) for p in self.root.glob(pattern) if p.is_file()]
 
@@ -97,6 +106,12 @@ class DockerWorkspace:
 
     def write(self, path: str, content: str) -> None:
         return self.local.write(path, content)
+
+    def write_bytes(self, path: str, data: bytes) -> str:
+        return self.local.write_bytes(path, data)
+
+    def read_bytes(self, path: str) -> bytes:
+        return self.local.read_bytes(path)
 
     def glob(self, pattern: str) -> list[str]:
         return self.local.glob(pattern)
