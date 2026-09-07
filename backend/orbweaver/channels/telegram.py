@@ -126,7 +126,12 @@ async def start_telegram() -> None:
         uri = str(sess.jsonld.get("workspace_uri") or "workspace:default") if sess else "workspace:default"
         ws = make_workspace(kind, uri, settings.workspace_root)
         events = await agent_turn(
-            store, session_id, update.message.text, ws, workspace_kind=kind, headless=True
+            store, session_id, update.message.text, ws, workspace_kind=kind, headless=True,
+            system_extra=(
+                "Format all responses as plain text. Do not use Markdown — Telegram does not "
+                "render it as rich text. Use plain text with spacing, emoji, and simple "
+                "punctuation to organize responses instead."
+            ),
         )
         await update.message.reply_text(texts_for_reply(events) or "(no assistant text)")
 

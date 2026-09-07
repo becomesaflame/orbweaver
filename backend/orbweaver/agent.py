@@ -7,6 +7,7 @@ import json
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -183,8 +184,17 @@ def _events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     return events_to_messages(events)
 
 
+def _orbweaver_md() -> str:
+    """Return contents of ORBWEAVER.md from the repo root, or empty string if absent."""
+    candidate = Path(__file__).resolve().parents[3] / "ORBWEAVER.md"
+    try:
+        return candidate.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+
+
 def static_system() -> str:
-    return (
+    base = (
         f"You are Orbweaver, a coding agent. The running gateway is Orbweaver {__version__} "
         f"(semantic version). If asked what version is running, answer {__version__}. "
         "Use tools to read and patch the workspace. "
@@ -193,6 +203,10 @@ def static_system() -> str:
         "matter. Keep pins small. If a tool is blocked, find a safer path; do not try to "
         "bypass the permission gate."
     )
+    md = _orbweaver_md()
+    if md:
+        base = base + "\n\n# ORBWEAVER.md\n" + md
+    return base
 
 
 def build_agent_system(pins: str, extra: str = "") -> list[dict[str, Any]]:
