@@ -83,7 +83,8 @@ auto-merge is allowed when the user asked to land or ship the work. Pushing
 `main`, force-push, history rewrite, editing systemd, and restarting the
 gateway are not.
 
-Sandboxed Bash may read host files (including `/var/log` and, when
-`allowUnixSockets` grants them, the user journal and local Postgres). That is
-the intended way to inspect production logs. Do not use `permissions: ["all"]`
+Sandboxed Bash may read host files (including `/var/log`). The system journal
+socket and this uid's user journal socket are granted by default, so
+`journalctl -u` works without `permissions: ["all"]`. Extra sockets (local
+Postgres) still go in `allowUnixSockets`. Do not use `permissions: ["all"]`
 for log inspection. Do not restart the gateway or edit systemd units.

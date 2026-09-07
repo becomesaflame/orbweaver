@@ -1,7 +1,9 @@
 from pathlib import Path
 
+from orbweaver.sandbox.bwrap import build_bwrap_argv
 from orbweaver.sandbox.domains import DEFAULT_ALLOWED_DOMAINS
 from orbweaver.sandbox.policy import (
+    default_journal_sockets,
     is_hardcoded_socket_deny,
     load_sandbox_policy,
 )
@@ -14,6 +16,17 @@ def test_hardcoded_denies_and_docker_sock(tmp_path: Path, monkeypatch):
     assert any(str(p).endswith(".ssh") for p in policy.deny_read), homes
     assert is_hardcoded_socket_deny(Path("/run/docker.sock"))
     assert is_hardcoded_socket_deny(tmp_path / "docker.sock")
+    journals = set(default_journal_sockets())
+    assert journals.issubset(set(policy.allow_unix_sockets))
+
+
+def test_loaded_policy_binds_journal_socket(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("orbweaver.sandbox.policy.Path.home", lambda: tmp_path)
+    policy = load_sandbox_policy(tmp_path, environ={}, home=tmp_path)
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp", policy=policy)
+    sock = "/run/systemd/journal/socket"
+    assert sock in argv
+    assert argv[argv.index(sock) - 1] == "--ro-bind-try"
 
 
 def test_merge_unions_paths_and_repo_wins_default(tmp_path: Path, monkeypatch):

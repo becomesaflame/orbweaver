@@ -40,9 +40,29 @@ def test_bwrap_binds_sockets_and_hides_run(tmp_path: Path):
 
 def test_bwrap_deny_read_overlay(tmp_path: Path):
     hidden = tmp_path / "secrets"
+    hidden.mkdir()
     policy = SandboxPolicy(deny_read=(hidden,))
     argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp", policy=policy)
-    assert str(hidden.resolve()) in argv
+    dest = str(hidden.resolve())
+    assert argv[argv.index(dest) - 1] == "--tmpfs"
+
+
+def test_bwrap_skips_missing_deny_read(tmp_path: Path):
+    missing = tmp_path / "no-such-gnupg"
+    policy = SandboxPolicy(deny_read=(missing,))
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp", policy=policy)
+    assert str(missing) not in argv
+    assert str(missing.resolve()) not in argv
+
+
+def test_bwrap_hides_deny_read_file(tmp_path: Path):
+    secret = tmp_path / "token"
+    secret.write_text("nope", encoding="utf-8")
+    policy = SandboxPolicy(deny_read=(secret,))
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp", policy=policy)
+    dest = str(secret.resolve())
+    i = argv.index(dest)
+    assert argv[i - 2 : i] == ["--ro-bind", "/dev/null"]
 
 
 def test_local_bash_fail_closed_without_bwrap(tmp_path: Path, monkeypatch):

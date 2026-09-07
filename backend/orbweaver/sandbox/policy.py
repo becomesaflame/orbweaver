@@ -22,6 +22,16 @@ HARDCODED_UNIX_SOCKET_DENY: tuple[str, ...] = (
     "/run/docker.sock",
 )
 
+
+def default_journal_sockets(uid: int | None = None) -> tuple[Path, ...]:
+    """System journal plus this uid's user journal. `/run` is tmpfs-hidden otherwise."""
+    user_id = os.getuid() if uid is None else uid
+    return (
+        Path("/run/systemd/journal/socket"),
+        Path(f"/run/user/{user_id}/systemd/journal/socket"),
+    )
+
+
 PROTECTED_WRITE_REL: tuple[str, ...] = (
     ".git/hooks",
     ".git/config",
@@ -223,10 +233,12 @@ def _with_hardcoded_denies(policy: SandboxPolicy, home: Path | None = None) -> S
             deny.append((home_dir / raw[2:]).resolve())
         else:
             deny.append(expand_path(raw, relative_to=home_dir))
+    socks = list(policy.allow_unix_sockets)
+    socks.extend(default_journal_sockets())
     return replace(
         policy,
         deny_read=tuple(_unique_paths(deny)),
-        allow_unix_sockets=_filter_sockets(policy.allow_unix_sockets),
+        allow_unix_sockets=_filter_sockets(socks),
     )
 
 
