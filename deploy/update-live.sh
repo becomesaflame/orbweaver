@@ -24,4 +24,5 @@ else
   echo "orbweaver.service is not installed; skip restart" >&2
 fi
 
-curl -fsS --retry 5 --retry-delay 1 http://127.0.0.1:8080/health
+# curl --retry does not retry connection-refused unless asked; uvicorn is not listening yet right after restart.
+curl -fsS --retry 10 --retry-delay 1 --retry-connrefused --retry-max-time 30 http://127.0.0.1:8080/health
