@@ -1,9 +1,9 @@
 name: ci
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
+  push:
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   test:
-    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,29 +26,8 @@ jobs:
       - run: python -m pytest ../tests -q
         working-directory: backend
 
-  promote:
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/release-candidate'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Fast-forward main from release-candidate
-        run: |
-          set -euo pipefail
-          git fetch origin main
-          if ! git merge-base --is-ancestor origin/main HEAD; then
-            echo "origin/main is not an ancestor of release-candidate; refusing non-FF promote"
-            exit 1
-          fi
-          git push origin HEAD:refs/heads/main
-
   deploy:
-    needs: promote
-    if: github.event_name == 'push' && github.ref == 'refs/heads/release-candidate' && vars.LIVE_HOST_DEPLOY == 'true'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.LIVE_HOST_DEPLOY == 'true'
     runs-on: [self-hosted, linux]
     env:
       XDG_RUNTIME_DIR: /run/user/1000

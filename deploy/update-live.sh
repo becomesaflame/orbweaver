@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fast-forward the production checkout to origin/main and restart the gateway.
-# Intended for a self-hosted runner on the live host, after CI has promoted RC.
+# Intended for a self-hosted runner on the live host, after a green merge to main.
 set -euo pipefail
 
 LIVE="${ORBWEAVER_LIVE:-/home/orbweaver/orbweaver}"
