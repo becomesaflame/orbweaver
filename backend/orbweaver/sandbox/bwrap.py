@@ -55,6 +55,21 @@ def sandbox_available() -> bool:
     return bwrap_path() is not None
 
 
+def _deny_read_overlay_args(hidden: Path) -> list[str]:
+    """Hide an existing denyRead path. Skip missing ones: bwrap cannot mkdir on a ro-bind."""
+    try:
+        if not hidden.exists():
+            return []
+        dest = str(hidden)
+        if hidden.is_dir():
+            return ["--tmpfs", dest]
+        if hidden.is_file():
+            return ["--ro-bind", "/dev/null", dest]
+    except OSError:
+        return []
+    return []
+
+
 def _dir_chain(path: Path) -> list[str]:
     posix = path.as_posix()
     if not posix.startswith("/"):
@@ -125,7 +140,7 @@ def build_bwrap_argv(
             argv.extend(["--dir", d])
         argv.extend(["--ro-bind-try", str(sock_p), str(sock_p)])
     for hidden in pol.deny_read:
-        argv.extend(["--tmpfs", str(hidden)])
+        argv.extend(_deny_read_overlay_args(hidden))
     for rw in pol.readwrite_roots(root, tmp):
         argv.extend(["--bind", str(rw), str(rw)])
     for rel in PROTECTED_WRITE_REL:
