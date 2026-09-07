@@ -99,3 +99,34 @@ async def test_list_sessions_autotitle_and_rename(tmp_path, monkeypatch, auth_he
         assert patched.json()["title"] == "Sidebar"
         listed = await client.get("/v1/sessions", headers=headers)
         assert listed.json()["sessions"][0]["title"] == "Sidebar"
+
+
+
+@pytest.mark.asyncio
+async def test_browse_workspaces(tmp_path: Path, monkeypatch, auth_header):
+    (tmp_path / "orbweaver").mkdir()
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    from orbweaver.config import settings
+
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        denied = await client.get("/v1/workspaces")
+        assert denied.status_code == 401
+        listed = await client.get("/v1/workspaces", headers=auth_header)
+        assert listed.status_code == 200, listed.text
+        body = listed.json()
+        assert body["uri"] == "workspace:default"
+        assert [d["name"] for d in body["dirs"]] == ["orbweaver"]
+        child = await client.get("/v1/workspaces", params={"rel": "orbweaver"}, headers=auth_header)
+        assert child.status_code == 200, child.text
+        assert child.json()["uri"] == "workspace:orbweaver"
+        made = await client.post(
+            "/v1/workspaces",
+            json={"parent": "orbweaver", "name": "notes"},
+            headers=auth_header,
+        )
+        assert made.status_code == 200, made.text
+        assert made.json()["uri"] == "file:./orbweaver/notes"
+        escaped = await client.get("/v1/workspaces", params={"rel": ".."}, headers=auth_header)
+        assert escaped.status_code == 400

@@ -129,6 +129,51 @@
       font-size:0.75rem; color:var(--muted); padding:0.12rem 0.45rem; border-radius:6px;
     }
     .msg-actions button:hover { color:var(--ink); }
+    .btn-new.secondary {
+      background:transparent; color:var(--ink); border:1px solid var(--line); font-weight:600;
+    }
+    .btn-new.secondary:hover { background:var(--hover); filter:none; }
+    #ws-modal.hidden { display:none; }
+    #ws-modal {
+      position:fixed; inset:0; background:rgba(0,0,0,0.55);
+      display:flex; align-items:center; justify-content:center; z-index:40;
+    }
+    #ws-modal .sheet {
+      width:min(34rem, 94vw); max-height:82vh; overflow:hidden;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px;
+      display:flex; flex-direction:column;
+    }
+    #ws-modal header {
+      padding:0.85rem 1rem 0.55rem; border-bottom:1px solid var(--line);
+    }
+    #ws-modal header h3 { margin:0; font-size:0.95rem; font-weight:650; }
+    #ws-modal header p { margin:0.35rem 0 0; color:var(--muted); font-size:0.8rem; }
+    #ws-crumbs {
+      display:flex; flex-wrap:wrap; gap:0.2rem; align-items:center;
+      padding:0.55rem 1rem; border-bottom:1px solid var(--line); font-size:0.8rem;
+    }
+    #ws-crumbs button { padding:0.15rem 0.35rem; color:#cfcfcf; }
+    #ws-crumbs .sep { color:var(--muted); }
+    #ws-host { padding:0 1rem 0.35rem; color:var(--muted); font-size:0.75rem; word-break:break-all; }
+    #ws-dirs { flex:1; overflow-y:auto; padding:0.4rem 0.55rem 0.6rem; min-height:12rem; }
+    #ws-dirs .dir {
+      width:100%; display:flex; align-items:center; gap:0.45rem;
+      padding:0.42rem 0.5rem; border-radius:8px;
+    }
+    #ws-dirs .dir .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    #ws-dirs .empty { padding:1.5rem 0.5rem; }
+    #ws-modal footer {
+      display:flex; flex-wrap:wrap; gap:0.45rem; align-items:center;
+      padding:0.7rem 1rem 0.9rem; border-top:1px solid var(--line);
+    }
+    #ws-modal footer input, #ws-modal footer select {
+      background:#1f1f1f; color:var(--ink); border:1px solid var(--line);
+      border-radius:6px; padding:0.35rem 0.45rem; font:inherit;
+    }
+    #ws-kind { min-width:6rem; }
+    #ws-new-name { flex:1; min-width:8rem; }
+    #ws-modal .grow { flex:1; }
+    #ws-use { background:var(--accent); color:#111; font-weight:650; }
     .msg.working, .msg.stopped {
       color:var(--muted); font-style:italic; background:transparent; border-left-color:#555;
     }
@@ -139,6 +184,7 @@
     <div class="brand"><h1>Orbweaver</h1></div>
     <div class="rail-actions">
       <button type="button" class="btn-new" id="newsession">+ New chat</button>
+      <button type="button" class="btn-new secondary" id="newworkspace">+ New workspace</button>
       <input id="search" class="search" placeholder="Search chats" autocomplete="off">
     </div>
     <div class="rail-list" id="session-list">
@@ -164,6 +210,28 @@
       </div>
     </div>
   </aside>
+  <div id="ws-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="ws-modal-title">
+    <div class="sheet">
+      <header>
+        <h3 id="ws-modal-title">Choose workspace folder</h3>
+        <p>Folders under WORKSPACE_ROOT. Sessions store a portable URI, not an absolute path.</p>
+      </header>
+      <div id="ws-crumbs"></div>
+      <div id="ws-host"></div>
+      <div id="ws-dirs"></div>
+      <footer>
+        <select id="ws-kind" title="Workspace kind">
+          <option value="local">local</option>
+          <option value="docker">docker</option>
+        </select>
+        <input id="ws-new-name" placeholder="New folder name">
+        <button type="button" class="ghost" id="ws-mkdir">Create</button>
+        <span class="grow"></span>
+        <button type="button" class="ghost" id="ws-cancel">Cancel</button>
+        <button type="button" id="ws-use">Use this folder</button>
+      </footer>
+    </div>
+  </div>
   <div id="stage">
     <header class="chat-bar">
       <h2 id="chat-title">New chat</h2>
@@ -450,6 +518,13 @@
       const head = document.createElement("div");
       head.className = "sec-label";
       head.innerHTML = "<span>Workspaces</span>";
+      const addWsRoot = document.createElement("button");
+      addWsRoot.type = "button";
+      addWsRoot.className = "icon-btn";
+      addWsRoot.title = "New workspace";
+      addWsRoot.textContent = "+";
+      addWsRoot.onclick = (ev) => { ev.stopPropagation(); openWorkspacePicker(); };
+      head.appendChild(addWsRoot);
       root.appendChild(head);
       for (const [key, items] of groups) {
         const first = items[0];
@@ -622,6 +697,107 @@
         $("status").textContent = String(e);
       });
     };
+
+    let pickerRel = "";
+    function closeWorkspacePicker() {
+      $("ws-modal").classList.add("hidden");
+    }
+    async function openWorkspacePicker() {
+      if (!$("token").value.trim()) {
+        $("settings").classList.remove("hidden");
+        $("status").textContent = "paste a JWT from python -m orbweaver.cli mint";
+        return;
+      }
+      $("ws-kind").value = $("wkind").value === "docker" ? "docker" : "local";
+      $("ws-new-name").value = "";
+      $("ws-modal").classList.remove("hidden");
+      await loadPicker("");
+      $("ws-new-name").focus();
+    }
+    function crumbParts(rel) {
+      const parts = (rel || "").split("/").filter(Boolean);
+      const out = [{ label: "root", rel: "" }];
+      let acc = "";
+      for (const part of parts) {
+        acc = acc ? acc + "/" + part : part;
+        out.push({ label: part, rel: acc });
+      }
+      return out;
+    }
+    async function loadPicker(rel) {
+      pickerRel = rel || "";
+      const r = await api("/v1/workspaces?rel=" + encodeURIComponent(pickerRel));
+      $("ws-host").textContent = r.host_path || "";
+      const crumbs = $("ws-crumbs");
+      crumbs.replaceChildren();
+      crumbParts(r.rel).forEach((c, i, arr) => {
+        if (i) {
+          const sep = document.createElement("span");
+          sep.className = "sep";
+          sep.textContent = "/";
+          crumbs.appendChild(sep);
+        }
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = c.label;
+        b.onclick = () => loadPicker(c.rel).catch((e) => { $("status").textContent = String(e); });
+        if (i === arr.length - 1) b.style.fontWeight = "650";
+        crumbs.appendChild(b);
+      });
+      const list = $("ws-dirs");
+      list.replaceChildren();
+      const dirs = r.dirs || [];
+      if (!dirs.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No subfolders. Use this folder or create one.";
+        list.appendChild(empty);
+      }
+      dirs.forEach((d) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "dir";
+        b.innerHTML = '<span class="name"></span><span class="ws-kind"></span>';
+        b.querySelector(".name").textContent = d.name;
+        b.querySelector(".ws-kind").textContent = d.uri;
+        b.onclick = () => loadPicker(d.rel).catch((e) => { $("status").textContent = String(e); });
+        list.appendChild(b);
+      });
+      $("ws-use").dataset.uri = r.uri;
+    }
+    $("newworkspace").onclick = () => {
+      openWorkspacePicker().catch((e) => { $("status").textContent = String(e); });
+    };
+    $("ws-cancel").onclick = closeWorkspacePicker;
+    $("ws-modal").addEventListener("click", (ev) => {
+      if (ev.target === $("ws-modal")) closeWorkspacePicker();
+    });
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape" && !$("ws-modal").classList.contains("hidden")) closeWorkspacePicker();
+    });
+    $("ws-use").onclick = () => {
+      const uri = $("ws-use").dataset.uri || "workspace:default";
+      const kind = $("ws-kind").value || "local";
+      $("wuri").value = uri;
+      $("wkind").value = kind;
+      persistWorkspace();
+      closeWorkspacePicker();
+      createSession(uri, kind).catch((e) => { $("status").textContent = String(e); });
+    };
+    $("ws-mkdir").onclick = () => {
+      const name = $("ws-new-name").value.trim();
+      if (!name) { $("status").textContent = "enter a folder name"; return; }
+      api("/v1/workspaces", {
+        method: "POST",
+        body: JSON.stringify({ parent: pickerRel, name })
+      }).then((r) => {
+        $("ws-new-name").value = "";
+        return loadPicker(r.rel);
+      }).catch((e) => { $("status").textContent = String(e); });
+    };
+    $("ws-new-name").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); $("ws-mkdir").click(); }
+    });
 
     async function requestCancel(discard) {
       const flight = inFlight;

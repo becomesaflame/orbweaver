@@ -32,7 +32,12 @@ from orbweaver.store import (
     session_at_id,
 )
 from orbweaver.subagent import is_subagent_session
-from orbweaver.uris import WorkspaceURIError, validate_workspace_uri
+from orbweaver.uris import (
+    WorkspaceURIError,
+    list_workspace_dirs,
+    mkdir_workspace,
+    validate_workspace_uri,
+)
 from orbweaver.workspace import make_workspace
 
 def _web_dir() -> Path:
@@ -130,6 +135,11 @@ class SessionBody(BaseModel):
     workspace_uri: str
     workspace_kind: str = "local"
     title: str = "New chat"
+
+
+class WorkspaceMkdirBody(BaseModel):
+    parent: str = ""
+    name: str
 
 
 class SessionPatch(BaseModel):
@@ -344,6 +354,24 @@ async def pin_api(body: PinBody, _u: dict = Depends(_user)) -> dict[str, str]:
 async def forget_api(body: ForgetBody, _u: dict = Depends(_user)) -> dict[str, str]:
     await get_store().forget_chunk(body.id)
     return {"status": "forgotten"}
+
+
+@app.get("/v1/workspaces")
+async def browse_workspaces(rel: str = "", _u: dict = Depends(_user)) -> dict[str, Any]:
+    try:
+        return list_workspace_dirs(settings.workspace_root, rel)
+    except FileNotFoundError as e:
+        raise HTTPException(404, "folder not found") from e
+    except WorkspaceURIError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/v1/workspaces")
+async def mkdir_workspace_api(body: WorkspaceMkdirBody, _u: dict = Depends(_user)) -> dict[str, Any]:
+    try:
+        return mkdir_workspace(settings.workspace_root, body.parent, body.name)
+    except WorkspaceURIError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @app.post("/v1/sessions")
