@@ -9,8 +9,27 @@ import subprocess
 from pathlib import Path
 
 from orbweaver.config import settings
+from orbweaver.sandbox.errors import label_sandbox_output
+from orbweaver.sandbox.policy import (
+    PROTECTED_WRITE_REL,
+    SandboxPolicy,
+    load_sandbox_policy,
+)
 
 log = logging.getLogger(__name__)
+
+FALLBACK_RO_BINDS: tuple[str, ...] = (
+    "/usr",
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/sbin",
+    "/etc",
+    "/var",
+    "/home",
+    "/opt",
+    "/var/log",
+)
 
 
 class SandboxUnavailable(Exception):
@@ -36,62 +55,94 @@ def sandbox_available() -> bool:
     return bwrap_path() is not None
 
 
-def build_bwrap_argv(command: str, workspace_root: Path, tmp_dir: Path) -> list[str]:
+def _dir_chain(path: Path) -> list[str]:
+    posix = path.as_posix()
+    if not posix.startswith("/"):
+        return []
+    parts = [p for p in posix.split("/") if p]
+    acc: list[str] = []
+    out: list[str] = []
+    for part in parts[:-1]:
+        acc.append(part)
+        out.append("/" + "/".join(acc))
+    return out
+
+
+def _is_run_symlink() -> bool:
+    try:
+        return Path("/var/run").is_symlink()
+    except OSError:
+        return False
+
+
+def build_bwrap_argv(
+    command: str,
+    workspace_root: Path,
+    tmp_dir: Path,
+    *,
+    policy: SandboxPolicy | None = None,
+    full_network: bool = False,
+    host_root: bool = True,
+) -> list[str]:
     exe = bwrap_path() or "bwrap"
-    root = str(workspace_root.resolve())
-    tmp = str(tmp_dir.resolve())
-    return [
+    root = workspace_root.resolve()
+    tmp = tmp_dir.resolve()
+    pol = policy or SandboxPolicy()
+    argv: list[str] = [
         exe,
         "--unshare-user",
         "--unshare-pid",
-        "--unshare-net",
         "--die-with-parent",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--tmpfs",
-        "/tmp",
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        "--ro-bind",
-        "/bin",
-        "/bin",
-        "--ro-bind-try",
-        "/lib",
-        "/lib",
-        "--ro-bind-try",
-        "/lib64",
-        "/lib64",
-        "--ro-bind-try",
-        "/sbin",
-        "/sbin",
-        "--ro-bind-try",
-        "/etc/passwd",
-        "/etc/passwd",
-        "--ro-bind-try",
-        "/etc/group",
-        "/etc/group",
-        "--bind",
-        root,
-        root,
-        "--bind",
-        tmp,
-        tmp,
-        "--setenv",
-        "TMPDIR",
-        tmp,
-        "--chdir",
-        root,
-        "--",
-        "bash",
-        "-lc",
-        command,
     ]
+    if not full_network:
+        argv.extend(["--unshare-net"])
+    argv.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
+    if host_root:
+        argv.extend(["--ro-bind", "/", "/"])
+    else:
+        for mount in FALLBACK_RO_BINDS:
+            argv.extend(["--ro-bind-try", mount, mount])
+        argv.extend(
+            [
+                "--ro-bind-try",
+                "/etc/passwd",
+                "/etc/passwd",
+                "--ro-bind-try",
+                "/etc/group",
+                "/etc/group",
+            ]
+        )
+    argv.extend(["--tmpfs", "/run"])
+    if not _is_run_symlink():
+        argv.extend(["--tmpfs", "/var/run"])
+    seen_dirs: set[str] = set()
+    for sock in pol.allow_unix_sockets:
+        sock_p = Path(sock)
+        for d in _dir_chain(sock_p):
+            if d in {"/run", "/var/run"} or d in seen_dirs:
+                continue
+            seen_dirs.add(d)
+            argv.extend(["--dir", d])
+        argv.extend(["--ro-bind-try", str(sock_p), str(sock_p)])
+    for hidden in pol.deny_read:
+        argv.extend(["--tmpfs", str(hidden)])
+    for rw in pol.readwrite_roots(root, tmp):
+        argv.extend(["--bind", str(rw), str(rw)])
+    for rel in PROTECTED_WRITE_REL:
+        protected = root / rel
+        argv.extend(["--ro-bind-try", str(protected), str(protected)])
+    argv.extend(["--setenv", "TMPDIR", str(tmp), "--chdir", str(root), "--", "bash", "-lc", command])
+    return argv
 
 
-def run_sandboxed(command: str, workspace_root: Path, timeout: int = 30) -> str:
+def run_sandboxed(
+    command: str,
+    workspace_root: Path,
+    timeout: int = 30,
+    *,
+    policy: SandboxPolicy | None = None,
+    full_network: bool = False,
+) -> str:
     if is_containerized():
         return _raw(command, workspace_root, timeout)
     exe = bwrap_path()
@@ -99,7 +150,19 @@ def run_sandboxed(command: str, workspace_root: Path, timeout: int = 30) -> str:
         raise SandboxUnavailable("bwrap is not installed")
     tmp = workspace_root / ".orbweaver-tmp"
     tmp.mkdir(parents=True, exist_ok=True)
-    argv = build_bwrap_argv(command, workspace_root, tmp)
+    pol = policy or load_sandbox_policy(workspace_root)
+    inner = command
+    proxy = None
+    if not full_network:
+        from orbweaver.sandbox.proxy import DomainProxy, wrap_command_with_proxy
+
+        sock = tmp / "ow-proxy.sock"
+        proxy = DomainProxy(sock, pol.network)
+        proxy.start()
+        inner = wrap_command_with_proxy(command, str(sock))
+    argv = build_bwrap_argv(
+        inner, workspace_root, tmp, policy=pol, full_network=full_network
+    )
     try:
         proc = subprocess.run(
             argv,
@@ -112,11 +175,14 @@ def run_sandboxed(command: str, workspace_root: Path, timeout: int = 30) -> str:
         raise SandboxUnavailable(f"bwrap not found: {e}") from e
     except OSError as e:
         raise SandboxUnavailable(f"bwrap failed to start: {e}") from e
+    finally:
+        if proxy is not None:
+            proxy.close()
     out = (proc.stdout or "") + (proc.stderr or "")
-    if proc.returncode != 0 and "operation not permitted" in out.lower():
+    if proc.returncode != 0 and "operation not permitted" in out.lower() and "bwrap" in out.lower():
         log.warning("bwrap operation not permitted: %s", out[-500:])
         raise SandboxUnavailable(out[-800:])
-    return out[-200_000:]
+    return label_sandbox_output(out[-200_000:])
 
 
 def _raw(command: str, workspace_root: Path, timeout: int) -> str:

@@ -52,9 +52,13 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWLIST` (comma-separated user ids). Se
 
 ### Permissions and sandbox
 
-Default mode is **auto**: in-project writes apply immediately; a transcript classifier (Sonnet, `ORBWEAVER_CLASSIFIER_MODEL`) reviews unsandboxed Bash, WebFetch, and `SpawnSubagent`. A separate Haiku injection probe (`ORBWEAVER_INJECTION_PROBE_MODEL`) warns on untrusted tool output. Telegram/cron abort after repeated classifier denials and **always tell the user why**.
+Default mode is **auto**: in-project writes apply immediately; a transcript classifier (Sonnet, `ORBWEAVER_CLASSIFIER_MODEL`) reviews `Bash` with `permissions: ["full_network"]` or `["all"]`, WebFetch, and `SpawnSubagent`. A separate Haiku injection probe (`ORBWEAVER_INJECTION_PROBE_MODEL`) warns on untrusted tool output. Telegram/cron abort after repeated classifier denials and **always tell the user why**.
 
-Linux Bash for `LocalWorkspace` runs in **bubblewrap** with filesystem isolation and **no network**. Commands that need the network retry unsandboxed only after the classifier allows it. On this host (Ubuntu with AppArmor userns restrictions):
+Linux Bash for `LocalWorkspace` runs in **bubblewrap**. The sandbox is write confinement, not a hidden host: files are readable, writes stay in the working set (workspace plus extra roots), `/run` is hidden except `allowUnixSockets`, and outbound HTTP uses a CONNECT proxy with a package-manager domain allowlist. RFC1918, loopback, and cloud metadata are blocked on that network path. `unsandboxed: true` aliases `permissions: ["all"]` for one minor version.
+
+Configure extra roots, sockets, and domains in `~/.orbweaver/sandbox.json`, `$WORKSPACE_ROOT/.orbweaver/sandbox.json`, or `ORBWEAVER_SANDBOX_CONFIG` (see `deploy/sandbox.json.example`).
+
+On this host (Ubuntu with AppArmor userns restrictions):
 
 ```bash
 sudo apt-get install -y bubblewrap

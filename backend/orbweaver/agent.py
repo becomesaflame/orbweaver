@@ -31,7 +31,10 @@ from orbweaver.store import Event, Job, Store, new_uuid
 TOOL_SPEC = [
     {
         "name": "Read",
-        "description": "Read a file in the session workspace.",
+        "description": (
+            "Read a file. Relative paths are the session workspace. Absolute paths in extra "
+            "sandbox roots are auto-allowed; other host paths are classified."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
@@ -80,13 +83,22 @@ TOOL_SPEC = [
     },
     {
         "name": "Bash",
-        "description": "Run a shell command in the workspace. Sandboxed by default (no network). "
-        "Set unsandboxed true only when network or host access is required; that path is classified.",
+        "description": (
+            "Run a shell command in the workspace. Sandboxed by default: host files are readable, "
+            "writes stay in the working set, network uses a domain allowlist, Unix sockets are "
+            "denied unless granted. Host reads and allowlisted sockets/domains do not need "
+            "escalation. Set permissions to [\"full_network\"] for arbitrary internet, or "
+            "[\"all\"] for host writes/docker/sudo (classified). unsandboxed true aliases [\"all\"]."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
                 "unsandboxed": {"type": "boolean"},
+                "permissions": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["full_network", "all"]},
+                },
             },
             "required": ["command"],
         },
@@ -222,7 +234,8 @@ def static_system() -> str:
     return (
         f"You are Orbweaver, a coding agent. The running gateway is Orbweaver {__version__} "
         f"(semantic version). If asked what version is running, answer {__version__}. "
-        "Use tools to read and patch the workspace. "
+        "Use tools to read and patch the workspace. Sandboxed Bash can read host files; "
+        "do not set permissions [\"all\"] just to inspect logs or journals. "
         "In auto mode, in-project Write applies immediately. Prefer ProposePatch when a "
         "visible diff overlay helps the user. Use MemorySearch when past decisions might "
         "matter. Keep pins small. If a tool is blocked, find a safer path; do not try to "
@@ -269,8 +282,14 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "Grep":
         return "\n".join(ws.grep(inp["pattern"], inp.get("glob") or "**/*"))
     if name == "Bash":
-        unsandboxed = bool(inp.get("unsandboxed"))
-        return ws.bash(inp["command"], unsandboxed=unsandboxed)
+        from orbweaver.permissions.pipeline import bash_permissions
+
+        perms = sorted(bash_permissions(inp))
+        return ws.bash(
+            inp["command"],
+            unsandboxed=bool(inp.get("unsandboxed")),
+            permissions=perms,
+        )
     if name == "WebFetch":
         import httpx
 

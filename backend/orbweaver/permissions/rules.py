@@ -176,21 +176,32 @@ def _workspace_root(workspace) -> Path | None:
     return Path(root) if root is not None else None
 
 
-def in_project_path(rel: str, workspace) -> bool:
-    """True when the path stays inside the workspace root."""
-    if not rel or rel.startswith("/"):
+def in_working_set(rel: str, workspace, *, write: bool = False) -> bool:
+    """True when the path is in the sandbox working set (rw roots if write)."""
+    if not rel or path_is_always_denied(rel):
         return False
     root = _workspace_root(workspace)
     if root is None:
-        return not path_is_always_denied(rel)
+        return not str(rel).startswith("/")
+    from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
+
     try:
-        path = (root / rel).resolve()
-        root_r = root.resolve()
-        if root_r not in path.parents and path != root_r:
+        if rel.startswith(("/", "~")):
+            path = Path(rel).expanduser().resolve()
+        else:
+            path = (root / rel).resolve()
+        policy = load_sandbox_policy(root)
+        roots = policy.readwrite_roots(root) if write else policy.working_set_roots(root)
+        if not in_roots(path, roots):
             return False
     except (OSError, ValueError):
         return False
-    return not path_is_always_denied(rel)
+    return True
+
+
+def in_project_path(rel: str, workspace) -> bool:
+    """True when the path is writable in the working set."""
+    return in_working_set(rel, workspace, write=True)
 
 
 def deny_rules() -> str:

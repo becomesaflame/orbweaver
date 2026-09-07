@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     orbweaver_sandbox: bool = True
     orbweaver_sandbox_fail_if_unavailable: bool = True
     orbweaver_auto_allow_bash_if_sandboxed: bool = True
+    orbweaver_sandbox_config: str = ""
+    orbweaver_sandbox_additional_readonly: str = ""
+    orbweaver_sandbox_additional_readwrite: str = ""
+    orbweaver_sandbox_deny_read: str = ""
+    orbweaver_sandbox_unix_sockets: str = ""
+    orbweaver_sandbox_allowed_domains: str = ""
+    orbweaver_sandbox_denied_domains: str = ""
+    orbweaver_sandbox_network_default: str = ""
+    orbweaver_sandbox_include_default_domains: str = ""
     orbweaver_pinned_token_cap: int = 4000
     context_window: int = 200_000
     output_reserve: int = 16_000
