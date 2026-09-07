@@ -130,3 +130,15 @@ async def test_browse_workspaces(tmp_path: Path, monkeypatch, auth_header):
         assert made.json()["uri"] == "file:./orbweaver/notes"
         escaped = await client.get("/v1/workspaces", params={"rel": ".."}, headers=auth_header)
         assert escaped.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_health_includes_version():
+    from orbweaver import __version__
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.get("/health")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+        assert r.json()["version"] == __version__

@@ -2,7 +2,7 @@
   "name": "orbweaver",
   "displayName": "Orbweaver",
   "description": "Orbweaver coding agent: chat, inline diffs, HTML+Markdown plan mode",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "publisher": "orbweaver",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],

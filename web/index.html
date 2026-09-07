@@ -26,6 +26,7 @@
       padding:0.85rem 0.9rem 0.4rem;
     }
     .brand h1 { font-size:0.95rem; margin:0; font-weight:650; letter-spacing:0.01em; }
+    .brand .ver { font-size:0.7rem; color:var(--muted); font-weight:500; }
     .rail-actions { padding:0.35rem 0.7rem 0.5rem; display:flex; flex-direction:column; gap:0.35rem; }
     button {
       font: inherit; color:var(--ink); background:transparent;
@@ -181,7 +182,7 @@
 </head>
 <body>
   <aside id="rail">
-    <div class="brand"><h1>Orbweaver</h1></div>
+    <div class="brand"><h1>Orbweaver</h1><span class="ver" id="app-ver"></span></div>
     <div class="rail-actions">
       <button type="button" class="btn-new" id="newsession">+ New chat</button>
       <button type="button" class="btn-new secondary" id="newworkspace">+ New workspace</button>
@@ -265,6 +266,16 @@
     let collapsed = new Set(JSON.parse(localStorage.getItem(LS.collapsed) || "[]"));
     let expandedExtra = new Set(JSON.parse(localStorage.getItem(LS.expanded) || "[]"));
     $("base").value = location.origin;
+    async function pingVersion() {
+      try {
+        const r = await fetch($("base").value.replace(/\/$/, "") + "/health");
+        const j = await r.json();
+        $("app-ver").textContent = j.version ? "v" + j.version : "";
+      } catch {
+        $("app-ver").textContent = "";
+      }
+    }
+    pingVersion();
     const savedTok = localStorage.getItem(LS.jwt);
     if (savedTok) $("token").value = savedTok;
     const savedSid = localStorage.getItem(LS.sid);
@@ -294,6 +305,7 @@
       localStorage.setItem(LS.jwt, $("token").value.trim());
       refreshSessions();
     });
+    $("base").addEventListener("change", pingVersion);
     $("wuri").addEventListener("input", persistWorkspace);
     $("wkind").addEventListener("input", persistWorkspace);
     $("sid").addEventListener("input", persistSid);

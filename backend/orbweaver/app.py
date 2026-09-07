@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from orbweaver import __version__
 from orbweaver.agent import TurnCancelled, agent_turn
 from orbweaver.auth import mint_token, require_user
 from orbweaver.config import settings
@@ -252,7 +253,7 @@ async def _maybe_autotitle(store, sess: Entity, user_text: str) -> None:
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": __version__}
 
 
 @app.post("/v1/auth/token", include_in_schema=settings.orbweaver_allow_http_mint)

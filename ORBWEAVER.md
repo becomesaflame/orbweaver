@@ -12,3 +12,7 @@ This tree is the agent-editable checkout (`workspace:orbweaver`). The running ga
 ## Trust
 
 Trusted git remote: `git@github.com:becomesaflame/orbweaver.git`. Pushing that remote's `release-candidate` branch is allowed when the user asked to land or ship the work.
+
+## Version
+
+The running gateway version is `backend/orbweaver/__init__.py` (`__version__`, semantic versioning). Bump it on `release-candidate` when the user asks to ship a release. The agent system prompt reports the **running process** version, which may lag this working copy until CI deploys.

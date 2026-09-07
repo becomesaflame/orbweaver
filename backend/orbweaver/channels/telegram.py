@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
+from orbweaver import __version__
 from orbweaver.agent import agent_turn
 from orbweaver.auth import mint_token
 from orbweaver.config import settings
@@ -92,8 +93,17 @@ async def start_telegram() -> None:
         ent = await session_for_telegram_user(store, update.effective_user.id, chat_id)
         context.user_data["session_id"] = str(ent.id)
         mint_token(f"telegram:{update.effective_user.id}", extra={"channel": "telegram"})
-        await update.message.reply_text(f"session {ent.id}")
+        await update.message.reply_text(f"session {ent.id}\nOrbweaver {__version__}")
         log.info("telegram session %s jwt issued", ent.id)
+
+    async def on_version(update: Update, context) -> None:
+        del context
+        if not update.effective_user or not update.message:
+            return
+        if not user_allowed(update.effective_user.id):
+            await update.message.reply_text("not allowlisted")
+            return
+        await update.message.reply_text(f"Orbweaver {__version__}")
 
     async def on_text(update: Update, context) -> None:
         if not update.effective_user or not update.message or not update.message.text:
@@ -138,6 +148,7 @@ async def start_telegram() -> None:
         await on_text(update, context)
 
     app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CommandHandler("version", on_version))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     await app.initialize()

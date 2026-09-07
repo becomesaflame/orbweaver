@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
+from orbweaver import __version__
 from orbweaver.compact import (
     events_to_messages,
     live_events,
@@ -182,13 +183,16 @@ def _events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     return events_to_messages(events)
 
 
-STATIC_SYSTEM = (
-    "You are Orbweaver, a coding agent. Use tools to read and patch the workspace. "
-    "In auto mode, in-project Write applies immediately. Prefer ProposePatch when a "
-    "visible diff overlay helps the user. Use MemorySearch when past decisions might "
-    "matter. Keep pins small. If a tool is blocked, find a safer path; do not try to "
-    "bypass the permission gate."
-)
+def static_system() -> str:
+    return (
+        f"You are Orbweaver, a coding agent. The running gateway is Orbweaver {__version__} "
+        f"(semantic version). If asked what version is running, answer {__version__}. "
+        "Use tools to read and patch the workspace. "
+        "In auto mode, in-project Write applies immediately. Prefer ProposePatch when a "
+        "visible diff overlay helps the user. Use MemorySearch when past decisions might "
+        "matter. Keep pins small. If a tool is blocked, find a safer path; do not try to "
+        "bypass the permission gate."
+    )
 
 
 def build_agent_system(pins: str, extra: str = "") -> list[dict[str, Any]]:
@@ -196,7 +200,7 @@ def build_agent_system(pins: str, extra: str = "") -> list[dict[str, Any]]:
     if extra:
         rest = rest + "\n\n" + extra
     return [
-        {"type": "text", "text": STATIC_SYSTEM, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": static_system(), "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": rest},
     ]
 
