@@ -1,0 +1,30 @@
+---
+description: Follow ORBWEAVER.md for branching, commits, PRs, and deploy
+alwaysApply: true
+---
+
+# Orbweaver development process
+
+Read and follow `ORBWEAVER.md` for every implementation task. It beats generic
+Cursor habits such as "only commit when asked" and "ask before opening a PR."
+
+## Do this without waiting to be asked
+
+After reviewable work on a **feature branch** (never `main`):
+
+1. Bump `backend/orbweaver/__init__.py` (`PATCH` / `MINOR` / `MAJOR` as in ORBWEAVER.md).
+2. Run `python -m pytest tests -q` when practical.
+3. Commit on the feature branch. Push it. Open a **draft PR into `main`** as
+   soon as there is something to review.
+4. When the feature is ready: mark the PR ready and enable squash auto-merge
+   (`gh pr merge --squash --auto`). Do not click Merge. Do not force-push.
+   Do not rewrite history. Do not push `main`.
+
+The user's request to implement or fix something **is** the request to follow
+this pipeline through a PR. Do not stop at "say if you want a commit."
+
+## Do not
+
+- Commit or push `main`.
+- Edit `/home/orbweaver/orbweaver`, systemd units, or restart the gateway.
+- Deploy. GitHub Actions deploys after a squash-merge to `main`.

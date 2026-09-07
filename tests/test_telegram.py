@@ -1,7 +1,25 @@
+import io
+
+import httpx
 import pytest
-from orbweaver.channels.telegram import session_for_telegram_user, user_allowed
+from PIL import Image
+
+from orbweaver.channels.telegram import (
+    notify_telegram_photo,
+    send_session_photo,
+    session_for_telegram_user,
+    user_allowed,
+)
 from orbweaver.config import settings
+from orbweaver.image import save_inbound_image
 from orbweaver.store import reset_store_for_tests
+from orbweaver.workspace import LocalWorkspace
+
+
+def _png_bytes() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), (10, 200, 10)).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def test_user_allowed(monkeypatch):
@@ -25,3 +43,54 @@ async def test_telegram_session_reuse():
     assert updated.id == a.id
     assert updated.jsonld["telegram_chat_id"] == 999
     assert c.id != a.id
+
+
+class _Resp:
+    def __init__(self, status=200, text="ok"):
+        self.status_code = status
+        self.text = text
+
+
+class _FakeAsyncClient:
+    seen: dict | None = None
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, data=None, files=None, json=None):
+        _FakeAsyncClient.seen = {"url": url, "data": data, "files": files, "json": json}
+        return _Resp()
+
+
+@pytest.mark.asyncio
+async def test_notify_telegram_photo_posts(monkeypatch):
+    monkeypatch.setattr(settings, "telegram_bot_token", "tok")
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    result = await notify_telegram_photo(7, b"abc", "cap", "x.jpg", "image/jpeg")
+    assert result == "ok"
+    assert _FakeAsyncClient.seen["url"].endswith("/sendPhoto")
+    assert _FakeAsyncClient.seen["data"]["chat_id"] == "7"
+    assert _FakeAsyncClient.seen["data"]["caption"] == "cap"
+
+
+@pytest.mark.asyncio
+async def test_send_session_photo_posts_when_chat_bound(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "telegram_bot_token", "tok")
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    saved = save_inbound_image(ws, _png_bytes(), "out")
+    store = reset_store_for_tests()
+    sess = await session_for_telegram_user(store, 42, chat_id=99)
+    result = await send_session_photo(
+        {"workspace": ws, "store": store, "session_id": sess.id},
+        {"path": saved["path"], "caption": "here"},
+    )
+    assert '"sent": true' in result
+    assert _FakeAsyncClient.seen["url"].endswith("/sendPhoto")
+    assert _FakeAsyncClient.seen["data"]["chat_id"] == "99"

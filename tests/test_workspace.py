@@ -31,3 +31,15 @@ def test_docker_bash_without_binary(tmp_path: Path, monkeypatch):
     assert ws.read("x.txt") == "ok"
     out = ws.bash("echo hi")
     assert "docker is not available" in out
+
+
+def test_write_and_read_bytes(tmp_path: Path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    rel = ws.write_bytes("attachments/a.bin", b"\x00\x01")
+    assert rel == "attachments/a.bin"
+    assert ws.read_bytes(rel) == b"\x00\x01"
+    try:
+        ws.write_bytes("../escape.bin", b"no")
+        raise AssertionError("should have refused escape")
+    except PermissionError:
+        pass

@@ -117,6 +117,40 @@ def prompt_events(events: list[Event]) -> list[Event]:
     return microcompact_events(live_events(events))
 
 
+def _user_message_content(payload: dict[str, Any]) -> str | list[dict[str, Any]]:
+    text = payload.get("text") or payload.get("content") or ""
+    images = payload.get("images") or []
+    if not images:
+        return text
+    from orbweaver.image import user_image_blocks
+
+    blocks = user_image_blocks(images)
+    if text:
+        blocks.append({"type": "text", "text": str(text)})
+    return blocks or str(text)
+
+
+def _append_user_content(messages: list[dict[str, Any]], content: str | list[dict[str, Any]]) -> None:
+    if not (messages and messages[-1]["role"] == "user"):
+        messages.append({"role": "user", "content": content})
+        return
+    prev = messages[-1]["content"]
+    if isinstance(content, list):
+        if isinstance(prev, str):
+            messages[-1]["content"] = [{"type": "text", "text": prev}, *content]
+        elif isinstance(prev, list):
+            prev.extend(content)
+        else:
+            messages.append({"role": "user", "content": content})
+        return
+    if isinstance(prev, str):
+        messages[-1]["content"] = prev + "\n\n" + content
+    elif isinstance(prev, list):
+        prev.append({"type": "text", "text": content})
+    else:
+        messages.append({"role": "user", "content": content})
+
+
 def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     pending_tool: list[dict[str, Any]] = []
@@ -124,17 +158,7 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
         k = ev.kind
         p = ev.payload
         if k == "user":
-            text = p.get("text") or p.get("content") or ""
-            if messages and messages[-1]["role"] == "user":
-                prev = messages[-1]["content"]
-                if isinstance(prev, str):
-                    messages[-1]["content"] = prev + "\n\n" + text
-                elif isinstance(prev, list):
-                    prev.append({"type": "text", "text": text})
-                else:
-                    messages.append({"role": "user", "content": text})
-            else:
-                messages.append({"role": "user", "content": text})
+            _append_user_content(messages, _user_message_content(p))
         elif k == "assistant":
             messages.append({"role": "assistant", "content": p.get("text") or ""})
         elif k == "tool_call":

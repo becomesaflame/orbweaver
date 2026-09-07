@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     workspace_root: str = "."
     telegram_bot_token: str = ""
     telegram_allowlist: str = ""
+    orbweaver_image_api_key: str = ""
+    orbweaver_image_api_url: str = "https://api.openai.com/v1/images/generations"
+    orbweaver_image_model: str = "dall-e-3"
+    orbweaver_image_size: str = "1024x1024"
     orbweaver_host: str = "0.0.0.0"
     orbweaver_port: int = 8080
     orbweaver_allow_http_mint: bool = False

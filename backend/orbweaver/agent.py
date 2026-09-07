@@ -22,6 +22,7 @@ from orbweaver.compact import (
     usage_input_tokens,
 )
 from orbweaver.config import settings
+from orbweaver.image import hydrate_workspace_images
 from orbweaver.memory import pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
@@ -175,6 +176,40 @@ TOOL_SPEC = [
             "required": ["due_at", "message"],
         },
     },
+    {
+        "name": "SendPhoto",
+        "description": (
+            "Send an image file from the workspace to the user on Telegram. "
+            "Use this for screenshots, charts, or other images you wrote under attachments/."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "caption": {"type": "string"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "GenerateImage",
+        "description": (
+            "Generate an image from a text prompt and save it under attachments/. "
+            "On Telegram sessions the file is also sent to the chat."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "path": {
+                    "type": "string",
+                    "description": "Workspace path to write, default attachments/generated-<id>.png",
+                },
+                "caption": {"type": "string"},
+            },
+            "required": ["prompt"],
+        },
+    },
 ]
 
 
@@ -302,6 +337,14 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         )
         await store.put_job(job)
         return json.dumps({"job_id": str(job.id), "due_at": due.isoformat()})
+    if name == "SendPhoto":
+        from orbweaver.channels.telegram import send_session_photo
+
+        return await send_session_photo(ctx, inp)
+    if name == "GenerateImage":
+        from orbweaver.channels.telegram import generate_and_maybe_send
+
+        return await generate_and_maybe_send(ctx, inp)
     return f"unknown tool {name}"
 
 
@@ -381,6 +424,7 @@ async def agent_turn(
     system_extra: str = "",
     max_rounds: int = 24,
     subagent_depth: int = 0,
+    images: list[dict[str, str]] | None = None,
 ) -> list[Event]:
     _raise_if_cancelled(cancel)
     if resume:
@@ -392,7 +436,10 @@ async def agent_turn(
                         user_text = str(ev.payload.get("text") or "")
                     break
     else:
-        user_ev = await store.append_event(session_id, "user", {"text": user_text})
+        payload: dict[str, Any] = {"text": user_text}
+        if images:
+            payload["images"] = images
+        user_ev = await store.append_event(session_id, "user", payload)
         if turn_state is not None:
             turn_state.user_seq = user_ev.seq
     produced: list[Event] = []
@@ -474,6 +521,7 @@ async def agent_turn(
             events = await store.list_events(session_id)
             ctx["events"] = events
             messages = events_to_messages(prompt_events(events))
+            messages = hydrate_workspace_images(messages, workspace)
             messages = rehydrate_messages(messages, events, workspace)
             if not messages:
                 messages = [{"role": "user", "content": user_text}]
