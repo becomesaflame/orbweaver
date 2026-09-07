@@ -1,0 +1,15 @@
+[Unit]
+Description=Orbweaver gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/orbweaver/orbweaver/backend
+EnvironmentFile=-/home/orbweaver/orbweaver/backend/.env
+ExecStart=/home/orbweaver/orbweaver/backend/.venv/bin/python -m orbweaver.cli serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
