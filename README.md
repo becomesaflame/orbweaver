@@ -48,7 +48,7 @@ Then **Install from VSIX** or **Run Extension** from the `vscode/` folder. Set `
 
 ### Telegram
 
-Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWLIST` (comma-separated user ids). Allowlisted Telegram sessions use `LocalWorkspace` (bubblewrap), same as VS Code. Existing Telegram sessions stored as `docker` are migrated on the next message. Voice notes go through `/v1/stt` when `faster-whisper` is installed (`pip install -e ".[stt]"`). DockerWorkspace remains available for web/API sessions that set `workspace_kind=docker`.
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWLIST` (comma-separated user ids). Sessions use `LocalWorkspace` (bubblewrap). Leftover `workspace_kind=docker` rows are rewritten to `local` on the next turn. Voice notes go through `/v1/stt` when `faster-whisper` is installed (`pip install -e ".[stt]"`).
 
 ### Permissions and sandbox
 
@@ -74,7 +74,7 @@ EOF
 sudo systemctl reload apparmor
 ```
 
-If bubblewrap cannot start, local Bash fails closed (`ORBWEAVER_SANDBOX_FAIL_IF_UNAVAILABLE=true`). DockerWorkspace still uses Docker when the binary exists and refuses Bash when it does not. Nested bwrap is skipped inside Compose containers.
+If bubblewrap cannot start, local Bash fails closed (`ORBWEAVER_SANDBOX_FAIL_IF_UNAVAILABLE=true`). Nested bwrap is skipped inside Compose containers.
 
 ### Tests
 

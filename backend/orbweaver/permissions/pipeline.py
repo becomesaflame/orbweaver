@@ -105,8 +105,7 @@ def bash_sandboxable(inp: dict[str, Any], workspace_kind: str) -> bool:
         return False
     if is_critical_rm(str(inp.get("command") or "")):
         return False
-    if workspace_kind == "docker":
-        return True
+    del workspace_kind
     if not settings.orbweaver_sandbox:
         return False
     return sandbox_available()
@@ -189,7 +188,6 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
     if (
         name == "Bash"
         and not bash_sandboxable(inp, workspace_kind)
-        and workspace_kind != "docker"
         and settings.orbweaver_sandbox
         and settings.orbweaver_sandbox_fail_if_unavailable
         and not sandbox_available()

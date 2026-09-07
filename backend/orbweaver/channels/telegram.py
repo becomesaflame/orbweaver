@@ -24,25 +24,15 @@ from orbweaver.store import (
     new_uuid,
     session_at_id,
 )
-from orbweaver.workspace import make_workspace
+from orbweaver.workspace import WORKSPACE_KIND_LOCAL, apply_local_workspace_kind, bind_workspace
 
 log = logging.getLogger(__name__)
-
-TELEGRAM_WORKSPACE_KIND = "local"
 
 TELEGRAM_IMAGE_HINT = (
     "The user may send photos; those arrive as images you can see. "
     "To send a photo on Telegram, write an image file in the workspace and call SendPhoto. "
     "GenerateImage creates a file and, on Telegram sessions, sends it to the chat."
 )
-
-
-def apply_telegram_workspace_kind(jsonld: dict) -> bool:
-    """Allowlisted Telegram sessions use LocalWorkspace (bwrap), not Docker."""
-    if jsonld.get("workspace_kind") == TELEGRAM_WORKSPACE_KIND:
-        return False
-    jsonld["workspace_kind"] = TELEGRAM_WORKSPACE_KIND
-    return True
 
 
 def user_allowed(user_id: int) -> bool:
@@ -170,7 +160,7 @@ async def session_for_telegram_user(
 ) -> Entity:
     for ent in await store.list_entities(SESSION_TYPE):
         if ent.jsonld.get("telegram_user_id") == user_id:
-            changed = apply_telegram_workspace_kind(ent.jsonld)
+            changed = apply_local_workspace_kind(ent.jsonld)
             if chat_id is not None and ent.jsonld.get("telegram_chat_id") != chat_id:
                 ent.jsonld["telegram_chat_id"] = chat_id
                 changed = True
@@ -186,7 +176,7 @@ async def session_for_telegram_user(
             "@id": session_at_id(uid),
             "@type": SESSION_TYPE,
             "workspace_uri": "workspace:default",
-            "workspace_kind": TELEGRAM_WORKSPACE_KIND,
+            "workspace_kind": WORKSPACE_KIND_LOCAL,
             "title": f"telegram:{user_id}",
             "telegram_user_id": user_id,
             "telegram_chat_id": chat_id if chat_id is not None else user_id,
@@ -207,20 +197,16 @@ async def _session_workspace(update, context):
         context.user_data["session_id"] = sid
     session_id = UUID(sid)
     sess = await store.get_entity(session_id)
-    kind = TELEGRAM_WORKSPACE_KIND
     if sess:
-        changed = apply_telegram_workspace_kind(sess.jsonld)
+        changed = False
         if chat_id is not None and sess.jsonld.get("telegram_chat_id") != chat_id:
             sess.jsonld["telegram_chat_id"] = chat_id
             changed = True
-        if changed:
+        ws, kind, kind_changed = bind_workspace(sess.jsonld, settings.workspace_root)
+        if changed or kind_changed:
             await store.put_entity(sess)
-    uri = (
-        str(sess.jsonld.get("workspace_uri") or "workspace:default")
-        if sess
-        else "workspace:default"
-    )
-    ws = make_workspace(kind, uri, settings.workspace_root)
+    else:
+        ws, kind, _ = bind_workspace({"workspace_uri": "workspace:default"}, settings.workspace_root)
     return store, session_id, ws, kind
 
 

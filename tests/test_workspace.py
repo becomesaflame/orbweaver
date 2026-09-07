@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from orbweaver.workspace import DockerWorkspace, LocalWorkspace
+from orbweaver.workspace import LocalWorkspace
 
 
 def test_local_glob_and_grep(tmp_path: Path):
@@ -40,25 +40,30 @@ def test_additional_readonly_root(tmp_path: Path, monkeypatch):
         pass
 
 
-def test_docker_rejects_host_read(tmp_path: Path):
-    ws = DockerWorkspace("workspace:default", str(tmp_path))
+def test_host_reads_can_be_disabled(tmp_path: Path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path), host_reads=False)
     try:
         ws.read("/etc/passwd")
-        raise AssertionError("docker workspace must not read host files")
+        raise AssertionError("host_reads=False must not read host files")
     except PermissionError:
         pass
 
 
-def test_docker_bash_without_binary(tmp_path: Path, monkeypatch):
-    def boom(*_a, **_k):
-        raise FileNotFoundError("docker")
+def test_legacy_docker_kind_becomes_local(tmp_path: Path):
+    from orbweaver.workspace import (
+        apply_local_workspace_kind,
+        make_workspace,
+        normalize_workspace_kind,
+    )
 
-    monkeypatch.setattr("orbweaver.workspace.subprocess.run", boom)
-    ws = DockerWorkspace("workspace:default", str(tmp_path))
+    assert normalize_workspace_kind("docker") == "local"
+    jsonld = {"workspace_uri": "workspace:default", "workspace_kind": "docker"}
+    assert apply_local_workspace_kind(jsonld) is True
+    assert jsonld["workspace_kind"] == "local"
+    ws = make_workspace("docker", "workspace:default", str(tmp_path))
+    assert isinstance(ws, LocalWorkspace)
     ws.write("x.txt", "ok")
     assert ws.read("x.txt") == "ok"
-    out = ws.bash("echo hi")
-    assert "docker is not available" in out
 
 
 def test_write_and_read_bytes(tmp_path: Path):
