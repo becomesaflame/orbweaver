@@ -106,3 +106,30 @@ async def test_send_session_photo_posts_when_chat_bound(tmp_path, monkeypatch):
     assert '"sent": true' in result
     assert _FakeAsyncClient.seen["url"].endswith("/sendPhoto")
     assert _FakeAsyncClient.seen["data"]["chat_id"] == "99"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_replies_when_agent_raises(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from orbweaver.channels.telegram import _run_turn
+
+    replies: list[str] = []
+
+    class _Msg:
+        async def reply_text(self, text):
+            replies.append(text)
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("tool_use ids were found without tool_result blocks")
+
+    async def fake_ws(*_a, **_k):
+        return reset_store_for_tests(), uuid4(), LocalWorkspace("workspace:default", str(tmp_path)), "local"
+
+    monkeypatch.setattr("orbweaver.channels.telegram.agent_turn", boom)
+    monkeypatch.setattr("orbweaver.channels.telegram._session_workspace", fake_ws)
+    await _run_turn(SimpleNamespace(message=_Msg()), None, "Go ahead with the push")
+    assert replies
+    assert "Turn failed" in replies[0]
+    assert "tool_use" in replies[0]

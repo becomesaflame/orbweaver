@@ -95,6 +95,9 @@ async def test_headless_ask_abort_persists_events(tmp_path, monkeypatch):
     assert "Stopped this turn" in abort.payload["text"]
     assistant = [e for e in events if e.kind == "assistant"]
     assert assistant and "Stopped this turn" in assistant[-1].payload["text"]
+    results = [e for e in events if e.kind == "tool_result"]
+    assert results and "Stopped this turn" in results[0].payload["content"]
+    assert results[0].payload["tool_use_id"] == "tu1"
     assert texts_for_reply(events) != "(no assistant text)"
 
 

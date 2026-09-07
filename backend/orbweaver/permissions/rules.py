@@ -154,7 +154,6 @@ def matching_rule(
 _GIT_PUSH = re.compile(r"\bgit\s+push\b", re.IGNORECASE)
 _FORCE_PUSH_FLAG = re.compile(
     r"(?:^|[\s;|&])(?:--force(?:-with-lease)?|-f)(?=[\s;|&]|$)",
-    re.IGNORECASE,
 )
 _FORCE_REFSPEC = re.compile(
     r"\bgit\s+push\b[\s\S]*?(?:origin|upstream)\s+\+\S",

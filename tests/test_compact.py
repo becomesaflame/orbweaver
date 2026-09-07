@@ -229,3 +229,45 @@ def test_rehydrate_injects_recent_read(tmp_path):
     blob = json.dumps(out)
     assert "src/a.py" in blob
     assert "print('hi')" in blob
+
+
+def test_events_to_messages_stubs_orphan_tool_use():
+    from orbweaver.store import Event
+
+    sid = uuid4()
+    events = [
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=1,
+            kind="tool_call",
+            payload={"id": "toolu_orphan", "name": "Bash", "input": {"command": "git push"}},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="turn_aborted",
+            payload={"text": "Stopped this turn"},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=3,
+            kind="assistant",
+            payload={"text": "Stopped this turn"},
+        ),
+        Event(id=uuid4(), session_id=sid, seq=4, kind="user", payload={"text": "Go ahead"}),
+    ]
+    messages = events_to_messages(events)
+    assert any(
+        isinstance(m["content"], list)
+        and any(
+            b.get("type") == "tool_result" and b.get("tool_use_id") == "toolu_orphan"
+            for b in m["content"]
+        )
+        for m in messages
+        if m["role"] == "user"
+    )
+    assert messages[-1]["role"] == "user"
+    assert "Go ahead" in str(messages[-1]["content"])
