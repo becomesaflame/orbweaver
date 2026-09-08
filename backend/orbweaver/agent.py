@@ -906,29 +906,17 @@ async def agent_turn(
         )
 
     check()
-    if not settings.anthropic_api_key:
+    from orbweaver.llm import make_agent_client, no_llm_echo
+
+    client = make_agent_client()
+    if client is None:
         ev = await store.append_event(
             session_id,
             "assistant",
-            {
-                "text": (
-                    "ANTHROPIC_API_KEY is not set. Echo: "
-                    + (user_text or "")[:500]
-                    + "\nSet the key to enable the Claude tool loop."
-                )
-            },
+            {"text": no_llm_echo(user_text or "")},
         )
         fire(ev)
         return produced
-
-    import anthropic
-
-    headers = {}
-    if settings.anthropic_workspace_id.strip():
-        headers["anthropic-workspace-id"] = settings.anthropic_workspace_id.strip()
-    client = anthropic.AsyncAnthropic(
-        api_key=settings.anthropic_api_key, default_headers=headers or None
-    )
     sess = await store.get_entity(session_id)
     resolved_channel = resolve_channel(sess.jsonld if sess else None, channel=channel)
     denial_state = denial_state_for(session_id)
