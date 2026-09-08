@@ -20,6 +20,7 @@ SAFE_ALLOWLIST = frozenset(
         "MemoryRemember",
         "MemoryPin",
         "MemoryForget",
+        "WorkspaceSearch",
         "SendPhoto",
         "GenerateImage",
         "WebSearch",
@@ -116,7 +117,7 @@ def _subject(tool: str, inp: dict[str, Any]) -> str:
         from orbweaver.browser import summarize_browser
 
         return summarize_browser(inp)
-    if tool == "WebSearch":
+    if tool in {"WebSearch", "WorkspaceSearch", "MemorySearch"}:
         return str(inp.get("query") or "")
     if tool == "SpawnSubagent":
         return str(inp.get("task") or "")
