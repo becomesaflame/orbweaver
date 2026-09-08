@@ -872,6 +872,15 @@ async def agent_turn(
         user_ev = await store.append_event(session_id, "user", payload)
         if turn_state is not None:
             turn_state.user_seq = user_ev.seq
+        if emit:
+            emit(
+                {
+                    "kind": user_ev.kind,
+                    "payload": user_ev.payload,
+                    "id": str(user_ev.id),
+                    "seq": user_ev.seq,
+                }
+            )
     produced: list[Event] = []
 
     def fire(ev: Event) -> None:
