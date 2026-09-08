@@ -92,21 +92,22 @@ async def test_agent_turn_uses_ollama_fake_client(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "ollama_base_url", "http://ollama.test")
     monkeypatch.setattr(settings, "ollama_model", "llama3.2")
 
+    class _Text:
+        type = "text"
+        text = "ollama fallback ok"
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.content = [_Text()]
+            self.usage = None
+
     class _Client:
         class messages:
             @staticmethod
             async def create(**_k):
-                class _B:
-                    type = "text"
-                    text = "ollama fallback ok"
+                return _Resp()
 
-                class _R:
-                    content = [_B()]
-                    usage = None
-
-                return _R()
-
-        monkeypatch.setattr("orbweaver.llm.make_agent_client", lambda **_k: _Client())
+    monkeypatch.setattr("orbweaver.llm.make_agent_client", lambda **_k: _Client())
     store = reset_store_for_tests()
     sid = uuid4()
     ws = LocalWorkspace("workspace:default", str(tmp_path))
