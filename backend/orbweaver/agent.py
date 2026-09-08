@@ -22,8 +22,8 @@ from orbweaver.compact import (
     usage_input_tokens,
 )
 from orbweaver.config import settings
-from orbweaver.image import hydrate_workspace_images
-from orbweaver.memory import pinned_prompt, remember, rewrite_search_query
+from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
+from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.skills import workspace_skills_prompt
@@ -47,10 +47,11 @@ TOOL_SPEC = [
     {
         "name": "Read",
         "description": (
-            "Read a file as numbered lines. Relative paths are the session workspace. "
-            "Absolute paths in extra sandbox roots are auto-allowed; other host paths are "
-            "classified. Use offset (1-based line, or negative from the end) and limit to "
-            "page; do not page files with Bash. The result says how to continue when truncated."
+            "Read a file as numbered lines, or an image as vision (jpg/png/webp/gif). "
+            "Relative paths are the session workspace. Absolute paths in extra sandbox "
+            "roots are auto-allowed; other host paths are classified. Use offset "
+            "(1-based line, or negative from the end) and limit to page text; do not "
+            "page files with Bash. The result says how to continue when truncated."
         ),
         "input_schema": {
             "type": "object",
@@ -202,6 +203,24 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"query": {"type": "string"}},
             "required": ["query"],
+        },
+    },
+    {
+        "name": "MemoryGraph",
+        "description": (
+            "Walk the shared memory graph around an entity @id (same neighborhood as "
+            "GET /memory/graph). Use after MemorySearch when you have an entity id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Entity @id to walk from."},
+                "depth": {
+                    "type": "integer",
+                    "description": "Neighborhood hops (default 1, max 4).",
+                },
+            },
+            "required": ["id"],
         },
     },
     {
@@ -440,7 +459,8 @@ def static_system(channel: str = "") -> str:
         "In auto mode, in-project Delete applies immediately. TodoWrite keeps the plan "
         "on this session across compaction. After edits, ReadLints for diagnostics. "
         "Use MemorySearch when past decisions might "
-        "matter. Keep pins small. If the sandbox cannot run a command, ask the user "
+        "matter, and MemoryGraph to walk entity neighborhoods. Keep pins small. If the "
+        "sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
         "stay blocked; do not route around them. Call independent tools in parallel in "
         "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
@@ -481,11 +501,14 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     store: Store = ctx["store"]
     session_id: UUID = ctx["session_id"]
     if name == "Read":
+        path = str(inp.get("path") or "")
+        if is_image_path(path):
+            return format_image_read(ws, path)
         try:
-            raw = ws.read(inp["path"])
+            raw = ws.read(path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
-        return format_read(raw, path=str(inp["path"]), offset=inp.get("offset"), limit=inp.get("limit"))
+        return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
@@ -538,6 +561,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             ids.append(str(c.id))
             lines.append(f"[{c.id} score={score:.3f}] {c.text}")
         return json.dumps({"chunk_ids": ids, "text": "\n".join(lines) or "(no hits)"})
+    if name == "MemoryGraph":
+        hops = inp.get("depth", 1)
+        neighborhood = await graph_neighborhood(store, str(inp.get("id") or ""), hops)
+        return json.dumps(neighborhood)
     if name == "MemoryRemember":
         from orbweaver.store import PinBudgetError
 
