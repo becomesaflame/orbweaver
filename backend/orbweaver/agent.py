@@ -23,7 +23,7 @@ from orbweaver.compact import (
 )
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
-from orbweaver.memory import pinned_prompt, remember, rewrite_search_query
+from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.skills import workspace_skills_prompt
@@ -73,6 +73,31 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
             "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "NotebookEdit",
+        "description": (
+            "Edit one cell in a .ipynb notebook. Do not Write the whole notebook JSON. "
+            "action is replace (default), insert, or delete. replace can set source or "
+            "search-replace with old_string/new_string."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "cell_idx": {"type": "integer", "description": "0-based cell index."},
+                "action": {"type": "string", "enum": ["replace", "insert", "delete"]},
+                "source": {"type": "string", "description": "Full replacement or insert source."},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "cell_type": {
+                    "type": "string",
+                    "enum": ["code", "markdown", "raw"],
+                    "description": "Cell type for insert (default code).",
+                },
+            },
+            "required": ["path", "cell_idx"],
         },
     },
     {
@@ -168,13 +193,47 @@ TOOL_SPEC = [
         "name": "WebFetch",
         "description": (
             "HTTP GET a known URL and return extracted readable text (HTML is stripped). "
-            "Find URLs with WebSearch first. Do not keep fetching nearby docs URLs when the "
-            "result says the page is JavaScript-rendered."
+            "Find URLs with WebSearch first. When the result says the page is "
+            "JavaScript-rendered, use Browser instead of fetching nearby docs URLs."
         ),
         "input_schema": {
             "type": "object",
             "properties": {"url": {"type": "string"}},
             "required": ["url"],
+        },
+    },
+    {
+        "name": "Browser",
+        "description": (
+            "Drive a headless Chromium session to verify UI. Actions: navigate, click, type, "
+            "snapshot (visible text and controls after JavaScript), screenshot (PNG under "
+            "attachments/). Use this when WebFetch reports a JavaScript-rendered page or when "
+            "you changed web/ and need to click through a flow. Requires "
+            'pip install -e ".[browser]" and playwright install chromium. file:// and '
+            "workspace-relative paths must stay in the workspace. Classified like WebFetch "
+            "(not auto-allowed)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["navigate", "click", "type", "snapshot", "screenshot"],
+                },
+                "url": {
+                    "type": "string",
+                    "description": "navigate: http(s) URL, file://, or workspace-relative path",
+                },
+                "selector": {"type": "string", "description": "CSS selector for click/type"},
+                "text": {"type": "string", "description": "Text to type into the selector"},
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "screenshot: workspace PNG path, default attachments/browser-<id>.png"
+                    ),
+                },
+            },
+            "required": ["action"],
         },
     },
     {
@@ -203,6 +262,24 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"query": {"type": "string"}},
             "required": ["query"],
+        },
+    },
+    {
+        "name": "MemoryGraph",
+        "description": (
+            "Walk the shared memory graph around an entity @id (same neighborhood as "
+            "GET /memory/graph). Use after MemorySearch when you have an entity id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Entity @id to walk from."},
+                "depth": {
+                    "type": "integer",
+                    "description": "Neighborhood hops (default 1, max 4).",
+                },
+            },
+            "required": ["id"],
         },
     },
     {
@@ -449,13 +526,16 @@ def static_system(channel: str = "") -> str:
         f"{write_line}"
         "In auto mode, in-project Delete applies immediately. TodoWrite keeps the plan "
         "on this session across compaction. After edits, ReadLints for diagnostics. "
+        "Use NotebookEdit for .ipynb cells instead of rewriting the whole JSON. "
         "Use MemorySearch when past decisions might "
-        "matter. Keep pins small. If the sandbox cannot run a command, ask the user "
+        "matter, and MemoryGraph to walk entity neighborhoods. Keep pins small. If the "
+        "sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
         "stay blocked; do not route around them. Call independent tools in parallel in "
         "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
         "Use WebSearch to find sources, then WebFetch a few result URLs; do not guess "
-        "docs paths. Configured MCP servers appear as mcp_<server>_<tool> and use the "
+        "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
+        "Configured MCP servers appear as mcp_<server>_<tool> and use the "
         "same permission pipeline as other tools. Finish with a user-visible answer "
         "before the tool-round budget runs out; spawn a subagent for a long exploration "
         "instead of burning parent rounds."
@@ -504,6 +584,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "Write":
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
+    if name == "NotebookEdit":
+        from orbweaver.notebook import apply_notebook_edit
+
+        return apply_notebook_edit(ws, inp)
     if name == "Delete":
         try:
             return ws.delete(inp["path"])
@@ -533,6 +617,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         r = httpx.get(inp["url"], timeout=20.0, follow_redirects=True)  # noqa: ASYNC210
         ctype = r.headers.get("content-type") or ""
         return format_webfetch(str(inp.get("url") or ""), r.status_code, ctype, r.text)
+    if name == "Browser":
+        from orbweaver.browser import run_browser
+
+        return await run_browser(inp, ctx)
     if name == "WebSearch":
         from orbweaver.websearch import run_websearch
 
@@ -553,6 +641,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             ids.append(str(c.id))
             lines.append(f"[{c.id} score={score:.3f}] {c.text}")
         return json.dumps({"chunk_ids": ids, "text": "\n".join(lines) or "(no hits)"})
+    if name == "MemoryGraph":
+        hops = inp.get("depth", 1)
+        neighborhood = await graph_neighborhood(store, str(inp.get("id") or ""), hops)
+        return json.dumps(neighborhood)
     if name == "MemoryRemember":
         from orbweaver.store import PinBudgetError
 
