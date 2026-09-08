@@ -78,7 +78,7 @@ async def _maybe_review_return(
 
 
 async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
-    from orbweaver.agent import TOOL_SPEC, TurnCancelled, agent_turn
+    from orbweaver.agent import TurnCancelled, agent_turn, resolve_channel, tools_for_channel
 
     if int(ctx.get("subagent_depth") or 0) >= 1:
         return "error: nested subagents are not allowed"
@@ -94,26 +94,32 @@ async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     parent = await store.get_entity(parent_id)
     workspace_uri = "workspace:default"
     workspace_kind = str(ctx.get("workspace_kind") or "local")
+    parent_channel = resolve_channel(
+        parent.jsonld if parent else None, channel=ctx.get("channel")
+    )
     if parent and parent.jsonld:
         workspace_uri = str(parent.jsonld.get("workspace_uri") or workspace_uri)
         workspace_kind = str(parent.jsonld.get("workspace_kind") or workspace_kind)
 
     child_id = new_uuid()
+    child_jsonld = {
+        "@id": session_at_id(child_id),
+        "@type": SESSION_TYPE,
+        "workspace_uri": workspace_uri,
+        "workspace_kind": workspace_kind,
+        "title": title,
+        "status": "active",
+        "role": "subagent",
+        "parent_session": session_at_id(parent_id),
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    if parent_channel:
+        child_jsonld["channel"] = parent_channel
     child = Entity(
         id=child_id,
         at_id=session_at_id(child_id),
         at_type=SESSION_TYPE,
-        jsonld={
-            "@id": session_at_id(child_id),
-            "@type": SESSION_TYPE,
-            "workspace_uri": workspace_uri,
-            "workspace_kind": workspace_kind,
-            "title": title,
-            "status": "active",
-            "role": "subagent",
-            "parent_session": session_at_id(parent_id),
-            "created_at": datetime.now(UTC).isoformat(),
-        },
+        jsonld=child_jsonld,
     )
     await store.put_entity(child)
     await _parent_event(
@@ -132,10 +138,11 @@ async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             workspace_kind=workspace_kind,
             cancel=ctx.get("cancel"),
             headless=True,
-            tools=child_tool_spec(TOOL_SPEC),
+            tools=child_tool_spec(tools_for_channel(parent_channel)),
             system_extra=SUBAGENT_SYSTEM_EXTRA,
             max_rounds=SUBAGENT_MAX_ROUNDS,
             subagent_depth=1,
+            channel=parent_channel or None,
         )
     except TurnCancelled:
         status = "cancelled"

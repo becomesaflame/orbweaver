@@ -88,6 +88,63 @@ async def test_send_photo_denies_env(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_in_project_delete_skips_classifier(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    decision = await can_use_tool("Delete", {"path": "src/a.py"}, _ctx(tmp_path))
+    assert decision.behavior == "allow"
+    assert decision.fast_path == "acceptEdits"
+
+
+@pytest.mark.asyncio
+async def test_delete_env_denied(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    decision = await can_use_tool("Delete", {"path": ".env"}, _ctx(tmp_path))
+    assert decision.behavior == "deny"
+
+
+@pytest.mark.asyncio
+async def test_delete_outside_working_set_denied(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    decision = await can_use_tool("Delete", {"path": "/etc/passwd"}, _ctx(tmp_path))
+    assert decision.behavior == "deny"
+
+
+@pytest.mark.asyncio
+async def test_todowrite_allowlisted(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    decision = await can_use_tool(
+        "TodoWrite",
+        {"todos": [{"id": "1", "content": "ship", "status": "pending"}]},
+        _ctx(tmp_path),
+    )
+    assert decision.behavior == "allow"
+    assert decision.fast_path == "allowlist"
+
+
+@pytest.mark.asyncio
+async def test_readlints_allowlisted(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    decision = await can_use_tool("ReadLints", {"paths": ["src/a.py"]}, _ctx(tmp_path))
+    assert decision.behavior == "allow"
+    assert decision.fast_path == "allowlist"
+
+
+@pytest.mark.asyncio
 async def test_in_project_write_skips_classifier(tmp_path, monkeypatch):
     async def boom(*_a, **_k):
         raise AssertionError("classifier should not run")

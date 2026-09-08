@@ -55,7 +55,13 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS rate_limit_hits (
+  rate_key TEXT NOT NULL,
+  ts DOUBLE PRECISION NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS events_session_idx ON events(session_id);
 CREATE INDEX IF NOT EXISTS jobs_due_idx ON jobs(due_at);
 CREATE INDEX IF NOT EXISTS triples_subject_idx ON triples(subject);
 CREATE INDEX IF NOT EXISTS chunks_forgotten_idx ON chunks(forgotten) WHERE forgotten = FALSE;
+CREATE INDEX IF NOT EXISTS rate_limit_hits_key_ts_idx ON rate_limit_hits (rate_key, ts);
