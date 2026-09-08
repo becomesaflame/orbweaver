@@ -13,10 +13,9 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from orbweaver.tooltext import grep_regex
-
 from orbweaver.config import settings
 from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
+from orbweaver.tooltext import grep_regex
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
 
 DEFAULT_BASH_TIMEOUT_S = 30

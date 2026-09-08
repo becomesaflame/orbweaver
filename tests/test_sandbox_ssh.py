@@ -5,6 +5,8 @@ import sys
 import threading
 from pathlib import Path
 
+from sandbox_mounts import assert_ro_bind_dests_creatable
+
 from orbweaver.sandbox.bwrap import build_bwrap_argv
 from orbweaver.sandbox.policy import load_sandbox_policy
 from orbweaver.sandbox.proxy import wrap_command_with_proxy
@@ -17,7 +19,6 @@ from orbweaver.sandbox.ssh import (
     ssh_identity_bind_args,
     ssh_private_identity_files,
 )
-from sandbox_mounts import assert_ro_bind_dests_creatable
 
 
 def test_filter_ssh_argv_drops_dash_f():

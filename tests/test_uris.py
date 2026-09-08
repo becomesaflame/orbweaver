@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pytest
+
 from orbweaver.uris import (
     WorkspaceURIError,
     list_workspace_dirs,
@@ -6,8 +10,6 @@ from orbweaver.uris import (
     resolve_workspace_uri,
     validate_workspace_uri,
 )
-import pytest
-from pathlib import Path
 
 
 def test_rejects_absolute_paths():

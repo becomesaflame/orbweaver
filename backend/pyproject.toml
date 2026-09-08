@@ -22,7 +22,7 @@ dependencies = [
 embed = ["sentence-transformers>=3.0.0"]
 stt = ["faster-whisper>=1.0.0"]
 browser = ["playwright>=1.40.0"]
-dev = ["pytest>=8.0.0", "pytest-asyncio>=0.24.0", "ruff>=0.8.0"]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.24.0", "ruff>=0.8.0", "mypy>=1.13.0"]
 
 [project.scripts]
 orbweaver = "orbweaver.cli:main"
@@ -49,3 +49,20 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = [".venv", "vscode/node_modules", "vscode/out", "web/node_modules"]
+
+[tool.ruff.lint]
+# B008: FastAPI Depends()/File() defaults. BLE001: optional-dep and HTML parse fallbacks.
+ignore = ["B008", "BLE001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["orbweaver"]
+
+[tool.mypy]
+python_version = "3.12"
+pretty = true
+ignore_missing_imports = true
+follow_imports = "silent"
+warn_unused_ignores = false
+disable_error_code = ["import-untyped"]
+exclude = ["(?x)(\\.venv|vscode|web)"]

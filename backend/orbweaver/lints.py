@@ -134,9 +134,9 @@ def read_lints(workspace, inp: dict[str, Any], events: list[Event] | None = None
         quoted = " ".join(shlex.quote(p) for p in paths)
         filled = command.replace("{paths}", quoted) if "{paths}" in command else f"{command} {quoted}"
         output = run_configured_linter(workspace, filled)
-        diags = parse_compiler_output(output, source="linter")
+        parsed = parse_compiler_output(output, source="linter")
         return json.dumps(
-            {"diagnostics": diags, "output": output[-20_000:], "command": filled}
+            {"diagnostics": parsed, "output": output[-20_000:], "command": filled}
         )
 
     diags: list[dict[str, Any]] = []

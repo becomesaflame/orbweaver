@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from orbweaver import __version__
@@ -23,12 +23,12 @@ from orbweaver.compact import (
 )
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
+from orbweaver.lints import read_lints
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
-from orbweaver.lints import read_lints
 from orbweaver.todos import inject_session_todos, persist_todos
 from orbweaver.tooltext import format_read, format_webfetch
 
@@ -493,7 +493,7 @@ def resolve_channel(
     if jsonld.get("telegram_user_id") is not None or jsonld.get("telegram_chat_id") is not None:
         return "telegram"
     title = str(jsonld.get("title") or "").strip().lower()
-    if title == "vscode" or title.startswith("vscode:") or title.startswith("vscode/"):
+    if title == "vscode" or title.startswith(("vscode:", "vscode/")):
         return VSCODE_CHANNEL
     return ""
 
@@ -654,7 +654,7 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         return run_websearch(inp)
     if name == "MemorySearch":
         events = live_events(await store.list_events(session_id))
-        already = set()
+        already: set[str] = set()
         for ev in events:
             if ev.kind == "MemoryRecall":
                 already.update(ev.payload.get("chunk_ids") or [])
@@ -930,9 +930,9 @@ async def agent_turn(
                     client.messages.create(
                         model=settings.orbweaver_model,
                         max_tokens=4096,
-                        system=system,
-                        tools=active_tools,
-                        messages=messages,
+                        system=cast(Any, system),
+                        tools=cast(Any, active_tools),
+                        messages=cast(Any, messages),
                     ),
                     cancel,
                     produced,
@@ -1050,9 +1050,9 @@ async def agent_turn(
                     client.messages.create(
                         model=settings.orbweaver_model,
                         max_tokens=4096,
-                        system=system,
+                        system=cast(Any, system),
                         tools=[],
-                        messages=messages,
+                        messages=cast(Any, messages),
                     ),
                     cancel,
                     produced,
