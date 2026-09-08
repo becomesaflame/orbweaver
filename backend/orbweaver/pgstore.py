@@ -320,6 +320,11 @@ class PostgresStore:
     async def reschedule_job(self, job: Job) -> None:
         await self.put_job(job)
 
+    async def delete_job(self, job_id: uuid.UUID) -> None:
+        pool = self._pool_req()
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM jobs WHERE id=$1", job_id)
+
     async def meta_get(self, key: str) -> str | None:
         pool = self._pool_req()
         async with pool.acquire() as conn:

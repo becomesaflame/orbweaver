@@ -396,7 +396,7 @@ flowchart LR
       </ul>
 
       <h2 id="telegram">Telegram and cron</h2>
-      <p>python-telegram-bot; allowlisted user IDs; voice notes go through STT. Cron: APScheduler or a <code>jobs</code> table polled by the host. Due jobs enqueue a synthetic user message. The host owns waking; agents only request <code>schedule_task</code> as a system action.</p>
+      <p>python-telegram-bot; allowlisted user IDs; voice notes go through STT. Cron: APScheduler polls a <code>jobs</code> table. Due jobs enqueue a synthetic user message; the host notifies Telegram and appends a <code>cron_result</code> session event on success or abort. Recurrence is <code>minute</code>/<code>hour</code>/<code>day</code> or a 5-field cron expression; one-shots are deleted after they run. Agents only request <code>ScheduleTask</code>.</p>
 
       <h2 id="portability">Instance portability</h2>
       <p>Move memory and agents from a laptop to a server (or back) without rewriting IDs. Restore from backup is the same operation as migrate. Schema is phase 1; CLI is phase 6.</p>
