@@ -11,7 +11,7 @@ from typing import Any
 from orbweaver.config import settings
 from orbweaver.store import Event
 
-EDIT_TOOLS = frozenset({"Write", "ProposePatch"})
+EDIT_TOOLS = frozenset({"Write", "StrReplace", "ProposePatch", "NotebookEdit"})
 MAX_PATHS = 20
 
 

@@ -87,6 +87,7 @@ def test_static_system_teaches_rebase_continue():
     assert "Everything up-to-date" in text
     assert "git add -A" in text
     assert "NOT_DONE" in text
+    assert "StrReplace" in text
 
 
 def test_escalate_lines_are_mechanical():

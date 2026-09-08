@@ -279,6 +279,28 @@ class LocalWorkspace:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
+    def str_replace(
+        self, path: str, old: str, new: str, *, replace_all: bool = False
+    ) -> str:
+        if not old:
+            return "error: old_string is required and must be non-empty"
+        target = self._resolve(path, write=True)
+        if not target.is_file():
+            return f"error: file not found: {path}"
+        current = target.read_text(encoding="utf-8")
+        n = current.count(old)
+        if n == 0:
+            return f"error: old_string not found in {path}"
+        if n > 1 and not replace_all:
+            return (
+                f"error: old_string matched {n} times in {path}; "
+                "include more surrounding context for a unique match, or set replace_all true"
+            )
+        updated = current.replace(old, new) if replace_all else current.replace(old, new, 1)
+        target.write_text(updated, encoding="utf-8")
+        noun = "occurrence" if n == 1 else "occurrences"
+        return f"updated {path} ({n} {noun})"
+
     def write_bytes(self, path: str, data: bytes) -> str:
         p = self._resolve(path, write=True)
         p.parent.mkdir(parents=True, exist_ok=True)

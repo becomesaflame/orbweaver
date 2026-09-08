@@ -36,12 +36,14 @@ def test_non_vscode_tool_specs_omit_proposepatch(channel):
     names = {t["name"] for t in tools_for_channel(channel)}
     assert "ProposePatch" not in names
     assert "Write" in names
+    assert "StrReplace" in names
 
 
 def test_vscode_tool_spec_includes_proposepatch():
     names = {t["name"] for t in tools_for_channel("vscode")}
     assert "ProposePatch" in names
     assert "Write" in names
+    assert "StrReplace" in names
 
 
 def test_system_prompt_mentions_proposepatch_only_for_vscode():
