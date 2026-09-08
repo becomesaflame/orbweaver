@@ -310,6 +310,7 @@ flowchart LR
 flowchart LR
   subgraph everyTurn [Every turn prompt]
     Pinned["Pinned working memory"]
+    Skills["Workspace skills and rules"]
     Recent["Recent event stream"]
   end
   User["Current user message"] --> Rewrite["Query rewrite last N turns"]
@@ -317,6 +318,7 @@ flowchart LR
   Search --> Recall["MemoryRecall event"]
   Recall --> Recent
   Pinned --> Prompt["Model prompt"]
+  Skills --> Prompt
   Recent --> Prompt
         </pre>
       </div>
@@ -326,6 +328,7 @@ flowchart LR
           <tr><td>Output reserve</td><td>16,000 tokens</td></tr>
           <tr><td>System + tool schemas</td><td>Measured, not a user budget (~12k typical)</td></tr>
           <tr><td>Pinned working memory</td><td><strong>4,000 hard cap</strong> (<code>ORBWEAVER_PINNED_TOKEN_CAP</code>). Overflowing a pin is rejected.</td></tr>
+          <tr><td>Workspace skills and rules</td><td><strong>4,000 cap</strong> (<code>ORBWEAVER_SKILLS_TOKEN_CAP</code>). Injects root <code>AGENTS.md</code> / <code>ORBWEAVER.md</code>, <code>.cursor/rules/*.mdc</code> with <code>alwaysApply: true</code>, and optional <code>.orbweaver/rules</code>. Missing files are a no-op; overflow is truncated.</td></tr>
           <tr><td>Event stream</td><td>The rest (~168k). Compact at ~85% full. Microcompact stubs old tool results in the prompt; oversized tool output is persisted under <code>.orbweaver/tool-results/</code>. Session notes (Haiku) are preferred; full compact is last resort with extractive fallback. After a boundary, recently read files are re-injected under a token cap.</td></tr>
         </tbody>
       </table>
@@ -336,7 +339,7 @@ flowchart LR
       <div class="diagram">
         <pre class="mermaid">
 flowchart TD
-  Build["Build prompt: system plus pins plus events"] --> Call["Claude tool_use"]
+  Build["Build prompt: system plus pins plus workspace skills plus events"] --> Call["Claude tool_use"]
   Call --> Deny{"deny or ask rule?"}
   Deny -->|deny| Block["tool_result blocked"]
   Deny -->|ask interactive| Ask["AskUser"]
