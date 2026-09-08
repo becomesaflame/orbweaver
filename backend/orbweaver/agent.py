@@ -87,8 +87,10 @@ TOOL_SPEC = [
             "Run a shell command in the workspace. Sandboxed by default: host files are readable, "
             "writes stay in the working set, network uses a domain allowlist, Unix sockets are "
             "denied unless granted. Host reads and allowlisted sockets/domains do not need "
-            "escalation. Set permissions to [\"full_network\"] for arbitrary internet, or "
-            "[\"all\"] for host writes/docker/sudo (classified). unsandboxed true aliases [\"all\"]."
+            "escalation. If the sandbox blocks the command, ask the user before setting "
+            "permissions to [\"full_network\"] (arbitrary internet) or [\"all\"] "
+            "(host writes/docker/sudo). Those overrides pause for approval. "
+            "unsandboxed true aliases [\"all\"]."
         ),
         "input_schema": {
             "type": "object",
@@ -238,8 +240,9 @@ def static_system() -> str:
         "do not set permissions [\"all\"] just to inspect logs or journals. "
         "In auto mode, in-project Write applies immediately. Prefer ProposePatch when a "
         "visible diff overlay helps the user. Use MemorySearch when past decisions might "
-        "matter. Keep pins small. If a tool is blocked, find a safer path; do not try to "
-        "bypass the permission gate."
+        "matter. Keep pins small. If the sandbox cannot run a command, ask the user "
+        "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
+        "stay blocked; do not route around them."
     )
 
 
@@ -257,7 +260,7 @@ def _blocked_tool_result(decision) -> str:
     if decision.behavior == "ask":
         return (
             "This action needs user approval and was not executed. "
-            f"Reason: {decision.reason}. Ask the user, or pick a safer approach."
+            f"Reason: {decision.reason}. Wait for the user to confirm, then retry."
         )
     return (
         f"Blocked by permission gate ({decision.fast_path}): {decision.reason}. "

@@ -61,12 +61,15 @@ def test_proxy_connect_denied(tmp_path: Path):
     assert "sandbox_denied: network" in text
     assert "secret.internal" in text
     assert "full_network" in text
+    assert "Ask the user" in text
 
 
 def test_label_output_prefixes():
     assert "unix_socket" in unix_socket_denied("/run/postgresql/.s.PGSQL.5432")
     assert "full_network" in network_denied("pypi.org")
-    labeled = label_sandbox_output("curl: (7) Failed to connect: Network is unreachable")
-    assert labeled.startswith("sandbox_denied: network")
+    assert "Ask the user" in network_denied("pypi.org")
+    labeled_fs = label_sandbox_output("touch: cannot touch '/etc/hosts': Read-only file system")
+    assert labeled_fs.startswith("sandbox_denied: filesystem")
+    assert "Ask the user" in labeled_fs
     already = "sandbox_denied: network (x)\nrest"
     assert label_sandbox_output(already) == already

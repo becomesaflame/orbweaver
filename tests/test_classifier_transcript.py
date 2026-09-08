@@ -6,6 +6,7 @@ import pytest
 from orbweaver.permissions.classifier import (
     build_transcript,
     parse_block,
+    parse_verdict,
     to_classifier_input,
 )
 from orbweaver.store import Event
@@ -66,8 +67,16 @@ def test_jsonl_escapes_newlines_in_user_text():
 def test_parse_block_and_projection():
     assert parse_block("<block>yes</block>") is True
     assert parse_block("<block>no</block>") is False
+    assert parse_block("<block>ask</block>") is False
     assert parse_block("nope") is None
+    assert parse_verdict("<block>yes</block>") == "deny"
+    assert parse_verdict("<block>no</block>") == "allow"
+    assert parse_verdict("<block>ask</block>") == "ask"
+    assert parse_verdict("nope") is None
     assert to_classifier_input("Bash", {"command": "echo hi"}) == "echo hi"
+    assert to_classifier_input(
+        "Bash", {"command": "curl https://example.com", "permissions": ["full_network"]}
+    ) == {"command": "curl https://example.com", "permissions": ["full_network"]}
     assert to_classifier_input("Glob", {"pattern": "*"}) == ""
 
 
@@ -107,6 +116,50 @@ async def test_classify_action_does_not_pass_temperature(monkeypatch):
         client=client,
     )
     assert result["should_block"] is False
+    assert result["should_ask"] is False
+    assert result["verdict"] == "allow"
     assert result["stage"] == "fast"
     assert client.kwargs
     assert all("temperature" not in kw for kw in client.kwargs)
+
+
+@pytest.mark.asyncio
+async def test_classify_unavailable_asks_not_denies(monkeypatch):
+    from orbweaver.config import settings
+    from orbweaver.permissions.classifier import classify_action
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+    result = await classify_action([], "Bash", {"command": "docker ps", "permissions": ["all"]})
+    assert result["verdict"] == "ask"
+    assert result["should_ask"] is True
+    assert result["should_block"] is False
+
+
+@pytest.mark.asyncio
+async def test_classify_stage2_ask(monkeypatch):
+    from types import SimpleNamespace
+
+    from orbweaver.config import settings
+    from orbweaver.permissions.classifier import classify_action
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+
+    class Client:
+        def __init__(self):
+            self.messages = self
+            self.n = 0
+
+        async def create(self, **kwargs):
+            self.n += 1
+            text = "<block>ask</block><reason>need override</reason>"
+            return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
+
+    result = await classify_action(
+        [],
+        "Bash",
+        {"command": "git clone git@github.com:x/y.git", "permissions": ["all"]},
+        client=Client(),
+    )
+    assert result["verdict"] == "ask"
+    assert result["should_block"] is False
+    assert "need override" in result["reason"]
