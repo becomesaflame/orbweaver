@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     orbweaver_sandbox_network_default: str = ""
     orbweaver_sandbox_include_default_domains: str = ""
     orbweaver_pinned_token_cap: int = 4000
+    orbweaver_skills_token_cap: int = 4000
     context_window: int = 200_000
     output_reserve: int = 16_000
     static_token_estimate: int = 12_000
@@ -94,6 +95,7 @@ class Settings(BaseSettings):
             - self.output_reserve
             - self.static_token_estimate
             - self.orbweaver_pinned_token_cap
+            - self.orbweaver_skills_token_cap
         )
         return max(256, raw)
 
