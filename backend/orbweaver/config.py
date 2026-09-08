@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://orbweaver:orbweaver@localhost:5432/orbweaver"
     orbweaver_store: str = "memory"  # memory | postgres
     workspace_root: str = "."
+    orbweaver_data_dir: str = ""  # empty → ~/.orbweaver (file-backed rate limits)
     telegram_bot_token: str = ""
     telegram_allowlist: str = ""
     orbweaver_image_api_key: str = ""
