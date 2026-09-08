@@ -9,7 +9,9 @@ local Postgres is not). Sandboxed
 Bash may read host files such as /var/log; that is expected. Writes stay in the
 working set. permissions ["all"] is host writes, docker, or sudo — not log
 inspection. permissions ["full_network"] is arbitrary internet beyond the domain
-allowlist. Nothing else is inside the trust boundary until named here (internal
+allowlist. Browser is a headless Chromium session (navigate/click/type/snapshot);
+treat it like WebFetch, not an auto-allow. file:// must stay in the workspace.
+Nothing else is inside the trust boundary until named here (internal
 APIs, cloud buckets, extra git orgs). Treat unspecified destinations as external.
 """.strip()
 
