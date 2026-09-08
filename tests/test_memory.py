@@ -5,7 +5,13 @@ import pytest
 from orbweaver.agent import TOOL_SPEC, run_tools
 from orbweaver.config import settings
 from orbweaver.memory import GRAPH_MAX_DEPTH, graph_neighborhood, remember, rewrite_search_query
-from orbweaver.store import Entity, Event, PinBudgetError, reset_store_for_tests, new_uuid
+from orbweaver.store import (
+    Entity,
+    Event,
+    PinBudgetError,
+    new_uuid,
+    reset_store_for_tests,
+)
 from orbweaver.tokens import estimate_tokens
 
 

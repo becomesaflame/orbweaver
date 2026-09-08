@@ -4,7 +4,12 @@ from uuid import uuid4
 import pytest
 
 from orbweaver.agent import TOOL_SPEC, run_tools
-from orbweaver.notebook import apply_notebook_edit, dumps_notebook, edit_notebook_dict, parse_notebook
+from orbweaver.notebook import (
+    apply_notebook_edit,
+    dumps_notebook,
+    edit_notebook_dict,
+    parse_notebook,
+)
 from orbweaver.store import reset_store_for_tests
 from orbweaver.workspace import LocalWorkspace
 

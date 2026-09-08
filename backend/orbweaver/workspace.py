@@ -7,10 +7,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from orbweaver.tooltext import normalize_grep_pattern
-
 from orbweaver.config import settings
 from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
+from orbweaver.tooltext import normalize_grep_pattern
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
 
 GREP_HIT_CAP = 50

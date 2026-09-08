@@ -1,5 +1,4 @@
 import shutil
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest

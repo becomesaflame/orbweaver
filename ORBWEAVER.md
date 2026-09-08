@@ -46,7 +46,9 @@ push to main                    -->  if LIVE_HOST_DEPLOY: self-hosted runner
                                      on lampropeltis runs deploy/update-live.sh
 ```
 
-Pytest on the PR is the merge gate. Auto-merge is what lands the SHA; there
+Pytest, ruff, mypy, and vscode `tsc` on the PR are the merge gate.
+Playwright web smoke is a separate job (skip with repository variable
+`SKIP_PLAYWRIGHT`). Auto-merge is what lands the SHA; there
 is no Actions job that merges PRs. Deploy is a separate workflow so a PR
 does not show skipped promote/deploy checks. GitHub's merge is not an
 Actions `GITHUB_TOKEN` push, so deploy does start.

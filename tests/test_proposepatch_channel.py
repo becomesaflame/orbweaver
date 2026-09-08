@@ -15,7 +15,15 @@ from orbweaver.channels.cron import sweep
 from orbweaver.channels.telegram import session_for_telegram_user
 from orbweaver.config import settings
 from orbweaver.permissions.pipeline import can_use_tool
-from orbweaver.store import SESSION_TYPE, Entity, Event, Job, get_store, reset_store_for_tests, session_at_id
+from orbweaver.store import (
+    SESSION_TYPE,
+    Entity,
+    Event,
+    Job,
+    get_store,
+    reset_store_for_tests,
+    session_at_id,
+)
 from orbweaver.workspace import LocalWorkspace
 
 

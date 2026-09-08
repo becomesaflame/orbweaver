@@ -1,13 +1,12 @@
 from pathlib import Path
 
 import pytest
+from sandbox_mounts import assert_ro_bind_dests_creatable
 
 from orbweaver.config import settings
 from orbweaver.sandbox.bwrap import build_bwrap_argv, sandbox_available
 from orbweaver.sandbox.policy import SandboxPolicy
 from orbweaver.workspace import LocalWorkspace
-
-from sandbox_mounts import assert_ro_bind_dests_creatable
 
 
 def test_bwrap_argv_has_isolation(tmp_path: Path):

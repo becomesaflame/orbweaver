@@ -2,6 +2,7 @@ import json
 from uuid import uuid4
 
 import pytest
+
 from orbweaver.agent import run_tools
 from orbweaver.compact import events_to_messages, maybe_compact, prompt_events
 from orbweaver.config import settings
