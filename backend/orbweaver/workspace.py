@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob as globmod
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -225,6 +226,20 @@ class LocalWorkspace:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data)
         return self._display(p)
+
+    def delete(self, path: str) -> str:
+        p = self._resolve(path, write=True)
+        if p == self.root.resolve():
+            raise PermissionError(f"refusing to delete workspace root: {path}")
+        if not p.exists():
+            return f"not found: {path}"
+        if p.is_symlink() or p.is_file():
+            p.unlink()
+            return f"deleted {self._display(p)}"
+        if p.is_dir():
+            shutil.rmtree(p)
+            return f"deleted {self._display(p)}"
+        raise PermissionError(f"cannot delete {path}")
 
     def read_bytes(self, path: str) -> bytes:
         return self._resolve(path).read_bytes()
