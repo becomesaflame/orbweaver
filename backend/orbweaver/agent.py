@@ -23,7 +23,7 @@ from orbweaver.compact import (
 )
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
-from orbweaver.memory import pinned_prompt, remember, rewrite_search_query
+from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.skills import workspace_skills_prompt
@@ -237,6 +237,24 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"query": {"type": "string"}},
             "required": ["query"],
+        },
+    },
+    {
+        "name": "MemoryGraph",
+        "description": (
+            "Walk the shared memory graph around an entity @id (same neighborhood as "
+            "GET /memory/graph). Use after MemorySearch when you have an entity id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Entity @id to walk from."},
+                "depth": {
+                    "type": "integer",
+                    "description": "Neighborhood hops (default 1, max 4).",
+                },
+            },
+            "required": ["id"],
         },
     },
     {
@@ -475,7 +493,8 @@ def static_system(channel: str = "") -> str:
         "In auto mode, in-project Delete applies immediately. TodoWrite keeps the plan "
         "on this session across compaction. After edits, ReadLints for diagnostics. "
         "Use MemorySearch when past decisions might "
-        "matter. Keep pins small. If the sandbox cannot run a command, ask the user "
+        "matter, and MemoryGraph to walk entity neighborhoods. Keep pins small. If the "
+        "sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
         "stay blocked; do not route around them. Call independent tools in parallel in "
         "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
@@ -581,6 +600,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             ids.append(str(c.id))
             lines.append(f"[{c.id} score={score:.3f}] {c.text}")
         return json.dumps({"chunk_ids": ids, "text": "\n".join(lines) or "(no hits)"})
+    if name == "MemoryGraph":
+        hops = inp.get("depth", 1)
+        neighborhood = await graph_neighborhood(store, str(inp.get("id") or ""), hops)
+        return json.dumps(neighborhood)
     if name == "MemoryRemember":
         from orbweaver.store import PinBudgetError
 

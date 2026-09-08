@@ -63,6 +63,8 @@ def summarize_input(name: str, inp: dict[str, Any]) -> str:
         return summarize_browser(inp)
     if name == "WebSearch":
         return str(inp.get("query") or "")[:240]
+    if name == "MemoryGraph":
+        return str(inp.get("id") or "")[:240]
     if name == "SpawnSubagent":
         return str(inp.get("task") or "")[:240]
     return name
