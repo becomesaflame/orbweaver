@@ -46,6 +46,24 @@ CONCLUDE_NUDGE = (
     "Tool-round budget exhausted. Answer the user now from the tool results you already "
     "have. Do not call tools."
 )
+GIT_NOT_DONE_NUDGE = (
+    "Git ritual says NOT_DONE. The last git commit or push did not finish the rebase "
+    "and did not publish HEAD. Call Bash now with `git rebase --continue` "
+    "(after git add of resolved files) or `git rebase --abort`. "
+    "Do not tell the user the branch or PR was updated."
+)
+GIT_NOT_DONE_LAST_NUDGE = (
+    "This is the last tool round and Git ritual says NOT_DONE. "
+    "If you can, call Bash with git rebase --continue or --abort. "
+    "Otherwise tell the user the rebase is unfinished (detached HEAD / rebase-in-progress) "
+    "and do not claim the PR or branch was updated."
+)
+GIT_NOT_DONE_CONCLUDE = (
+    "Tool-round budget exhausted and Git ritual says NOT_DONE. "
+    "Tell the user the rebase is unfinished (detached HEAD or rebase-in-progress). "
+    "Do not claim the branch or PR was updated. Next step is git rebase --continue "
+    "or --abort."
+)
 
 TOOL_SPEC = [
     {
@@ -679,7 +697,9 @@ def static_system(channel: str = "") -> str:
         "str.replace conflict markers. After resolving, git add those files and "
         "git rebase --continue (or merge --continue). git commit is not continue. "
         "While detached or rebase-in-progress, git push origin <branch> updates the "
-        "old branch tip, not HEAD. Do not git add -A if it would stage junk "
+        "old branch tip, not HEAD. If the footer says NOT_DONE, the rebase is "
+        "unfinished; next git must be rebase --continue or --abort, not a success "
+        "claim. Do not git add -A if it would stage junk "
         "(.venv, .orbweaver-tmp). Never force-push main. Never rewrite history "
         "unless the user asked. "
         "Finish with a user-visible answer "
@@ -808,7 +828,7 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "ReadLints":
         return read_lints(ws, inp, ctx.get("events"))
     if name == "Bash":
-        from orbweaver.git_ritual import annotate_bash_output
+        from orbweaver.git_ritual import annotate_bash_output, ritual_says_not_done
         from orbweaver.permissions.pipeline import bash_permissions
 
         perms = sorted(bash_permissions(inp))
@@ -827,6 +847,7 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             result = annotate_bash_output(
                 Path(ws.root), inp.get("command") or "", result
             )
+            ctx["git_not_done"] = ritual_says_not_done(result)
         return result
     if name == "WebFetch":
         import httpx
@@ -1215,7 +1236,14 @@ async def agent_turn(
             ctx["events"] = events
             messages = _prompt_messages(events, workspace, user_text)
             if round_i == max_rounds - 1:
-                _nudge_user(messages, LAST_ROUND_NUDGE)
+                _nudge_user(
+                    messages,
+                    GIT_NOT_DONE_LAST_NUDGE
+                    if ctx.get("git_not_done")
+                    else LAST_ROUND_NUDGE,
+                )
+            elif ctx.pop("git_not_done_nudge_pending", False):
+                _nudge_user(messages, GIT_NOT_DONE_NUDGE)
             try:
                 resp = await _await_or_cancel(
                     client.messages.create(
@@ -1240,6 +1268,14 @@ async def agent_turn(
                 fire(ev)
             check()
             if not tool_uses:
+                if (
+                    ctx.get("git_not_done")
+                    and not ctx.get("git_not_done_nudged")
+                    and round_i < max_rounds - 1
+                ):
+                    ctx["git_not_done_nudged"] = True
+                    ctx["git_not_done_nudge_pending"] = True
+                    continue
                 break
             stop_after_ask = False
             waiting_ask = False
@@ -1370,7 +1406,10 @@ async def agent_turn(
         else:
             events = await store.list_events(session_id)
             messages = _prompt_messages(events, workspace, user_text)
-            _nudge_user(messages, CONCLUDE_NUDGE)
+            _nudge_user(
+                messages,
+                GIT_NOT_DONE_CONCLUDE if ctx.get("git_not_done") else CONCLUDE_NUDGE,
+            )
             try:
                 resp = await _await_or_cancel(
                     client.messages.create(

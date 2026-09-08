@@ -15,6 +15,8 @@ from pathlib import Path
 GIT_CMD_RE = re.compile(r"(?:^|[\s;|&`])git\s+\w")
 CD_RE = re.compile(r"(?:^|&&|\|\||;)\s*cd\s+((?:'[^']+'|\"[^\"]+\"|\S+))")
 ADD_ALL_RE = re.compile(r"\bgit\s+add\s+(?:-A|--all)\b")
+COMMIT_OR_PUSH_RE = re.compile(r"\bgit\s+(commit|push)\b")
+REBASE_FINISH_RE = re.compile(r"\bgit\s+rebase\s+(?:--continue|--abort|--skip)\b")
 
 RITUAL_MARK = "--- git ritual ---"
 REBASE_WARNING = (
@@ -31,6 +33,17 @@ DETACHED_WARNING = (
 ADD_ALL_WARNING = (
     "git add -A/--all stages untracked junk (.venv, .orbweaver-tmp). "
     "Add the files you changed instead."
+)
+NOT_DONE_MARK = "NOT_DONE"
+NOT_DONE_WARNING = (
+    "NOT_DONE: this is not done. git commit / git push did not finish the rebase "
+    "and did not publish HEAD. The next Git command must be `git rebase --continue` "
+    "(after git add of resolved files) or `git rebase --abort`. "
+    "Do not treat 'Everything up-to-date' or a new commit hash as success."
+)
+STAGED_TMP_WARNING = (
+    ".orbweaver-tmp is in git status; do not stage it. "
+    "Add only the files you changed."
 )
 
 _GIT_ENV = {
@@ -99,10 +112,40 @@ def repo_for_command(workspace_root: Path, command: str) -> Path | None:
     return None
 
 
-def git_snapshot(repo: Path) -> str:
+def command_commits_or_pushes(command: str) -> bool:
+    return bool(COMMIT_OR_PUSH_RE.search(command or ""))
+
+
+def command_finishes_rebase(command: str) -> bool:
+    return bool(REBASE_FINISH_RE.search(command or ""))
+
+
+def ritual_says_not_done(output: str) -> bool:
+    blob = str(output or "")
+    return f"{NOT_DONE_MARK}:" in blob
+
+
+def escalate_lines(
+    command: str, *, rebase: bool, detached: bool, status: str
+) -> list[str]:
+    extra: list[str] = []
+    if (
+        (rebase or detached)
+        and command_commits_or_pushes(command)
+        and not command_finishes_rebase(command)
+    ):
+        extra.append(NOT_DONE_WARNING)
+    if ADD_ALL_RE.search(command or ""):
+        extra.append(ADD_ALL_WARNING)
+        if ".orbweaver-tmp" in (status or ""):
+            extra.append(STAGED_TMP_WARNING)
+    return extra
+
+
+def git_snapshot(repo: Path) -> tuple[str, bool, bool, str]:
     status = _run_git(repo, "status", "--short", "--branch")
     if status.returncode != 0 and not (status.stdout or status.stderr):
-        return ""
+        return "", False, False, ""
     head_ab = (_run_git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout or "").strip()
     head_sha = (_run_git(repo, "rev-parse", "--short", "HEAD").stdout or "").strip()
     git_dir_raw = (_run_git(repo, "rev-parse", "--git-dir").stdout or "").strip()
@@ -110,17 +153,20 @@ def git_snapshot(repo: Path) -> str:
     if not git_dir.is_absolute():
         git_dir = repo / git_dir
 
+    status_text = (status.stdout or status.stderr or "").rstrip() or "(no status)"
+    rebase = (git_dir / "rebase-merge").is_dir() or (git_dir / "rebase-apply").is_dir()
+    detached = head_ab == "HEAD"
     lines = [
         f"repo={repo}",
         f"branch={head_ab or '?'}",
         f"HEAD={head_sha or '?'}",
-        (status.stdout or status.stderr or "").rstrip() or "(no status)",
+        status_text,
     ]
-    if (git_dir / "rebase-merge").is_dir() or (git_dir / "rebase-apply").is_dir():
+    if rebase:
         lines.append(REBASE_WARNING)
-    if head_ab == "HEAD":
+    if detached:
         lines.append(DETACHED_WARNING)
-    return "\n".join(lines)
+    return "\n".join(lines), rebase, detached, status_text
 
 
 def annotate_bash_output(workspace_root: Path, command: str, output: str) -> str:
@@ -130,12 +176,15 @@ def annotate_bash_output(workspace_root: Path, command: str, output: str) -> str
     if repo is None:
         return output
     try:
-        snap = git_snapshot(repo)
+        snap, rebase, detached, status_text = git_snapshot(repo)
     except (OSError, subprocess.TimeoutExpired):
         return output
     if not snap:
         return output
     parts = [str(output or "").rstrip(), "", RITUAL_MARK, snap]
-    if ADD_ALL_RE.search(command or ""):
-        parts.append(ADD_ALL_WARNING)
+    parts.extend(
+        escalate_lines(
+            command, rebase=rebase, detached=detached, status=status_text
+        )
+    )
     return "\n".join(parts) + "\n"
