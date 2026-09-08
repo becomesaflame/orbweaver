@@ -15,7 +15,10 @@ from orbweaver.tokens import estimate_tokens
 log = logging.getLogger(__name__)
 
 BOUNDARY_KINDS = frozenset({"compact_boundary", "compact_summary"})
-COMPACTABLE_TOOLS = frozenset({"Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Browser"})
+# Read stays in the prompt: a long turn of Bash/Grep used to drop earlier file
+# windows (global last-N compactable), so the model re-read the same paths until
+# the round cap and never edited. Token pressure on Reads is compact_boundary.
+COMPACTABLE_TOOLS = frozenset({"Bash", "Grep", "Glob", "WebFetch", "WebSearch", "Browser"})
 PAIR_KINDS = frozenset(
     {
         "tool_call",

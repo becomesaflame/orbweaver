@@ -74,7 +74,11 @@ TOOL_SPEC = [
             "Relative paths are the session workspace. Absolute paths in extra sandbox "
             "roots are auto-allowed; other host paths are classified. Use offset "
             "(1-based line, or negative from the end) and limit to page text; do not "
-            "page files with Bash. The result says how to continue when truncated."
+            "page files with Bash. Default limit is 400 lines — Grep (or one wide "
+            "Read) to find a symbol; do not take tiny windows, and do not re-Read a "
+            "path already in this turn unless the previous result was truncated. "
+            "Once you have the numbered lines, edit with StrReplace. The result says "
+            "how to continue when truncated."
         ),
         "input_schema": {
             "type": "object",

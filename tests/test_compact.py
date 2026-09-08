@@ -92,6 +92,79 @@ async def test_microcompact_stubs_old_tool_results_not_store():
     assert all("cleared" not in str(e.payload.get("content")) for e in stored if e.kind == "tool_result")
 
 
+@pytest.mark.asyncio
+async def test_microcompact_keeps_reads_when_bash_would_drop_them():
+    """Production: 33 Reads + 15 Bash in one turn. Global last-5 compactable
+    stubbed the RunningTurn window, so the model re-Read app.py until the round
+    cap and never StrReplace'd."""
+    store = reset_store_for_tests()
+    sid = new_uuid()
+    await _session(store, sid)
+    await store.append_event(
+        sid,
+        "tool_call",
+        {"id": "r1", "name": "Read", "input": {"path": "backend/orbweaver/agent.py"}},
+    )
+    await store.append_event(
+        sid,
+        "tool_result",
+        {
+            "tool_use_id": "r1",
+            "name": "Read",
+            "content": "     243|class RunningTurn:\n     244|    input_tokens: int\n",
+        },
+    )
+    for i in range(8):
+        tid = f"b{i}"
+        await store.append_event(sid, "tool_call", {"id": tid, "name": "Bash", "input": {"command": "x"}})
+        await store.append_event(
+            sid,
+            "tool_result",
+            {"tool_use_id": tid, "name": "Bash", "content": f"bash-out-{i}-" + "x" * 20},
+        )
+    await store.append_event(
+        sid,
+        "tool_call",
+        {
+            "id": "r2",
+            "name": "Read",
+            "input": {"path": "backend/orbweaver/agent.py", "offset": 590, "limit": 20},
+        },
+    )
+    await store.append_event(
+        sid,
+        "tool_result",
+        {
+            "tool_use_id": "r2",
+            "name": "Read",
+            "content": "     590|return {\"status\": status}\n",
+        },
+    )
+    await store.append_event(
+        sid,
+        "tool_call",
+        {"id": "r3", "name": "Read", "input": {"path": "web/index.html"}},
+    )
+    await store.append_event(
+        sid,
+        "tool_result",
+        {
+            "tool_use_id": "r3",
+            "name": "Read",
+            "content": "function add(kind, text) {\n  $(\"log\").scrollTop = $(\"log\").scrollHeight;\n",
+        },
+    )
+    events = await store.list_events(sid)
+    projected = prompt_events(events)
+    contents = [str(e.payload.get("content")) for e in projected if e.kind == "tool_result"]
+    assert any("class RunningTurn" in c for c in contents)
+    assert any("return {\"status\": status}" in c for c in contents)
+    assert any("function add(kind, text)" in c for c in contents)
+    assert any("cleared" in c for c in contents)
+    running = next(c for c in contents if "class RunningTurn" in c)
+    assert "cleared" not in running
+
+
 def test_persist_writes_preview_and_file(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "compact_tool_result_chars", 100)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
