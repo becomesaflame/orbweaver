@@ -125,6 +125,7 @@
     .ghost.hidden, #continue.hidden, #queue-btn.hidden, #inject.hidden { display:none; }
     #composer-hint { padding:0 1rem 0.75rem; font-size:0.75rem; color:var(--muted); min-height:1.15rem; }
     .msg.injected { border-left-color:#8aa0c8; }
+    .msg.ask { border-left-color:#8aa0c8; }
     .msg-actions { display:flex; gap:0.25rem; margin-top:0.4rem; }
     .msg-actions button {
       font-size:0.75rem; color:var(--muted); padding:0.12rem 0.45rem; border-radius:6px;
@@ -257,6 +258,7 @@
     let sessions = [];
     let inFlight = null;
     let stoppedSids = new Set();
+    let waitingAskSids = new Set();
     const followupQueues = new Map();
     let collapsed = new Set(JSON.parse(localStorage.getItem(LS.collapsed) || "[]"));
     let expandedExtra = new Set(JSON.parse(localStorage.getItem(LS.expanded) || "[]"));
@@ -349,6 +351,8 @@
         const extra = p.injected ? "injected" : "";
         const el = add(ev.kind, p.text || "", { seq: ev.seq, extraClass: extra });
         if (ev.kind === "user") attachUserActions(el, p.text || "", ev.seq, false);
+      } else if (ev.kind === "ask_user") {
+        add("assistant", p.question || "Waiting for your answer", { seq: ev.seq, extraClass: "ask" });
       } else if (ev.kind === "turn_aborted") {
         add("assistant", p.text || "Turn aborted", { seq: ev.seq, extraClass: "stopped" });
       } else if (ev.kind === "turn_interrupted") {
@@ -424,9 +428,22 @@
       paintFollowups();
       syncComposer();
     }
+    function pendingAskFromEvents(evs) {
+      const answered = new Set();
+      const asks = [];
+      for (const ev of evs) {
+        const p = ev.payload || {};
+        if (ev.kind === "tool_call" && p.name === "AskUser") asks.push(p.id);
+        if ((ev.kind === "tool_result" || ev.kind === "MemoryRecall") && p.tool_use_id) {
+          answered.add(String(p.tool_use_id));
+        }
+      }
+      return asks.some((id) => id && !answered.has(String(id)));
+    }
     function syncComposer() {
       const busy = !!(inFlight && inFlight.sid === currentSid());
-      const stopped = !busy && stoppedSids.has(currentSid());
+      const waiting = !busy && waitingAskSids.has(currentSid());
+      const stopped = !busy && !waiting && stoppedSids.has(currentSid());
       const hasText = !!$("text").value.trim();
       $("send").textContent = busy ? "Stop" : "Send";
       $("send").classList.toggle("stop", busy);
@@ -438,10 +455,12 @@
       $("continue").classList.toggle("hidden", !stopped);
       $("text").placeholder = busy
         ? "Enter queues · Ctrl+Enter adds to this turn"
-        : (stopped ? "Continue this turn, or type a new message" : "Message (Shift+Enter for newline)");
+        : (waiting ? "Answer the agent's question"
+          : (stopped ? "Continue this turn, or type a new message" : "Message (Shift+Enter for newline)"));
       $("composer-hint").textContent = busy
         ? "Enter queues for after this turn · Ctrl+Enter injects now · Esc stops"
-        : (stopped ? "Continue resumes · Edit the prompt to restart · Enter sends a new turn" : "");
+        : (waiting ? "The agent is waiting for your answer · Enter sends it as the tool result"
+          : (stopped ? "Continue resumes · Edit the prompt to restart · Enter sends a new turn" : ""));
       paintFollowups();
     }
     function setBusy(_on) { syncComposer(); }
@@ -654,12 +673,16 @@
         $("log").replaceChildren();
         const evs = r.events || [];
         stoppedSids.delete(sid);
+        waitingAskSids.delete(sid);
         if (!evs.length) {
           $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
         } else {
           for (const ev of evs) renderEvent(ev);
-          const last = evs[evs.length - 1];
-          if (last.kind !== "assistant") stoppedSids.add(sid);
+          if (pendingAskFromEvents(evs)) waitingAskSids.add(sid);
+          else {
+            const last = evs[evs.length - 1];
+            if (last.kind !== "assistant") stoppedSids.add(sid);
+          }
         }
         $("status").textContent = "";
         syncComposer();
@@ -865,6 +888,7 @@
       const sid = currentSid();
       if (!sid) return;
       stoppedSids.delete(sid);
+      waitingAskSids.delete(sid);
       const ph = $("log").querySelector(".placeholder");
       if (ph) ph.remove();
       $("log").querySelectorAll(".msg.stopped").forEach((n) => n.remove());
@@ -879,6 +903,7 @@
         if (workingEl.parentNode) workingEl.remove();
         if (currentSid() === sid) {
           for (const ev of r.events || []) renderEvent(ev);
+          if (r.status === "waiting_ask") waitingAskSids.add(sid);
           if (r.status === "stopped") stoppedSids.add(sid);
         }
         await refreshSessions();
@@ -915,6 +940,7 @@
       persistSid();
       const sid = currentSid();
       stoppedSids.delete(sid);
+      waitingAskSids.delete(sid);
       const ph = $("log").querySelector(".placeholder");
       if (ph) ph.remove();
       $("text").value = "";
@@ -940,6 +966,7 @@
           if (userEl && r.user_seq != null) userEl.dataset.seq = String(r.user_seq);
           if (userEl) attachUserActions(userEl, text, r.user_seq, false);
           const events = r.events || [];
+          if (r.status === "waiting_ask") waitingAskSids.add(sid);
           if (r.status === "stopped") stoppedSids.add(sid);
           for (const ev of events) renderEvent(ev);
         }
