@@ -7,7 +7,9 @@ from PIL import Image
 from orbweaver.channels.telegram import generate_and_maybe_send, send_session_photo
 from orbweaver.compact.project import events_to_messages
 from orbweaver.config import settings
+from orbweaver.agent import run_tools
 from orbweaver.image import (
+    format_image_read,
     hydrate_workspace_images,
     process_image_bytes,
     save_inbound_image,
@@ -134,3 +136,65 @@ async def test_generate_image_without_api_key(tmp_path, monkeypatch):
     )
     assert "ORBWEAVER_IMAGE_API_KEY" in result
     assert "SendPhoto" in result
+
+
+@pytest.mark.asyncio
+async def test_read_image_path_returns_vision_marker(tmp_path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    saved = save_inbound_image(ws, _png_bytes(16), "vision")
+    store = reset_store_for_tests()
+    result = await run_tools("Read", {"path": saved["path"]}, {"workspace": ws, "store": store, "session_id": uuid4()})
+    assert "__orbweaver_image__" in result
+    assert saved["path"] in result
+    assert "image/jpeg" in result
+    ws.write("notes.txt", "hello\n")
+    text_result = await run_tools(
+        "Read", {"path": "notes.txt"}, {"workspace": ws, "store": store, "session_id": uuid4()}
+    )
+    assert "hello" in text_result
+    assert "__orbweaver_image__" not in text_result
+
+
+def test_format_image_read_missing_file(tmp_path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    result = format_image_read(ws, "attachments/missing.jpg")
+    assert result.startswith("error reading")
+
+
+def test_read_image_events_hydrate_like_telegram(tmp_path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    saved = save_inbound_image(ws, _png_bytes(12), "loop")
+    marker = format_image_read(ws, saved["path"])
+    sid = uuid4()
+    events = [
+        Event(id=uuid4(), session_id=sid, seq=1, kind="user", payload={"text": "what is this?"}),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="tool_call",
+            payload={"id": "toolu_1", "name": "Read", "input": {"path": saved["path"]}},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=3,
+            kind="tool_result",
+            payload={"tool_use_id": "toolu_1", "name": "Read", "content": marker},
+        ),
+    ]
+    messages = events_to_messages(events)
+    tool = messages[-1]["content"][0]
+    assert tool["type"] == "tool_result"
+    blocks = tool["content"]
+    assert blocks[0]["type"] == "image"
+    assert blocks[0]["source"]["type"] == "workspace_path"
+    assert blocks[0]["source"]["path"] == saved["path"]
+    assert blocks[1]["type"] == "text"
+    assert "Read image" in blocks[1]["text"]
+
+    hydrated = hydrate_workspace_images(messages, ws)
+    src = hydrated[-1]["content"][0]["content"][0]["source"]
+    assert src["type"] == "base64"
+    assert src["media_type"] == "image/jpeg"
+    assert len(src["data"]) > 20
