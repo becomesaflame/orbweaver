@@ -22,7 +22,7 @@ from orbweaver.compact import (
     usage_input_tokens,
 )
 from orbweaver.config import settings
-from orbweaver.image import hydrate_workspace_images
+from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
 from orbweaver.memory import pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
@@ -47,10 +47,11 @@ TOOL_SPEC = [
     {
         "name": "Read",
         "description": (
-            "Read a file as numbered lines. Relative paths are the session workspace. "
-            "Absolute paths in extra sandbox roots are auto-allowed; other host paths are "
-            "classified. Use offset (1-based line, or negative from the end) and limit to "
-            "page; do not page files with Bash. The result says how to continue when truncated."
+            "Read a file as numbered lines, or an image as vision (jpg/png/webp/gif). "
+            "Relative paths are the session workspace. Absolute paths in extra sandbox "
+            "roots are auto-allowed; other host paths are classified. Use offset "
+            "(1-based line, or negative from the end) and limit to page text; do not "
+            "page files with Bash. The result says how to continue when truncated."
         ),
         "input_schema": {
             "type": "object",
@@ -516,11 +517,14 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     store: Store = ctx["store"]
     session_id: UUID = ctx["session_id"]
     if name == "Read":
+        path = str(inp.get("path") or "")
+        if is_image_path(path):
+            return format_image_read(ws, path)
         try:
-            raw = ws.read(inp["path"])
+            raw = ws.read(path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
-        return format_read(raw, path=str(inp["path"]), offset=inp.get("offset"), limit=inp.get("limit"))
+        return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
