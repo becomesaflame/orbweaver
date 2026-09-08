@@ -95,6 +95,7 @@ async def test_spawn_creates_hidden_child_session(tmp_path, ws, monkeypatch, aut
     assert "Read" in names
     assert "ProposePatch" not in names
     assert "Write" in names
+    assert "StrReplace" in names
     assert child.jsonld.get("channel") in {None, ""}
     parent_kinds = [e.kind for e in await store.list_events(sid)]
     assert "subagent_started" in parent_kinds
@@ -237,14 +238,17 @@ def test_child_tool_spec_by_type():
     assert "MemoryGraph" in explore
     assert "MemoryReflect" in explore
     assert "Write" not in explore
+    assert "StrReplace" not in explore
     assert "Bash" not in explore
     assert "NotebookEdit" not in explore
     assert "Write" in implement
+    assert "StrReplace" in implement
     assert "Bash" in implement
     assert "NotebookEdit" in implement
     assert "Bash" in shell
     assert "Read" in shell
     assert "Write" not in shell
+    assert "StrReplace" not in shell
     assert "NotebookEdit" not in shell
     assert names >= {"Read", "Write", "Bash"}
     assert normalize_subagent_type("") == "implement"
@@ -277,6 +281,7 @@ async def test_typed_subagent_explore_and_unknown(ws, monkeypatch):
     names = {t["name"] for t in captured["kwargs"]["tools"]}
     assert "Read" in names
     assert "Write" not in names
+    assert "StrReplace" not in names
     assert "Bash" not in names
     assert "explore" in captured["kwargs"]["system_extra"]
 

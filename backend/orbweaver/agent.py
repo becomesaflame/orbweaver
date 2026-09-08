@@ -666,7 +666,10 @@ def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dic
 
 
 def static_system(channel: str = "") -> str:
-    write_line = "In auto mode, in-project Write applies immediately. "
+    write_line = (
+        "In auto mode, in-project Write and StrReplace apply immediately. "
+        "Prefer StrReplace for existing files. "
+    )
     if channel_allows_proposepatch(channel):
         write_line += "Prefer ProposePatch when a visible diff overlay helps the user. "
     return (
@@ -693,8 +696,10 @@ def static_system(channel: str = "") -> str:
         "the Bash footer 'git ritual' (status, branch, HEAD) is authoritative, not a "
         "success substring like 'Everything up-to-date'. Identify the repo (cd target "
         "or workspace root); do not rebase a nested shared clone by accident. "
-        "For conflicts, keep current main and re-apply the small feature; do not "
-        "str.replace conflict markers. After resolving, git add those files and "
+        "For conflicts, keep current main and re-apply the small feature; use "
+        "StrReplace on the whole hunk including <<<<<<< / ======= / >>>>>>> "
+        "markers. Do not rewrite files with Python, sed, or Bash str.replace. "
+        "After resolving, git add those files and "
         "git rebase --continue (or merge --continue). git commit is not continue. "
         "While detached or rebase-in-progress, git push origin <branch> updates the "
         "old branch tip, not HEAD. If the footer says NOT_DONE, the rebase is "
@@ -792,6 +797,16 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "Write":
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
+    if name == "StrReplace":
+        try:
+            return ws.str_replace(
+                str(inp.get("path") or ""),
+                str(inp.get("old_string") or ""),
+                str(inp.get("new_string") if inp.get("new_string") is not None else ""),
+                replace_all=bool(inp.get("replace_all")),
+            )
+        except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
+            return f"error replacing in {inp.get('path')}: {e}"
     if name == "NotebookEdit":
         from orbweaver.notebook import apply_notebook_edit
 
