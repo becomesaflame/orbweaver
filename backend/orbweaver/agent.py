@@ -76,6 +76,31 @@ TOOL_SPEC = [
         },
     },
     {
+        "name": "NotebookEdit",
+        "description": (
+            "Edit one cell in a .ipynb notebook. Do not Write the whole notebook JSON. "
+            "action is replace (default), insert, or delete. replace can set source or "
+            "search-replace with old_string/new_string."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "cell_idx": {"type": "integer", "description": "0-based cell index."},
+                "action": {"type": "string", "enum": ["replace", "insert", "delete"]},
+                "source": {"type": "string", "description": "Full replacement or insert source."},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "cell_type": {
+                    "type": "string",
+                    "enum": ["code", "markdown", "raw"],
+                    "description": "Cell type for insert (default code).",
+                },
+            },
+            "required": ["path", "cell_idx"],
+        },
+    },
+    {
         "name": "Delete",
         "description": (
             "Delete a file or directory in the session working set. Same deny/ask rules as "
@@ -492,6 +517,7 @@ def static_system(channel: str = "") -> str:
         f"{write_line}"
         "In auto mode, in-project Delete applies immediately. TodoWrite keeps the plan "
         "on this session across compaction. After edits, ReadLints for diagnostics. "
+        "Use NotebookEdit for .ipynb cells instead of rewriting the whole JSON. "
         "Use MemorySearch when past decisions might "
         "matter, and MemoryGraph to walk entity neighborhoods. Keep pins small. If the "
         "sandbox cannot run a command, ask the user "
@@ -547,6 +573,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "Write":
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
+    if name == "NotebookEdit":
+        from orbweaver.notebook import apply_notebook_edit
+
+        return apply_notebook_edit(ws, inp)
     if name == "Delete":
         try:
             return ws.delete(inp["path"])

@@ -101,7 +101,7 @@ def parse_rules(blob: str) -> list[tuple[str, str | None]]:
 def _subject(tool: str, inp: dict[str, Any]) -> str:
     if tool == "Bash":
         return str(inp.get("command") or "")
-    if tool in {"Read", "Write", "ProposePatch", "SendPhoto", "Delete"}:
+    if tool in {"Read", "Write", "ProposePatch", "NotebookEdit", "SendPhoto", "Delete"}:
         return str(inp.get("path") or "")
     if tool == "ReadLints":
         paths = inp.get("paths") or inp.get("path") or ""
