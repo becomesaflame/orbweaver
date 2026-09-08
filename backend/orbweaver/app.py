@@ -31,7 +31,7 @@ from orbweaver import __version__
 from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel, pending_ask_user
 from orbweaver.auth import mint_token, require_user
 from orbweaver.config import settings
-from orbweaver.memory import remember, rewrite_search_query
+from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
 from orbweaver.ratelimit import FileRateLimiter, get_rate_limiter
 from orbweaver.store import (
     SESSION_TYPE,
@@ -406,19 +406,7 @@ async def search(body: SearchBody, _u: dict = Depends(_user)) -> dict[str, Any]:
         events = await store.list_events(body.session_id)
         q = rewrite_search_query(events, body.query)
     hits = await store.search_chunks(q, k=body.k)
-    graph_hits: list[dict[str, str]] = []
-    seen_edges: set[tuple[str, str, str]] = set()
-    for chunk, _score in hits:
-        for eid in chunk.entity_ids:
-            ent = await store.get_entity(eid)
-            if not ent:
-                continue
-            for s, p, o in await store.graph(ent.at_id, depth=1):
-                edge = (s, p, o)
-                if edge in seen_edges:
-                    continue
-                seen_edges.add(edge)
-                graph_hits.append({"s": s, "p": p, "o": o})
+    graph_hits = await expand_chunk_graph(store, hits)
     return {
         "query_used": q,
         "hits": [{"id": str(c.id), "text": c.text, "score": score} for c, score in hits],
