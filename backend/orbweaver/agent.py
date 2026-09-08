@@ -8,6 +8,7 @@ import logging
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
@@ -218,7 +219,9 @@ TOOL_SPEC = [
             "escalation. If the sandbox blocks the command, ask the user before setting "
             "permissions to [\"full_network\"] (arbitrary internet) or [\"all\"] "
             "(host writes/docker/sudo). Those overrides pause for approval. "
-            "unsandboxed true aliases [\"all\"]."
+            "unsandboxed true aliases [\"all\"]. Git commands get an automatic "
+            "status footer (branch, HEAD, rebase-in-progress); trust that over "
+            "success substrings in the command output."
         ),
         "input_schema": {
             "type": "object",
@@ -667,7 +670,19 @@ def static_system(channel: str = "") -> str:
         "Use WebSearch to find sources, then WebFetch a few result URLs; do not guess "
         "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
         "Configured MCP servers appear as mcp_<server>_<tool> and use the "
-        "same permission pipeline as other tools. Finish with a user-visible answer "
+        "same permission pipeline as other tools. "
+        "Git: after clone, fetch, rebase, merge, commit, or push, read Git's state — "
+        "the Bash footer 'git ritual' (status, branch, HEAD) is authoritative, not a "
+        "success substring like 'Everything up-to-date'. Identify the repo (cd target "
+        "or workspace root); do not rebase a nested shared clone by accident. "
+        "For conflicts, keep current main and re-apply the small feature; do not "
+        "str.replace conflict markers. After resolving, git add those files and "
+        "git rebase --continue (or merge --continue). git commit is not continue. "
+        "While detached or rebase-in-progress, git push origin <branch> updates the "
+        "old branch tip, not HEAD. Do not git add -A if it would stage junk "
+        "(.venv, .orbweaver-tmp). Never force-push main. Never rewrite history "
+        "unless the user asked. "
+        "Finish with a user-visible answer "
         "before the tool-round budget runs out; spawn a subagent for a long exploration "
         "instead of burning parent rounds."
     )
@@ -793,18 +808,26 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "ReadLints":
         return read_lints(ws, inp, ctx.get("events"))
     if name == "Bash":
+        from orbweaver.git_ritual import annotate_bash_output
         from orbweaver.permissions.pipeline import bash_permissions
 
         perms = sorted(bash_permissions(inp))
-        return ws.bash(
+        background = bool(inp.get("background"))
+        job_id = inp.get("job_id")
+        result = ws.bash(
             inp.get("command") or "",
             timeout=inp.get("timeout"),
             block_until_ms=inp.get("block_until_ms"),
-            background=bool(inp.get("background")),
-            job_id=inp.get("job_id"),
+            background=background,
+            job_id=job_id,
             unsandboxed=bool(inp.get("unsandboxed")),
             permissions=perms,
         )
+        if not background and not job_id:
+            result = annotate_bash_output(
+                Path(ws.root), inp.get("command") or "", result
+            )
+        return result
     if name == "WebFetch":
         import httpx
 
