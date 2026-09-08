@@ -4,7 +4,8 @@ from uuid import uuid4
 import anthropic
 import pytest
 
-from orbweaver.agent import agent_turn, run_tools
+from orbweaver.agent import DEFAULT_MAX_ROUNDS, agent_turn, run_tools
+from orbweaver.subagent import SUBAGENT_MAX_ROUNDS
 from orbweaver.channels.telegram import texts_for_reply
 from orbweaver.config import settings
 from orbweaver.permissions.pipeline import abort_message
@@ -157,6 +158,46 @@ async def test_round_cap_fallback_when_conclude_empty(tmp_path, monkeypatch):
     events = await agent_turn(store, sid, "list files", ws, max_rounds=1)
     texts = [e.payload.get("text") for e in events if e.kind == "assistant"]
     assert any("Stopped after 1 tool rounds" in (t or "") for t in texts)
+
+
+def test_round_cap_is_safety_ceiling_not_compact_valve():
+    assert DEFAULT_MAX_ROUNDS >= 256
+    assert SUBAGENT_MAX_ROUNDS >= 256
+    assert DEFAULT_MAX_ROUNDS > 50
+    # Child budget is independent; it must not inherit a leftover parent remainder.
+    assert SUBAGENT_MAX_ROUNDS == DEFAULT_MAX_ROUNDS
+
+
+@pytest.mark.asyncio
+async def test_fifty_reads_conclude_from_model_stop_not_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    reads = [
+        SimpleNamespace(content=[_ToolUse("Read", {"path": "tiny.txt"}, uid=f"r{i}")])
+        for i in range(50)
+    ]
+    client = _RecordingAnthropic(reads)
+
+    def factory(*a, **k):
+        return client
+
+    async def cheap_read(name, inp, ctx):
+        return "1| ok"
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", factory)
+    monkeypatch.setattr("orbweaver.agent.run_tools", cheap_read)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    events = await agent_turn(store, sid, "read the file", ws)
+    texts = [e.payload.get("text") for e in events if e.kind == "assistant"]
+    assert any("here is what I found" in (t or "") for t in texts)
+    assert not any("Stopped after" in (t or "") for t in texts)
+    assert len(client.calls) == 51
+    assert client.calls[-1]["tools"] != []
+    blob = "\n".join(str(c["messages"][-1]["content"]) for c in client.calls)
+    assert "last tool round" not in blob.lower()
+    assert "Tool-round budget exhausted" not in blob
+    assert sum(1 for e in events if e.kind == "tool_call") == 50
 
 
 @pytest.mark.asyncio

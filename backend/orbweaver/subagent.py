@@ -15,7 +15,8 @@ except ImportError:  # pragma: no cover
     review_subagent_return = None  # type: ignore[assignment,misc]
 
 CHILD_BLOCKED_TOOLS = frozenset({"SpawnSubagent", "AskUser", "ScheduleTask"})
-SUBAGENT_MAX_ROUNDS = 48
+# Independent of the parent turn. Do not share a small cap that starves both.
+SUBAGENT_MAX_ROUNDS = 256
 RESULT_TEXT_CAP = 8000
 DEFAULT_SUBAGENT_TYPE = "implement"
 SUBAGENT_TYPES = frozenset({"explore", "implement", "shell"})
