@@ -52,6 +52,8 @@ def summarize_input(name: str, inp: dict[str, Any]) -> str:
         return str(inp.get("prompt") or "")[:240]
     if name == "WebFetch":
         return str(inp.get("url") or "")[:240]
+    if name == "WebSearch":
+        return str(inp.get("query") or "")[:240]
     if name == "SpawnSubagent":
         return str(inp.get("task") or "")[:240]
     return name

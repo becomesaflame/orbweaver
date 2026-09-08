@@ -8,7 +8,15 @@ from orbweaver.config import settings
 from orbweaver.redact import redact_secrets
 
 SKIP_PERSIST = frozenset(
-    {"Read", "WebFetch", "MemorySearch", "MemoryRemember", "MemoryPin", "MemoryForget"}
+    {
+        "Read",
+        "WebFetch",
+        "WebSearch",
+        "MemorySearch",
+        "MemoryRemember",
+        "MemoryPin",
+        "MemoryForget",
+    }
 )
 PREVIEW_CHARS = 2000
 
