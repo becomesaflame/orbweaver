@@ -1,4 +1,5 @@
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -6,12 +7,16 @@ import pytest
 
 from orbweaver.workspace import (
     DEFAULT_BASH_TIMEOUT_S,
+    GREP_HIT_CAP,
     MAX_BASH_TIMEOUT_S,
     LocalWorkspace,
     resolve_bash_timeout,
 )
 
+needs_rg = pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep (rg) required")
 
+
+@needs_rg
 def test_local_glob_and_grep(tmp_path: Path):
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     ws.write("src/a.py", "hello airbed\n")
@@ -22,6 +27,78 @@ def test_local_glob_and_grep(tmp_path: Path):
     alt = ws.grep(r"airbed\|docs")
     assert any("src/a.py" in h for h in alt)
     assert any("README.md" in h for h in alt)
+
+
+@needs_rg
+def test_glob_recursive_workspace_rooted(tmp_path: Path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("deep/nested/x.py", "x")
+    ws.write("top.py", "y")
+    hits = ws.glob("*.py")
+    assert "deep/nested/x.py" in hits
+    assert "top.py" in hits
+
+
+@needs_rg
+def test_grep_glob_filter(tmp_path: Path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("src/a.py", "needle\n")
+    ws.write("src/b.md", "needle\n")
+    hits = ws.grep("needle", glob="*.py")
+    assert any("src/a.py" in h for h in hits)
+    assert not any("b.md" in h for h in hits)
+
+
+@needs_rg
+def test_grep_type_filter(tmp_path: Path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("src/a.py", "needle\n")
+    ws.write("src/b.md", "needle\n")
+    hits = ws.grep("needle", file_type="py")
+    assert any("src/a.py" in h for h in hits)
+    assert not any("b.md" in h for h in hits)
+
+
+@needs_rg
+def test_grep_hit_cap(tmp_path: Path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("many.txt", "\n".join(f"hit {i}" for i in range(GREP_HIT_CAP + 30)))
+    hits = [h for h in ws.grep("hit") if not h.startswith("[")]
+    assert len(hits) == GREP_HIT_CAP
+    assert any("truncated" in h for h in ws.grep("hit"))
+
+
+@needs_rg
+def test_grep_context_lines(tmp_path: Path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("a.txt", "alpha\nMATCH\nomega\n")
+    text = "\n".join(ws.grep("MATCH", context=1))
+    assert "alpha" in text
+    assert "omega" in text
+    assert "MATCH" in text
+    after_only = "\n".join(ws.grep("MATCH", after=1))
+    assert "omega" in after_only
+    assert "alpha" not in after_only
+
+
+@needs_rg
+def test_grep_skips_binary(tmp_path: Path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write_bytes("blob.bin", b"hello\x00airbed\x00")
+    ws.write("keep.txt", "airbed\n")
+    hits = ws.grep("airbed")
+    assert any("keep.txt" in h for h in hits)
+    assert not any("blob.bin" in h for h in hits)
+
+
+def test_grep_missing_rg_is_clear(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("orbweaver.workspace.shutil.which", lambda _name: None)
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("a.txt", "x\n")
+    with pytest.raises(FileNotFoundError, match="ripgrep"):
+        ws.grep("x")
+    with pytest.raises(FileNotFoundError, match="ripgrep"):
+        ws.glob("*.txt")
 
 
 def test_path_escape_rejected(tmp_path: Path):

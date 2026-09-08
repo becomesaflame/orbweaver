@@ -128,7 +128,10 @@ TOOL_SPEC = [
     },
     {
         "name": "Glob",
-        "description": "List files matching a glob in the workspace.",
+        "description": (
+            "List files matching a glob, recursively from the workspace root (ripgrep --files). "
+            "Skips gitignored paths. Caps at 200 files."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"pattern": {"type": "string"}},
@@ -138,12 +141,23 @@ TOOL_SPEC = [
     {
         "name": "Grep",
         "description": (
-            "Search file contents with a regex. Use | for alternation. glob limits the files "
-            "(default **/*)."
+            "Search workspace file contents with ripgrep. Regex; use | for alternation "
+            "(a\\|b is treated as a|b). glob and type limit files. A/B/C add context lines. "
+            "Skips binary and gitignored files. Caps hits."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {"pattern": {"type": "string"}, "glob": {"type": "string"}},
+            "properties": {
+                "pattern": {"type": "string"},
+                "glob": {"type": "string"},
+                "type": {
+                    "type": "string",
+                    "description": "ripgrep file type, e.g. py, md, rust",
+                },
+                "A": {"type": "integer", "description": "lines after each match"},
+                "B": {"type": "integer", "description": "lines before each match"},
+                "C": {"type": "integer", "description": "lines before and after each match"},
+            },
             "required": ["pattern"],
         },
     },
@@ -590,7 +604,7 @@ def static_system(channel: str = "") -> str:
         "neighborhoods. Keep pins small. If the sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
         "stay blocked; do not route around them. Call independent tools in parallel in "
-        "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
+        "one round. Prefer Read offset/limit and Grep (ripgrep) over Bash for paging files. "
         "Use WebSearch to find sources, then WebFetch a few result URLs; do not guess "
         "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
         "Finish with a user-visible answer before the tool-round budget runs out; "
@@ -695,9 +709,26 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         result = ws.propose_patch(inp["path"], inp.get("old_string") or "", inp["new_string"])
         return json.dumps(result)[:200_000]
     if name == "Glob":
-        return "\n".join(ws.glob(inp["pattern"])[:200])
+        try:
+            return "\n".join(ws.glob(inp["pattern"])[:200])
+        except (FileNotFoundError, RuntimeError, TimeoutError) as e:
+            return str(e)
     if name == "Grep":
-        return "\n".join(ws.grep(inp["pattern"], inp.get("glob") or "**/*"))
+        from orbweaver.workspace import _ctx_int
+
+        try:
+            return "\n".join(
+                ws.grep(
+                    inp["pattern"],
+                    inp.get("glob") or "**/*",
+                    file_type=inp.get("type") or None,
+                    after=_ctx_int(inp.get("A")),
+                    before=_ctx_int(inp.get("B")),
+                    context=_ctx_int(inp.get("C")),
+                )
+            )
+        except (FileNotFoundError, TimeoutError) as e:
+            return str(e)
     if name == "ReadLints":
         return read_lints(ws, inp, ctx.get("events"))
     if name == "Bash":
