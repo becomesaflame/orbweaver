@@ -136,7 +136,7 @@ async def generate_and_maybe_send(ctx: dict, inp: dict) -> str:
         )
     try:
         data, media_type = generate_image_bytes(prompt)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return f"image generation failed: {e}"
     default_ext = ".png" if media_type == "image/png" else ".jpg"
     rel = str(inp.get("path") or "").strip() or f"attachments/generated-{new_uuid()}{default_ext}"
@@ -283,13 +283,13 @@ async def start_telegram() -> None:
         try:
             file = await largest.get_file()
             data = bytes(await file.download_as_bytearray())
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             await update.message.reply_text(f"photo download failed: {e}")
             return
         _store, _session_id, ws, _kind = await _session_workspace(update, context)
         try:
             img = save_inbound_image(ws, data, f"photo_{update.message.message_id}")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             await update.message.reply_text(f"photo processing failed: {e}")
             return
         caption = (update.message.caption or "").strip() or "[Photo]"
@@ -304,14 +304,14 @@ async def start_telegram() -> None:
         try:
             file = await doc.get_file()
             data = bytes(await file.download_as_bytearray())
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             await update.message.reply_text(f"image download failed: {e}")
             return
         _store, _session_id, ws, _kind = await _session_workspace(update, context)
         stem = (doc.file_name or f"image_{update.message.message_id}").rsplit(".", 1)[0]
         try:
             img = save_inbound_image(ws, data, stem)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             await update.message.reply_text(f"image processing failed: {e}")
             return
         caption = (update.message.caption or "").strip() or f"[Image: {img['path']}]"
@@ -328,7 +328,7 @@ async def start_telegram() -> None:
             from orbweaver.stt import transcribe_bytes
 
             text = transcribe_bytes(bytes(data), "voice.ogg")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             await update.message.reply_text(f"STT failed: {e}")
             return
         if not update.effective_user:
@@ -343,5 +343,8 @@ async def start_telegram() -> None:
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
+    updater = app.updater
+    if updater is None:
+        raise RuntimeError("telegram updater missing after start")
+    await updater.start_polling()
     log.info("telegram polling started")

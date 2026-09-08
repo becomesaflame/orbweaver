@@ -44,9 +44,9 @@ def paths_in_live_reads(live: list[Event]) -> set[str]:
                 id_to_path[tid] = path
         elif ev.kind == "tool_result" and str(ev.payload.get("name") or "") == "Read":
             tid = str(ev.payload.get("tool_use_id") or "")
-            path = id_to_path.get(tid)
-            if path:
-                present.add(path)
+            found = id_to_path.get(tid)
+            if found:
+                present.add(found)
     return present
 
 

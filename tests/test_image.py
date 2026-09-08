@@ -4,10 +4,10 @@ from uuid import uuid4
 import pytest
 from PIL import Image
 
+from orbweaver.agent import run_tools
 from orbweaver.channels.telegram import generate_and_maybe_send, send_session_photo
 from orbweaver.compact.project import events_to_messages
 from orbweaver.config import settings
-from orbweaver.agent import run_tools
 from orbweaver.image import (
     format_image_read,
     hydrate_workspace_images,

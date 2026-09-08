@@ -94,6 +94,9 @@ playwright install chromium
 
 ```bash
 python3 -m pytest tests -q
+cd backend && python -m ruff check . ../tests && python -m mypy orbweaver
+cd vscode && npm ci && npx tsc -p . --noEmit
+cd web && npm install && npx playwright test   # optional; skip in CI with SKIP_PLAYWRIGHT
 ```
 
 Playwright integration tests skip unless the `[browser]` extra and Chromium are installed.
