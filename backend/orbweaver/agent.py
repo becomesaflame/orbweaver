@@ -371,13 +371,25 @@ TOOL_SPEC = [
         "name": "SpawnSubagent",
         "description": (
             "Spawn a nested agent with its own event stream to complete a focused task. "
-            "Shares this workspace and memory. Returns a summary. Nested spawns are not allowed."
+            "Shares this workspace and memory. Returns a summary. Nested spawns are not allowed. "
+            "type/role selects a tool subset: explore (read/search), implement (default, edits), "
+            "or shell (Bash)."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "task": {"type": "string"},
                 "label": {"type": "string", "description": "Short name for the child run."},
+                "type": {
+                    "type": "string",
+                    "enum": ["explore", "implement", "shell"],
+                    "description": "Subagent role. Default implement.",
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["explore", "implement", "shell"],
+                    "description": "Alias for type.",
+                },
             },
             "required": ["task"],
         },
