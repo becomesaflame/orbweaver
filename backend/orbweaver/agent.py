@@ -25,10 +25,11 @@ from orbweaver.compact import (
     usage_input_tokens,
 )
 from orbweaver.config import settings
+from orbweaver.hooks import apply_post_tool_use, hook_cancel_abort, run_pre_tool_use
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
 from orbweaver.lints import read_lints
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
-from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
+from orbweaver.permissions import PermissionDecision, TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
@@ -728,6 +729,20 @@ def build_agent_system(
     ]
 
 
+async def preflight_tool(
+    name: str, inp: dict[str, Any], ctx: dict[str, Any]
+) -> tuple[dict[str, Any], PermissionDecision]:
+    """PreToolUse hooks, then the permission gate. Raises TurnAborted on cancel."""
+    pre = await run_pre_tool_use(name, inp, ctx)
+    if pre.action == "cancel":
+        raise hook_cancel_abort(name, pre.tool_input, pre.reason)
+    if pre.action == "deny":
+        return pre.tool_input, PermissionDecision(
+            "deny", pre.reason or "denied by PreToolUse hook", "hook"
+        )
+    return pre.tool_input, await can_use_tool(name, pre.tool_input, ctx)
+
+
 def _blocked_tool_result(decision) -> str:
     if decision.behavior == "ask":
         return (
@@ -1305,8 +1320,9 @@ async def agent_turn(
                 )
                 fire(call_ev)
                 ctx["events"] = await store.list_events(session_id)
+                tool_input = dict(block.input)
                 try:
-                    decision = await can_use_tool(block.name, dict(block.input), ctx)
+                    tool_input, decision = await preflight_tool(block.name, tool_input, ctx)
                 except TurnAborted as e:
                     fire(
                         await store.append_event(
@@ -1340,7 +1356,7 @@ async def agent_turn(
                     if decision.behavior == "ask":
                         stop_after_ask = True
                 elif block.name == "AskUser":
-                    question = str(dict(block.input).get("question") or "").strip()
+                    question = str(tool_input.get("question") or "").strip()
                     if not question:
                         result = "error: question is required"
                     elif not can_wait_for_user(ctx):
@@ -1361,7 +1377,14 @@ async def agent_turn(
                         waiting_ask = True
                         break
                 else:
-                    result = await run_tools(block.name, dict(block.input), ctx)
+                    try:
+                        result = await run_tools(block.name, tool_input, ctx)
+                    except (TurnAborted, asyncio.CancelledError):
+                        raise
+                    except Exception as e:
+                        log.warning("tool %s failed: %s", block.name, e)
+                        result = f"error: {e}"
+                    result = await apply_post_tool_use(block.name, tool_input, result, ctx)
                     result, persisted_path = persist_tool_result(
                         workspace, str(block.id), block.name, result
                     )
@@ -1398,7 +1421,7 @@ async def agent_turn(
                 if block.name == "ScheduleTask" and decision.behavior == "allow":
                     fire(
                         await store.append_event(
-                            session_id, "schedule_request", {"input": dict(block.input)}
+                            session_id, "schedule_request", {"input": tool_input}
                         )
                     )
             if waiting_ask:

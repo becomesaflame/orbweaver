@@ -308,6 +308,7 @@ def test_critical_rm_and_deny_names():
     assert path_is_always_denied(".env")
     assert path_is_always_denied(".ssh/id_rsa")
     assert path_is_always_denied(".orbweaver/mcp.json")
+    assert path_is_always_denied(".orbweaver/hooks.json")
     assert is_protected_git_push("git push origin main")
     assert is_protected_git_push("git push -u origin master")
     assert is_protected_git_push("git push origin HEAD:main")

@@ -84,6 +84,10 @@ Configure extra roots, sockets, and domains in `~/.orbweaver/sandbox.json`, `$WO
 
 Sessions can use external MCP tools. Configure stdio servers in `~/.orbweaver/mcp.json`, `$WORKSPACE_ROOT/.orbweaver/mcp.json`, or `ORBWEAVER_MCP_CONFIG` (see `deploy/mcp.json.example`). Later files override command/args; `env` maps merge so host tokens survive a workspace command override. Tools appear as `mcp_<server>_<tool>` and go through the same deny/ask/allow/classifier pipeline as other tools — they are not blanket-allowlisted. Put API tokens in the host file, not the workspace. Phase 6 snapshot packs must omit `mcp.json` (and its `env` blocks); those secrets stay on the destination host. The agent cannot Read or sandbox-write `.orbweaver/mcp.json`.
 
+### Tool hooks
+
+Optional `PreToolUse` / `PostToolUse` / `PostToolUseFailure` commands live in `~/.orbweaver/hooks.json`, `$WORKSPACE_ROOT/.orbweaver/hooks.json`, or `ORBWEAVER_HOOKS_CONFIG` (see `deploy/hooks.json.example`). Later files append. PreToolUse runs before the permission gate and can deny, cancel the turn, or rewrite tool input. PostToolUse appends hook stdout/stderr onto a successful tool result; PostToolUseFailure runs when the result looks like an error. A hook that would prompt (type `prompt`, or JSON `ask`) fails closed instead of hanging — cron and other headless channels never get a TTY prompt. The agent cannot Read or sandbox-write `.orbweaver/hooks.json`.
+
 On this host (Ubuntu with AppArmor userns restrictions):
 
 ```bash

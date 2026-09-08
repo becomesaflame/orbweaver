@@ -218,7 +218,7 @@ def path_is_always_denied(rel: str) -> bool:
     lowered = [p.lower() for p in parts]
     if name in ALWAYS_DENY_NAMES:
         return True
-    if name == "mcp.json" and ".orbweaver" in lowered:
+    if name in {"mcp.json", "hooks.json"} and ".orbweaver" in lowered:
         return True
     if name.endswith((".pem", ".key")):
         return True

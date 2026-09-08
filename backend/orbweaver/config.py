@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     orbweaver_auto_allow_bash_if_sandboxed: bool = True
     orbweaver_sandbox_config: str = ""
     orbweaver_mcp_config: str = ""
+    orbweaver_hooks_config: str = ""
     orbweaver_sandbox_additional_readonly: str = ""
     orbweaver_sandbox_additional_readwrite: str = ""
     orbweaver_sandbox_deny_read: str = ""
