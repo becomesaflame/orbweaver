@@ -27,17 +27,38 @@ from orbweaver.memory import pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.store import Event, Job, Store, new_uuid
+from orbweaver.tooltext import format_read, format_webfetch
+
+DEFAULT_MAX_ROUNDS = 48
+LAST_ROUND_NUDGE = (
+    "This is the last tool round of this turn. After these tool results, answer the user "
+    "with what you have. Do not start new exploration. Spawn a subagent only if a narrower "
+    "task can finish the work."
+)
+CONCLUDE_NUDGE = (
+    "Tool-round budget exhausted. Answer the user now from the tool results you already "
+    "have. Do not call tools."
+)
 
 TOOL_SPEC = [
     {
         "name": "Read",
         "description": (
-            "Read a file. Relative paths are the session workspace. Absolute paths in extra "
-            "sandbox roots are auto-allowed; other host paths are classified."
+            "Read a file as numbered lines. Relative paths are the session workspace. "
+            "Absolute paths in extra sandbox roots are auto-allowed; other host paths are "
+            "classified. Use offset (1-based line, or negative from the end) and limit to "
+            "page; do not page files with Bash. The result says how to continue when truncated."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string"}},
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based starting line; negative counts from the end.",
+                },
+                "limit": {"type": "integer", "description": "Max lines to return (default 400)."},
+            },
             "required": ["path"],
         },
     },
@@ -74,7 +95,10 @@ TOOL_SPEC = [
     },
     {
         "name": "Grep",
-        "description": "Search file contents for a string.",
+        "description": (
+            "Search file contents with a regex. Use | for alternation. glob limits the files "
+            "(default **/*)."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"pattern": {"type": "string"}, "glob": {"type": "string"}},
@@ -107,7 +131,11 @@ TOOL_SPEC = [
     },
     {
         "name": "WebFetch",
-        "description": "HTTP GET a URL and return text.",
+        "description": (
+            "HTTP GET a URL and return extracted readable text (HTML is stripped). "
+            "Use this for a known URL. Do not keep fetching nearby docs URLs when the "
+            "result says the page is JavaScript-rendered."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"url": {"type": "string"}},
@@ -232,6 +260,27 @@ def _events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     return events_to_messages(events)
 
 
+def _nudge_user(messages: list[dict[str, Any]], text: str) -> None:
+    if messages and messages[-1].get("role") == "user":
+        prev = messages[-1]["content"]
+        if isinstance(prev, str):
+            messages[-1]["content"] = prev + "\n\n" + text
+            return
+        if isinstance(prev, list):
+            prev.append({"type": "text", "text": text})
+            return
+    messages.append({"role": "user", "content": text})
+
+
+def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dict[str, Any]]:
+    messages = events_to_messages(prompt_events(events))
+    messages = hydrate_workspace_images(messages, workspace)
+    messages = rehydrate_messages(messages, events, workspace)
+    if not messages:
+        messages = [{"role": "user", "content": user_text}]
+    return messages
+
+
 def static_system() -> str:
     return (
         f"You are Orbweaver, a coding agent. The running gateway is Orbweaver {__version__} "
@@ -242,7 +291,10 @@ def static_system() -> str:
         "visible diff overlay helps the user. Use MemorySearch when past decisions might "
         "matter. Keep pins small. If the sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
-        "stay blocked; do not route around them."
+        "stay blocked; do not route around them. Call independent tools in parallel in "
+        "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
+        "Finish with a user-visible answer before the tool-round budget runs out; spawn a "
+        "subagent for a long exploration instead of burning parent rounds."
     )
 
 
@@ -273,7 +325,11 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     store: Store = ctx["store"]
     session_id: UUID = ctx["session_id"]
     if name == "Read":
-        return ws.read(inp["path"])[:20000]
+        try:
+            raw = ws.read(inp["path"])
+        except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
+            return f"error reading {inp.get('path')}: {e}"
+        return format_read(raw, path=str(inp["path"]), offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
@@ -297,7 +353,8 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         import httpx
 
         r = httpx.get(inp["url"], timeout=20.0, follow_redirects=True)  # noqa: ASYNC210
-        return r.text[:500_000]
+        ctype = r.headers.get("content-type") or ""
+        return format_webfetch(str(inp.get("url") or ""), r.status_code, ctype, r.text)
     if name == "MemorySearch":
         events = live_events(await store.list_events(session_id))
         already = set()
@@ -444,7 +501,7 @@ async def agent_turn(
     headless: bool = False,
     tools: list[dict[str, Any]] | None = None,
     system_extra: str = "",
-    max_rounds: int = 24,
+    max_rounds: int = DEFAULT_MAX_ROUNDS,
     subagent_depth: int = 0,
     images: list[dict[str, str]] | None = None,
 ) -> list[Event]:
@@ -535,18 +592,16 @@ async def agent_turn(
                     break
 
     try:
-        for _ in range(max_rounds):
+        for round_i in range(max_rounds):
             check()
             inj = inject_event()
             if inj is not None:
                 inj.clear()
             events = await store.list_events(session_id)
             ctx["events"] = events
-            messages = events_to_messages(prompt_events(events))
-            messages = hydrate_workspace_images(messages, workspace)
-            messages = rehydrate_messages(messages, events, workspace)
-            if not messages:
-                messages = [{"role": "user", "content": user_text}]
+            messages = _prompt_messages(events, workspace, user_text)
+            if round_i == max_rounds - 1:
+                _nudge_user(messages, LAST_ROUND_NUDGE)
             try:
                 resp = await _await_or_cancel(
                     client.messages.create(
@@ -664,18 +719,44 @@ async def agent_turn(
                 store, session_id, client=client, workspace=workspace, system=system
             )
         else:
-            fire(
-                await store.append_event(
-                    session_id,
-                    "assistant",
-                    {
-                        "text": (
-                            f"Stopped after {max_rounds} tool rounds without a final answer. "
-                            "Continue in a follow-up, or spawn a subagent with a narrower task."
-                        )
-                    },
+            events = await store.list_events(session_id)
+            messages = _prompt_messages(events, workspace, user_text)
+            _nudge_user(messages, CONCLUDE_NUDGE)
+            try:
+                resp = await _await_or_cancel(
+                    client.messages.create(
+                        model=settings.orbweaver_model,
+                        max_tokens=4096,
+                        system=system,
+                        tools=[],
+                        messages=messages,
+                    ),
+                    cancel,
+                    produced,
+                    inject=inject_event(),
                 )
-            )
+            except TurnInjected:
+                return produced
+            last_seq = events[-1].seq if events else 0
+            record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
+            texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+            if texts:
+                fire(
+                    await store.append_event(session_id, "assistant", {"text": "\n".join(texts)})
+                )
+            else:
+                fire(
+                    await store.append_event(
+                        session_id,
+                        "assistant",
+                        {
+                            "text": (
+                                f"Stopped after {max_rounds} tool rounds without a final answer. "
+                                "Continue in a follow-up, or spawn a subagent with a narrower task."
+                            )
+                        },
+                    )
+                )
         return produced
     except TurnAborted as e:
         await record_abort(e)

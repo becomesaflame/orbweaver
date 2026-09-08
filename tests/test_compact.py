@@ -92,6 +92,9 @@ def test_persist_writes_preview_and_file(tmp_path, monkeypatch):
     skipped, rel2 = persist_tool_result(ws, "toolu_2", "Read", big)
     assert rel2 is None
     assert skipped == big
+    web, rel3 = persist_tool_result(ws, "toolu_3", "WebFetch", big)
+    assert rel3 is None
+    assert web == big
 
 
 @pytest.mark.asyncio
