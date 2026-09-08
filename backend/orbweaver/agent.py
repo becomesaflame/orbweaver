@@ -26,6 +26,7 @@ from orbweaver.image import hydrate_workspace_images
 from orbweaver.memory import pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
+from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.tooltext import format_read, format_webfetch
 
@@ -322,8 +323,10 @@ def static_system() -> str:
     )
 
 
-def build_agent_system(pins: str, extra: str = "") -> list[dict[str, Any]]:
+def build_agent_system(pins: str, extra: str = "", skills: str = "") -> list[dict[str, Any]]:
     rest = pins or "(no pinned memory)"
+    if skills:
+        rest = rest + "\n\n" + skills
     if extra:
         rest = rest + "\n\n" + extra
     return [
@@ -680,7 +683,7 @@ async def agent_turn(
         "subagent_depth": subagent_depth,
     }
     pins = await pinned_prompt(store)
-    system = build_agent_system(pins, system_extra)
+    system = build_agent_system(pins, system_extra, skills=workspace_skills_prompt(workspace))
     active_tools = tools if tools is not None else TOOL_SPEC
     if not resume:
         await maybe_compact(
