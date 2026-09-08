@@ -77,7 +77,7 @@ async def _maybe_review_return(
 
 
 async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
-    from orbweaver.agent import TOOL_SPEC, TurnCancelled, agent_turn
+    from orbweaver.agent import TurnCancelled, agent_turn, session_tools
 
     if int(ctx.get("subagent_depth") or 0) >= 1:
         return "error: nested subagents are not allowed"
@@ -131,7 +131,7 @@ async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             workspace_kind=workspace_kind,
             cancel=ctx.get("cancel"),
             headless=True,
-            tools=child_tool_spec(TOOL_SPEC),
+            tools=child_tool_spec(await session_tools(ctx["workspace"])),
             system_extra=SUBAGENT_SYSTEM_EXTRA,
             max_rounds=SUBAGENT_MAX_ROUNDS,
             subagent_depth=1,

@@ -275,6 +275,14 @@ TOOL_SPEC = [
 ]
 
 
+async def session_tools(workspace=None) -> list[dict[str, Any]]:
+    """Built-in TOOL_SPEC plus tools from configured MCP servers."""
+    from orbweaver.mcp import mcp_tool_specs
+
+    extra = await mcp_tool_specs(workspace)
+    return list(TOOL_SPEC) + extra
+
+
 def _events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     """Build Anthropic messages from a (possibly projected) event list."""
     return events_to_messages(events)
@@ -314,8 +322,10 @@ def static_system() -> str:
         "stay blocked; do not route around them. Call independent tools in parallel in "
         "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
         "Use WebSearch to find sources, then WebFetch a few result URLs; do not guess "
-        "docs paths. Finish with a user-visible answer before the tool-round budget runs out; "
-        "spawn a subagent for a long exploration instead of burning parent rounds."
+        "docs paths. Configured MCP servers appear as mcp_<server>_<tool> and use the "
+        "same permission pipeline as other tools. Finish with a user-visible answer "
+        "before the tool-round budget runs out; spawn a subagent for a long exploration "
+        "instead of burning parent rounds."
     )
 
 
@@ -451,6 +461,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         from orbweaver.channels.telegram import generate_and_maybe_send
 
         return await generate_and_maybe_send(ctx, inp)
+    if name.startswith("mcp_"):
+        from orbweaver.mcp import call_mcp_tool
+
+        return await call_mcp_tool(name, inp, ws)
     return f"unknown tool {name}"
 
 
@@ -607,7 +621,7 @@ async def agent_turn(
     }
     pins = await pinned_prompt(store)
     system = build_agent_system(pins, system_extra, skills=workspace_skills_prompt(workspace))
-    active_tools = tools if tools is not None else TOOL_SPEC
+    active_tools = tools if tools is not None else await session_tools(workspace)
     if not resume:
         await maybe_compact(
             store, session_id, client=client, workspace=workspace, system=system

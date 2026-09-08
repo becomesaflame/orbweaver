@@ -37,7 +37,7 @@ def parse_injection(text: str) -> bool | None:
 
 async def probe_tool_output(name: str, output: str, *, client=None) -> dict[str, Any]:
     """Return {flagged: bool, output: str}. Fail open on errors."""
-    if name not in PROBE_TOOLS:
+    if name not in PROBE_TOOLS and not name.startswith("mcp_"):
         return {"flagged": False, "output": output}
     body = output or ""
     if len(body.strip()) < MIN_CHARS:

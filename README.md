@@ -58,6 +58,10 @@ Linux Bash for `LocalWorkspace` runs in **bubblewrap**. The sandbox is write con
 
 Configure extra roots, sockets, and domains in `~/.orbweaver/sandbox.json`, `$WORKSPACE_ROOT/.orbweaver/sandbox.json`, or `ORBWEAVER_SANDBOX_CONFIG` (see `deploy/sandbox.json.example`). `denyRead` overlays skip paths that do not exist so a missing `~/.gnupg` cannot prevent the sandbox from starting.
 
+### MCP servers
+
+Sessions can use external MCP tools. Configure stdio servers in `~/.orbweaver/mcp.json`, `$WORKSPACE_ROOT/.orbweaver/mcp.json`, or `ORBWEAVER_MCP_CONFIG` (see `deploy/mcp.json.example`). Later files override command/args; `env` maps merge so host tokens survive a workspace command override. Tools appear as `mcp_<server>_<tool>` and go through the same deny/ask/allow/classifier pipeline as other tools — they are not blanket-allowlisted. Put API tokens in the host file, not the workspace. Phase 6 snapshot packs must omit `mcp.json` (and its `env` blocks); those secrets stay on the destination host. The agent cannot Read or sandbox-write `.orbweaver/mcp.json`.
+
 On this host (Ubuntu with AppArmor userns restrictions):
 
 ```bash
