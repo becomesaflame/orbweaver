@@ -151,18 +151,22 @@ def matching_rule(
     return None
 
 
-_GIT_PUSH = re.compile(r"\bgit\s+push\b", re.IGNORECASE)
+# Force flags and protected refs are matched only in the argv of `git push`,
+# not in earlier commands (ssh -F / ssh -f, `rm -f`, env assignments, …).
+_GIT_PUSH_CMD = re.compile(
+    r"\bgit\s+push\b(?P<args>(?:(?!&&|\|\||;).)*)",
+    re.IGNORECASE,
+)
 _FORCE_PUSH_FLAG = re.compile(
-    r"(?:^|[\s;|&])(?:--force(?:-with-lease)?|-f)(?=[\s;|&]|$)",
+    r"(?:^|\s)(?:--force(?:-with-lease)?|-f)(?=\s|$)",
 )
 _FORCE_REFSPEC = re.compile(
-    r"\bgit\s+push\b[\s\S]*?(?:origin|upstream)\s+\+\S",
+    r"(?:^|\s)(?:origin|upstream)\s+\+\S",
     re.IGNORECASE,
 )
 _PROTECTED_REF_PUSH = re.compile(
     r"""
-    \bgit\s+push\b
-    [\s\S]*?
+    (?:^|\s)
     (?:
         (?:origin|upstream)
         \s+
@@ -186,12 +190,13 @@ def is_critical_rm(command: str) -> bool:
 
 def is_protected_git_push(command: str) -> bool:
     """True for force-push or a push to main/master (ask-gated, never auto-allowed)."""
-    text = command or ""
-    if not _GIT_PUSH.search(text):
-        return False
-    if _FORCE_PUSH_FLAG.search(text) or _FORCE_REFSPEC.search(text):
-        return True
-    return bool(_PROTECTED_REF_PUSH.search(text))
+    for match in _GIT_PUSH_CMD.finditer(command or ""):
+        args = match.group("args") or ""
+        if _FORCE_PUSH_FLAG.search(args) or _FORCE_REFSPEC.search(args):
+            return True
+        if _PROTECTED_REF_PUSH.search(args):
+            return True
+    return False
 
 
 def path_is_always_denied(rel: str) -> bool:

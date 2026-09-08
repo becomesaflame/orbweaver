@@ -235,12 +235,18 @@ def test_critical_rm_and_deny_names():
     assert not is_protected_git_push("git push origin feature/telegram-local-bash")
     assert not is_protected_git_push("git push -u origin HEAD")
     assert not is_protected_git_push("pytest -q")
+    assert is_protected_git_push("git push origin feature -f")
+    assert is_protected_git_push("git push --force-with-lease origin foo")
     ssh = (
         'cd /home/orbweaver/workspaces/orbweaver && GIT_SSH_COMMAND="ssh -o '
         'StrictHostKeyChecking=no -F /dev/null -i /home/orbweaver/.ssh/id_ed25519" '
         "git push origin feature/system-prompt-orbweaver-md"
     )
     assert not is_protected_git_push(ssh)
+    assert not is_protected_git_push('GIT_SSH_COMMAND="ssh -f -N" git push origin feature/x')
+    assert not is_protected_git_push("ssh -f git@github.com && git push origin feature/x")
+    assert not is_protected_git_push("git push origin feature/x && rm -f leftover")
+    assert is_protected_git_push("rm -f leftover && git push -f origin feature/x")
 
 
 @pytest.mark.asyncio
