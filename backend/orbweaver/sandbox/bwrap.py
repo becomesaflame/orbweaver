@@ -17,6 +17,7 @@ from orbweaver.sandbox.policy import (
 )
 from orbweaver.sandbox.ssh import (
     ensure_ssh_sandbox,
+    resolv_conf_overlay_args,
     ssh_config_overlay_args,
     ssh_identity_bind_args,
 )
@@ -138,6 +139,7 @@ def build_bwrap_argv(
     argv.extend(["--tmpfs", "/run"])
     if not _is_run_symlink():
         argv.extend(["--tmpfs", "/var/run"])
+    argv.extend(resolv_conf_overlay_args(tmp))
     seen_dirs: set[str] = set()
     for sock in pol.allow_unix_sockets:
         sock_p = Path(sock)

@@ -13,7 +13,9 @@ from orbweaver.sandbox.ssh import (
     SANDBOX_SSH_DIR,
     ensure_ssh_sandbox,
     filter_ssh_argv,
+    sandbox_resolv_conf_text,
     ssh_identity_bind_args,
+    ssh_private_identity_files,
 )
 from sandbox_mounts import assert_ro_bind_dests_creatable
 
@@ -71,6 +73,66 @@ def test_bwrap_full_network_skips_proxycommand(tmp_path: Path):
     build_bwrap_argv("true", tmp_path, tmp_path / "tmp", full_network=True)
     config = (tmp_path / "tmp" / "ow-ssh" / "config").read_text(encoding="utf-8")
     assert "ProxyCommand" not in config
+
+
+def test_sandbox_resolv_conf_drops_stub_resolver():
+    text = sandbox_resolv_conf_text(
+        "nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch example.test\n"
+    )
+    assert "127.0.0.53" not in text
+    assert "nameserver 1.1.1.1" in text
+    assert "search example.test" in text
+
+
+def test_sandbox_resolv_conf_prefers_uplink_ipv4():
+    text = sandbox_resolv_conf_text(
+        "nameserver 2a01:4ff:ff00::add:2\nnameserver 185.12.64.1\nsearch tail.ts.net\n"
+    )
+    assert "185.12.64.1" in text
+    assert "127.0.0.53" not in text
+    assert text.index("185.12.64.1") < text.index("2a01:")
+
+
+def test_bwrap_overlays_resolv_conf(tmp_path: Path):
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp")
+    resolv = tmp_path / "tmp" / "ow-ssh" / "resolv.conf"
+    assert resolv.is_file()
+    assert "127.0.0.53" not in resolv.read_text(encoding="utf-8")
+    assert str(resolv.resolve()) in argv
+    tmpfs_run = None
+    for idx, a in enumerate(argv):
+        if a == "--tmpfs" and idx + 1 < len(argv) and argv[idx + 1] == "/run":
+            tmpfs_run = idx
+            break
+    assert tmpfs_run is not None
+    assert argv.index(str(resolv.resolve())) > tmpfs_run
+    dest = argv[argv.index(str(resolv.resolve())) + 1]
+    assert dest in {"/etc/resolv.conf", "/run/systemd/resolve/stub-resolv.conf"}
+
+
+def test_custom_identity_from_dir_and_host_config(tmp_path: Path, monkeypatch):
+    """Production github.com SSH uses IdentityFile ~/.ssh/lampropeltis-orbweaver, not id_ed25519."""
+    home = tmp_path / "home"
+    ssh = home / ".ssh"
+    ssh.mkdir(parents=True)
+    key = ssh / "lampropeltis-orbweaver"
+    key.write_text("fake-key", encoding="utf-8")
+    (ssh / "config").write_text(
+        "Host github.com\n  IdentityFile ~/.ssh/lampropeltis-orbweaver\n  IdentitiesOnly yes\n  ProxyJump evil\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("orbweaver.sandbox.ssh.Path.home", lambda: home)
+    dest = ensure_ssh_sandbox(tmp_path / "tmp", proxied=True)
+    cfg = (dest / "config").read_text(encoding="utf-8")
+    assert "lampropeltis-orbweaver" in cfg
+    assert "ProxyJump" not in cfg
+    assert "IdentitiesOnly" not in cfg
+    priv = ssh_private_identity_files(home)
+    assert key.resolve() in priv
+    binds = ssh_identity_bind_args(home)
+    assert str(key.resolve()) in binds
+    assert str((ssh / "config").resolve()) not in binds
+    assert str((ssh / "config").resolve()) not in cfg
 
 
 def test_identity_binds_after_deny_read_skip_config(tmp_path: Path, monkeypatch):
