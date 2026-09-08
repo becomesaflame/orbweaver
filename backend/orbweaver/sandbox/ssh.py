@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -25,6 +26,19 @@ SSH_IDENTITY_FILES: tuple[str, ...] = (
     "id_ecdsa_sk.pub",
     "known_hosts",
 )
+
+SSH_SKIP_NAMES: frozenset[str] = frozenset(
+    {
+        "config",
+        "authorized_keys",
+        "authorized_keys2",
+        "known_hosts.old",
+    }
+)
+
+_IDENTITYFILE_RE = re.compile(r"^\s*IdentityFile\s+(\S+)", re.IGNORECASE)
+_LOOPBACK_NS_PREFIX = "127."
+_LOOPBACK_NS = frozenset({"127.0.0.1", "127.0.0.53", "::1"})
 
 SYSTEM_SSH_CONFIG = (
     "# Orbweaver sandbox system ssh_config.\n"
@@ -161,19 +175,34 @@ def _wrapper_source(real: Path, config: Path) -> str:
     )
 
 
-def _user_ssh_config(*, proxied: bool, proxycmd: Path, known_hosts: Path) -> str:
+def _user_ssh_config(
+    *,
+    proxied: bool,
+    proxycmd: Path,
+    known_hosts: Path,
+    identity_files: tuple[Path, ...] = (),
+) -> str:
     lines = [
         "Host *",
         "  AddressFamily inet",
         "  GlobalKnownHostsFile none",
         f"  UserKnownHostsFile {known_hosts}",
         "  StrictHostKeyChecking accept-new",
-        "  IdentityFile ~/.ssh/id_ed25519",
-        "  IdentityFile ~/.ssh/id_rsa",
-        "  IdentityFile ~/.ssh/id_ecdsa",
-        "  IdentityFile ~/.ssh/id_ed25519_sk",
-        "  IdentityFile ~/.ssh/id_ecdsa_sk",
     ]
+    priv = [p for p in identity_files if p.name != "known_hosts" and not p.name.endswith(".pub")]
+    if priv:
+        for path in priv:
+            lines.append(f"  IdentityFile {path}")
+    else:
+        lines.extend(
+            [
+                "  IdentityFile ~/.ssh/id_ed25519",
+                "  IdentityFile ~/.ssh/id_rsa",
+                "  IdentityFile ~/.ssh/id_ecdsa",
+                "  IdentityFile ~/.ssh/id_ed25519_sk",
+                "  IdentityFile ~/.ssh/id_ecdsa_sk",
+            ]
+        )
     if proxied:
         lines.append(f"  ProxyCommand python3 {proxycmd} %h %p")
     return "\n".join(lines) + "\n"
@@ -184,7 +213,7 @@ def ssh_helper_dir(tmp: Path) -> Path:
 
 
 def ensure_ssh_sandbox(tmp: Path, *, proxied: bool) -> Path:
-    """Write wrapper, configs, and CONNECT helper under tmp/ow-ssh."""
+    """Write wrapper, configs, resolv.conf, and CONNECT helper under tmp/ow-ssh."""
     dest = ssh_helper_dir(tmp)
     dest.mkdir(parents=True, exist_ok=True)
     real = Path(SANDBOX_OPENSSH)
@@ -196,8 +225,14 @@ def ensure_ssh_sandbox(tmp: Path, *, proxied: bool) -> Path:
     known.touch(exist_ok=True)
     system.write_text(SYSTEM_SSH_CONFIG, encoding="utf-8")
     proxycmd.write_text(PROXYCMD_SOURCE, encoding="utf-8")
+    (dest / "resolv.conf").write_text(sandbox_resolv_conf_text(), encoding="utf-8")
     config.write_text(
-        _user_ssh_config(proxied=proxied, proxycmd=proxycmd, known_hosts=known),
+        _user_ssh_config(
+            proxied=proxied,
+            proxycmd=proxycmd,
+            known_hosts=known,
+            identity_files=ssh_private_identity_files(),
+        ),
         encoding="utf-8",
     )
     wrapper.write_text(_wrapper_source(real, config), encoding="utf-8")
@@ -239,14 +274,162 @@ def ssh_config_overlay_args(tmp: Path) -> list[str]:
     return args
 
 
-def ssh_identity_bind_args(home: Path | None = None) -> list[str]:
-    """Re-expose keys after the ~/.ssh denyRead tmpfs. Skip host ssh_config."""
+def _expand_identity_path(raw: str, ssh_dir: Path) -> Path:
+    if raw.startswith("~/"):
+        return (ssh_dir.parent / raw[2:]).resolve()
+    path = Path(raw)
+    if not path.is_absolute():
+        return (ssh_dir / path).resolve()
+    return path.expanduser().resolve()
+
+
+def _identity_files_from_host_config(ssh_dir: Path) -> tuple[Path, ...]:
+    """Read IdentityFile paths from host config without exposing the file itself."""
+    config = ssh_dir / "config"
+    out: list[Path] = []
+    try:
+        text = config.read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        match = _IDENTITYFILE_RE.match(line)
+        if not match:
+            continue
+        raw = match.group(1).strip().strip('"').strip("'")
+        try:
+            path = _expand_identity_path(raw, ssh_dir)
+            if path.is_file():
+                out.append(path)
+        except OSError:
+            continue
+    return tuple(out)
+
+
+def ssh_identity_files(home: Path | None = None) -> tuple[Path, ...]:
+    """Identity files to re-bind. Includes custom names and host-config IdentityFile."""
     home_dir = (home or Path.home()).resolve()
     ssh_dir = home_dir / ".ssh"
-    args: list[str] = []
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path, *, require_file: bool) -> None:
+        try:
+            resolved = path.expanduser()
+            resolved = resolved.resolve() if resolved.is_absolute() else (ssh_dir / resolved).resolve()
+        except OSError:
+            return
+        if resolved in seen:
+            return
+        if require_file and not resolved.is_file():
+            return
+        seen.add(resolved)
+        found.append(resolved)
+
     for name in SSH_IDENTITY_FILES:
-        src = ssh_dir / name
-        args.extend(["--ro-bind-try", str(src), str(src)])
+        add(ssh_dir / name, require_file=False)
+    try:
+        for entry in ssh_dir.iterdir():
+            if not entry.is_file() or entry.name in SSH_SKIP_NAMES or entry.name.endswith(".old"):
+                continue
+            add(entry, require_file=True)
+    except OSError:
+        pass
+    for path in _identity_files_from_host_config(ssh_dir):
+        add(path, require_file=True)
+    return tuple(found)
+
+
+def ssh_private_identity_files(home: Path | None = None) -> tuple[Path, ...]:
+    return tuple(
+        p
+        for p in ssh_identity_files(home)
+        if p.is_file() and p.name != "known_hosts" and not p.name.endswith(".pub")
+    )
+
+
+def sandbox_resolv_conf_text(raw: str | None = None) -> str:
+    """resolv.conf that still works after the sandbox hides /run (systemd-resolved stub)."""
+    text = raw if raw is not None else _read_host_resolv()
+    v4: list[str] = []
+    v6: list[str] = []
+    extra: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("nameserver"):
+            parts = stripped.split()
+            if len(parts) < 2:
+                continue
+            ns = parts[1]
+            if ns in _LOOPBACK_NS or ns.startswith(_LOOPBACK_NS_PREFIX):
+                continue
+            if ":" in ns:
+                v6.append(f"nameserver {ns}")
+            else:
+                v4.append(f"nameserver {ns}")
+        elif stripped.startswith(("search ", "domain ", "options ")):
+            extra.append(stripped)
+    nameservers = v4 + v6
+    if not nameservers:
+        nameservers = ["nameserver 1.1.1.1", "nameserver 8.8.8.8"]
+    return "\n".join(nameservers + extra) + "\n"
+
+
+def _read_host_resolv() -> str:
+    for src in (Path("/run/systemd/resolve/resolv.conf"), Path("/etc/resolv.conf")):
+        try:
+            if src.exists():
+                return src.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return ""
+
+
+def _parent_dirs(path: Path) -> list[str]:
+    parts = [p for p in path.as_posix().split("/") if p]
+    acc: list[str] = []
+    out: list[str] = []
+    for part in parts[:-1]:
+        acc.append(part)
+        out.append("/" + "/".join(acc))
+    return out
+
+
+def resolv_conf_overlay_args(tmp: Path) -> list[str]:
+    """Put uplink DNS in place after --tmpfs /run (host resolv.conf is a symlink into /run)."""
+    src = ssh_helper_dir(tmp) / "resolv.conf"
+    if not src.is_file():
+        return []
+    host = Path("/etc/resolv.conf")
+    args: list[str] = []
+    try:
+        if host.is_symlink():
+            target = Path(os.path.normpath(str(Path("/etc") / host.readlink())))
+            if str(target).startswith("/run/") or str(target).startswith("/var/run/"):
+                for directory in _parent_dirs(target):
+                    if directory in {"/", "/run", "/var", "/var/run"}:
+                        continue
+                    args.extend(["--dir", directory])
+                args.extend(["--ro-bind", str(src), str(target)])
+                return args
+    except OSError:
+        pass
+    args.extend(["--ro-bind", str(src), "/etc/resolv.conf"])
+    return args
+
+
+def ssh_identity_bind_args(home: Path | None = None) -> list[str]:
+    """Re-expose keys after the ~/.ssh denyRead tmpfs. Skip host ssh_config."""
+    args: list[str] = []
+    seen: set[str] = set()
+    for src in ssh_identity_files(home):
+        dest = str(src)
+        if dest in seen:
+            continue
+        seen.add(dest)
+        args.extend(["--ro-bind-try", dest, dest])
     return args
 
 

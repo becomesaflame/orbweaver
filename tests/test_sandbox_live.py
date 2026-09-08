@@ -74,6 +74,48 @@ def test_sandboxed_ssh_skips_host_config_d(live_root):
     assert "github.com" in out.lower()
 
 
+def test_full_network_can_resolve_github(live_root):
+    """Production clone with permissions full_network: /run tmpfs hid systemd-resolved."""
+    out = run_sandboxed(
+        "python3 -c \"import socket; print(socket.getaddrinfo('github.com', 22)[0])\"",
+        live_root,
+        timeout=15,
+        full_network=True,
+    )
+    assert "Temporary failure" not in out
+    assert "Could not resolve" not in out
+    assert "sandbox_denied" not in out
+    assert "gaierror" not in out.lower()
+    assert "github.com" in out.lower() or "AddressFamily" in out
+
+
+def test_sandboxed_ssh_uses_host_identity(live_root):
+    from orbweaver.sandbox.ssh import ssh_private_identity_files
+
+    keys = ssh_private_identity_files()
+    if not keys:
+        pytest.skip("no host SSH identity file")
+    out = run_sandboxed("ssh -G github.com", live_root, timeout=15)
+    assert any(key.name in out for key in keys)
+
+
+def test_sandboxed_git_ls_remote_github(live_root):
+    """Production orbweaver2: git clone git@github.com:… over sandboxed ssh."""
+    from orbweaver.sandbox.ssh import ssh_private_identity_files
+
+    if not ssh_private_identity_files():
+        pytest.skip("no host SSH identity file")
+    out = run_sandboxed(
+        "git ls-remote git@github.com:becomesaflame/orbweaver.git",
+        live_root,
+        timeout=45,
+    )
+    assert "Could not resolve hostname" not in out
+    assert "Bad owner or permissions" not in out
+    assert "Permission denied (publickey)" not in out
+    assert "refs/heads" in out or "HEAD" in out
+
+
 def test_sandboxed_git_init_remote_and_rm(live_root):
     """Production clone: a later Bash turn could not write or rm .git/config and hooks."""
     init = run_sandboxed("git init", live_root, timeout=15)
