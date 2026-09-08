@@ -37,13 +37,13 @@ def validate_workspace_uri(uri: str) -> str:
         raise WorkspaceURIError("absolute file URIs are forbidden; use file:./relative")
     if _ABS.match(uri) or uri.startswith("file:///"):
         raise WorkspaceURIError(f"absolute host path is forbidden in stored data: {uri}")
-    if uri.startswith("git+https://") or uri.startswith("git+ssh://"):
+    if uri.startswith(("git+https://", "git+ssh://")):
         return uri
-    if uri.startswith("file:./") or uri.startswith("workspace:"):
+    if uri.startswith(("file:./", "workspace:")):
         return uri
     if uri.startswith("file:"):
         rest = uri[5:]
-        if rest.startswith("/") or rest.startswith("\\"):
+        if rest.startswith(("/", "\\")):
             raise WorkspaceURIError("absolute file URIs are forbidden")
         return "file:./" + rest.lstrip("./")
     raise WorkspaceURIError(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 
 def transcribe_bytes(data: bytes, filename: str = "audio.wav") -> str:

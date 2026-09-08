@@ -153,7 +153,7 @@
       <h1>Orbweaver architecture</h1>
       <p class="lede">Living design document. Update this page as the implementation lands. First pass is phases 1–4 as one unit; phases 5–8 follow.</p>
       <p class="note">Open this file in a browser (GitHub shows source, not a rendered page). Diagrams need a network connection for Mermaid from jsDelivr.</p>
-      <p class="note">Phases 1–4 are in the tree: FastAPI gateway, in-memory or Postgres store, Anthropic tool loop with 85% compaction, web chat + STT, VS Code chat/diffs/plan mode, Telegram + cron adapters, LocalWorkspace. Snapshot CLI remains phase 6. Full CI matrix remains phase 5.</p>
+      <p class="note">Phases 1–4 are in the tree: FastAPI gateway, in-memory or Postgres store, Anthropic tool loop with 85% compaction, web chat + STT, VS Code chat/diffs/plan mode, Telegram + cron adapters, LocalWorkspace. Snapshot CLI remains phase 6. Phase 5 CI is pytest, ruff, mypy, vscode <code>tsc</code>, and a skippable Playwright web smoke. Compose integration and vscode-test remain deferred.</p>
 
       <h2 id="decisions">Locked decisions</h2>
       <div class="cards">
@@ -245,7 +245,7 @@ sequenceDiagram
   README.md
   docs/architecture.html          # this document
   docker-compose.yml
-  .github/workflows/ci.yml        # filled in phase 5
+  .github/workflows/ci.yml        # pytest, ruff, mypy, vscode tsc; Playwright skippable
   backend/
     pyproject.toml
     orbweaver/
@@ -466,7 +466,7 @@ flowchart LR
         <li class="pass"><strong>Phase 2 — Agents + chat</strong> Original Python loop, leak-port permissions/sandbox/classifier, prompt-projection compaction (boundary, microcompact, session notes, Haiku summary), LocalWorkspace, web chat, STT.</li>
         <li class="pass"><strong>Phase 3 — VS Code</strong> Continue diffs, HTML+Markdown plan mode, workspace URI at session start.</li>
         <li class="pass"><strong>Phase 4 — Telegram + cron</strong> In-process adapters, LocalWorkspace for all channels. End of first pass.</li>
-        <li class="later"><strong>Phase 5 — CI only</strong> GitHub Actions: pytest on PRs into <code>main</code>; a green merge deploys. Later: ruff, mypy, compose integration, Playwright, vscode-test. Not memory workers. Not research agents.</li>
+        <li class="pass"><strong>Phase 5 — CI only</strong> GitHub Actions on PRs: pytest + bubblewrap, ruff, mypy, vscode <code>tsc</code>, Playwright web smoke (skip with repo variable <code>SKIP_PLAYWRIGHT</code>). Deferred: compose integration, vscode-test (compile-check instead). Not memory workers. Not research agents.</li>
         <li class="later"><strong>Phase 6 — Advanced memory and backups</strong> Optional store decay, snapshot export/import, off-site <code>.orb</code> packs. Restore = migrate. Packs omit MCP <code>mcp.json</code> / <code>env</code> secrets; supply those on the destination host.</li>
         <li class="later"><strong>Phase 7 — Feature research agent</strong> Watch other harnesses, draft PRs, never auto-merge.</li>
         <li class="later"><strong>Phase 8 — Performance-improvement agent</strong> Read Orbweaver traces, draft harness PRs, never auto-merge.</li>
