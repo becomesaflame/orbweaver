@@ -24,6 +24,7 @@ from orbweaver.compact import (
     rehydrate_messages,
     usage_input_tokens,
 )
+from orbweaver.compact.project import INTERRUPTED_TOOL
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
 from orbweaver.lints import read_lints
@@ -64,6 +65,10 @@ GIT_NOT_DONE_CONCLUDE = (
     "Tell the user the rebase is unfinished (detached HEAD or rebase-in-progress). "
     "Do not claim the branch or PR was updated. Next step is git rebase --continue "
     "or --abort."
+)
+TRUNCATED_TOOL_NUDGE = (
+    "Your previous tool_use was cut off (stop_reason=max_tokens) and was not executed. "
+    "Resend only that tool with a complete JSON input. Do not assume it ran."
 )
 
 TOOL_SPEC = [
@@ -656,6 +661,65 @@ def _nudge_user(messages: list[dict[str, Any]], text: str) -> None:
     messages.append({"role": "user", "content": text})
 
 
+def truncated_tool_uses(resp: Any) -> list[Any]:
+    """tool_use blocks that must not run because generation hit max_tokens."""
+    if getattr(resp, "stop_reason", None) != "max_tokens":
+        return []
+    content = list(getattr(resp, "content", None) or [])
+    uses = [b for b in content if getattr(b, "type", None) == "tool_use"]
+    if not uses:
+        return []
+    last = content[-1]
+    out: list[Any] = []
+    for block in uses:
+        inp = getattr(block, "input", None)
+        incomplete = inp is None or inp == {} or (isinstance(inp, str) and not str(inp).strip())
+        if incomplete or block is last:
+            out.append(block)
+    return out
+
+
+def _executable_tool_uses(resp: Any) -> list[Any]:
+    """Honor stop_reason: only run complete tool_use blocks."""
+    stop = getattr(resp, "stop_reason", None)
+    uses = [b for b in (getattr(resp, "content", None) or []) if getattr(b, "type", None) == "tool_use"]
+    if stop == "end_turn":
+        return []
+    skipped = {id(b) for b in truncated_tool_uses(resp)}
+    return [b for b in uses if id(b) not in skipped]
+
+
+async def _record_interrupted_tools(
+    store: Store,
+    session_id: UUID,
+    fire: Callable[[Event], None],
+    blocks: list[Any],
+) -> None:
+    for block in blocks:
+        fire(
+            await store.append_event(
+                session_id,
+                "tool_call",
+                {
+                    "id": getattr(block, "id", None),
+                    "name": getattr(block, "name", None),
+                    "input": getattr(block, "input", None) or {},
+                },
+            )
+        )
+        fire(
+            await store.append_event(
+                session_id,
+                "tool_result",
+                {
+                    "tool_use_id": getattr(block, "id", None),
+                    "name": getattr(block, "name", None),
+                    "content": INTERRUPTED_TOOL,
+                },
+            )
+        )
+
+
 def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dict[str, Any]]:
     messages = events_to_messages(prompt_events(events))
     messages = hydrate_workspace_images(messages, workspace)
@@ -1106,6 +1170,46 @@ async def _await_or_cancel(
         raise
 
 
+async def _create_agent_message(
+    client: Any,
+    *,
+    system: Any,
+    tools: Any,
+    messages: list[dict[str, Any]],
+    cancel: asyncio.Event | None,
+    produced: list[Event],
+    inject: asyncio.Event | None,
+    max_tokens: int | None = None,
+):
+    from orbweaver.llm import completion_max_tokens, max_tokens_for_model
+
+    budget = max_tokens if max_tokens is not None else completion_max_tokens()
+    kwargs = {
+        "model": settings.orbweaver_model,
+        "max_tokens": budget,
+        "system": cast(Any, system),
+        "tools": cast(Any, tools),
+        "messages": cast(Any, messages),
+    }
+    resp = await _await_or_cancel(
+        client.messages.create(**kwargs),
+        cancel,
+        produced,
+        inject=inject,
+    )
+    if truncated_tool_uses(resp):
+        raised = min(max_tokens_for_model(settings.orbweaver_model), settings.output_reserve)
+        if raised > budget:
+            kwargs["max_tokens"] = raised
+            resp = await _await_or_cancel(
+                client.messages.create(**kwargs),
+                cancel,
+                produced,
+                inject=inject,
+            )
+    return resp
+
+
 async def agent_turn(
     store: Store,
     session_id: UUID,
@@ -1260,31 +1364,38 @@ async def agent_turn(
                 )
             elif ctx.pop("git_not_done_nudge_pending", False):
                 _nudge_user(messages, GIT_NOT_DONE_NUDGE)
+            elif ctx.pop("truncated_tool_nudge_pending", False):
+                _nudge_user(messages, TRUNCATED_TOOL_NUDGE)
             messages = ensure_tool_use_results(messages)
             try:
-                resp = await _await_or_cancel(
-                    client.messages.create(
-                        model=settings.orbweaver_model,
-                        max_tokens=4096,
-                        system=cast(Any, system),
-                        tools=cast(Any, active_tools),
-                        messages=cast(Any, messages),
-                    ),
-                    cancel,
-                    produced,
+                resp = await _create_agent_message(
+                    client,
+                    system=system,
+                    tools=active_tools,
+                    messages=messages,
+                    cancel=cancel,
+                    produced=produced,
                     inject=inj,
                 )
             except TurnInjected:
                 continue
             last_seq = events[-1].seq if events else 0
             record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
-            tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
             if texts:
                 ev = await store.append_event(session_id, "assistant", {"text": "\n".join(texts)})
                 fire(ev)
             check()
+            truncated = truncated_tool_uses(resp)
+            if truncated:
+                await _record_interrupted_tools(store, session_id, fire, truncated)
+                ctx["truncated_tool_nudge_pending"] = True
+            tool_uses = _executable_tool_uses(resp)
             if not tool_uses:
+                if truncated:
+                    continue
+                if getattr(resp, "stop_reason", None) == "end_turn":
+                    break
                 if (
                     ctx.get("git_not_done")
                     and not ctx.get("git_not_done_nudged")
@@ -1429,16 +1540,13 @@ async def agent_turn(
             )
             messages = ensure_tool_use_results(messages)
             try:
-                resp = await _await_or_cancel(
-                    client.messages.create(
-                        model=settings.orbweaver_model,
-                        max_tokens=4096,
-                        system=cast(Any, system),
-                        tools=[],
-                        messages=cast(Any, messages),
-                    ),
-                    cancel,
-                    produced,
+                resp = await _create_agent_message(
+                    client,
+                    system=system,
+                    tools=[],
+                    messages=messages,
+                    cancel=cancel,
+                    produced=produced,
                     inject=inject_event(),
                 )
             except TurnInjected:

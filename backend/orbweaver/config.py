@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
     context_window: int = 200_000
-    output_reserve: int = 16_000
+    output_reserve: int = 64_000
     static_token_estimate: int = 12_000
     # Compact when estimate_prompt_tokens exceeds this fraction of event_budget
     # (~85% of the 200k window). Claw Code uses 100k cumulative input tokens.
