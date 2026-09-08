@@ -41,16 +41,17 @@ def user_allowed(user_id: int) -> bool:
 
 
 def texts_for_reply(events) -> str:
-    parts: list[str] = []
+    """Telegram/cron get the turn's last user-visible text, not every thought."""
+    last = ""
     for e in events:
         text = (e.payload or {}).get("text")
         if text and e.kind in {"assistant", "turn_aborted"}:
-            parts.append(str(text))
+            last = str(text)
         elif e.kind == "ask_user":
             question = (e.payload or {}).get("question")
             if question:
-                parts.append(str(question))
-    return "\n".join(parts)[:3500]
+                last = str(question)
+    return last[:3500]
 
 
 async def notify_telegram_chat(chat_id: int, text: str) -> None:

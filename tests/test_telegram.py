@@ -1,4 +1,5 @@
 import io
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -8,11 +9,12 @@ from orbweaver.channels.telegram import (
     notify_telegram_photo,
     send_session_photo,
     session_for_telegram_user,
+    texts_for_reply,
     user_allowed,
 )
 from orbweaver.config import settings
 from orbweaver.image import save_inbound_image
-from orbweaver.store import reset_store_for_tests
+from orbweaver.store import Event, reset_store_for_tests
 from orbweaver.workspace import LocalWorkspace, apply_local_workspace_kind
 
 
@@ -20,6 +22,57 @@ def _png_bytes() -> bytes:
     buf = io.BytesIO()
     Image.new("RGB", (8, 8), (10, 200, 10)).save(buf, format="PNG")
     return buf.getvalue()
+
+
+def test_texts_for_reply_uses_final_assistant_only():
+    sid = uuid4()
+    events = [
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=1,
+            kind="assistant",
+            payload={"text": "Now I have the full picture of all conflicts"},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="assistant",
+            payload={"text": "Now I have the exact picture."},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=3,
+            kind="assistant",
+            payload={"text": "Rebase finished. PR is updated."},
+        ),
+    ]
+    text = texts_for_reply(events)
+    assert text == "Rebase finished. PR is updated."
+    assert "full picture" not in text
+
+
+def test_texts_for_reply_prefers_trailing_ask_user():
+    sid = uuid4()
+    events = [
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=1,
+            kind="assistant",
+            payload={"text": "Looking at the repo"},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="ask_user",
+            payload={"question": "Force-push the rebased branch?"},
+        ),
+    ]
+    assert texts_for_reply(events) == "Force-push the rebased branch?"
 
 
 def test_user_allowed(monkeypatch):
