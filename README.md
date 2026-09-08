@@ -44,15 +44,19 @@ export DATABASE_URL=postgresql://orbweaver:orbweaver@localhost:5432/orbweaver
 cd vscode && npm install && npx tsc -p .
 ```
 
-Then **Install from VSIX** or **Run Extension** from the `vscode/` folder. Set `orbweaver.gatewayUrl` and `orbweaver.token` (from `python -m orbweaver.cli mint`). Default workspace URI is `workspace:default` (override with `orbweaver.workspaceUri`). Commands: Open Chat, Accept/Reject Diff, Open Plan (Markdown or HTML).
+Then **Install from VSIX** or **Run Extension** from the `vscode/` folder. Set `orbweaver.gatewayUrl` and `orbweaver.token` (from `python -m orbweaver.cli mint`). Default workspace URI is `workspace:default` (override with `orbweaver.workspaceUri`). The extension opens sessions with `channel=vscode` so ProposePatch stays available. Chat streams over `/v1/sessions/{id}/ws` (Stop / inject / continue match web chat). ProposePatch opens a real `vscode.diff`; Accept / Reject / edit the file in place. Plan mode creates or iterates `.orbweaver/plan.md` (or HTML) with preview beside the editor.
 
 ### Telegram
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWLIST` (comma-separated user ids). Sessions use `LocalWorkspace` (bubblewrap). Leftover `workspace_kind=docker` rows are rewritten to `local` on the next turn. Voice notes go through `/v1/stt` when `faster-whisper` is installed (`pip install -e ".[stt]"`).
 
+### Cron
+
+The host polls due jobs every 30s. A finished turn notifies the originating Telegram chat (success and abort) and appends a `cron_result` session event for web chat. Recurrence is `minute`, `hour`, or `day` (also `every hour`), or a 5-field cron expression (`minute hour day-of-month month day-of-week`, e.g. `0 9 * * mon`). Day-of-week `0` is Monday; names like `mon` work. Omit recurrence for a one-shot — those are deleted after they run.
+
 ### Permissions and sandbox
 
-Default mode is **auto**: in-project writes apply immediately; a transcript classifier (Sonnet, `ORBWEAVER_CLASSIFIER_MODEL`) reviews `Bash` with `permissions: ["full_network"]` or `["all"]`, WebFetch, and `SpawnSubagent`. It returns **allow**, **ask**, or **hard-deny**. `WebSearch` talks only to DuckDuckGo or Brave and is allowlisted like Grep; deny/ask rules still apply. Sandbox limits and soft-deny actions check in with the user; hard-deny (secrets, persistence, self-granting power) stays rare. A separate Haiku injection probe (`ORBWEAVER_INJECTION_PROBE_MODEL`) warns on untrusted tool output. Telegram/cron abort on classifier asks or repeated hard denials and **always tell the user why**. `AskUser` waits for a reply on web and Telegram; cron and other headless sessions abort instead of pretending to wait.
+Default mode is **auto**: in-project writes apply immediately; a transcript classifier (Sonnet, `ORBWEAVER_CLASSIFIER_MODEL`) reviews `Bash` with `permissions: ["full_network"]` or `["all"]`, WebFetch, Browser, and `SpawnSubagent`. It returns **allow**, **ask**, or **hard-deny**. `WebSearch` talks only to DuckDuckGo or Brave and is allowlisted like Grep; deny/ask rules still apply. Sandbox limits and soft-deny actions check in with the user; hard-deny (secrets, persistence, self-granting power) stays rare. A separate Haiku injection probe (`ORBWEAVER_INJECTION_PROBE_MODEL`) warns on untrusted tool output. Telegram/cron abort on classifier asks or repeated hard denials and **always tell the user why**. `AskUser` waits for a reply on web and Telegram; cron and other headless sessions abort instead of pretending to wait.
 
 Linux Bash for `LocalWorkspace` runs in **bubblewrap**. The sandbox is write confinement, not a hidden host: files are readable, writes stay in the working set (workspace plus extra roots), a private `/dev` is remounted after the host bind so `/dev/null` works, `/run` is hidden except `allowUnixSockets` (the systemd journal sockets are granted by default), and outbound HTTP uses a CONNECT proxy with a package-manager domain allowlist. RFC1918, loopback, and cloud metadata are blocked on that network path. `unsandboxed: true` aliases `permissions: ["all"]` for one minor version.
 
@@ -76,8 +80,20 @@ sudo systemctl reload apparmor
 
 If bubblewrap cannot start, local Bash fails closed (`ORBWEAVER_SANDBOX_FAIL_IF_UNAVAILABLE=true`). Nested bwrap is skipped inside Compose containers.
 
+### Browser tool (optional)
+
+UI verification uses Playwright Chromium (`navigate`, `click`, `type`, `snapshot`, `screenshot`). It is classified like WebFetch, not auto-allowed. CI does not install the extra; wiring and permission tests always run.
+
+```bash
+cd backend
+pip install -e ".[browser]"
+playwright install chromium
+```
+
 ### Tests
 
 ```bash
 python3 -m pytest tests -q
 ```
+
+Playwright integration tests skip unless the `[browser]` extra and Chromium are installed.

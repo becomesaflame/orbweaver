@@ -68,17 +68,25 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
         if perms:
             return {"command": cmd, "permissions": sorted(set(perms))}
         return cmd
-    if name in {"Read", "Write", "ProposePatch", "SendPhoto"}:
+    if name in {"Read", "Write", "ProposePatch", "NotebookEdit", "SendPhoto", "Delete"}:
         return {"path": inp.get("path")}
+    if name == "ReadLints":
+        return {"paths": inp.get("paths") or inp.get("path")}
     if name == "GenerateImage":
         return {"prompt": inp.get("prompt"), "path": inp.get("path")}
     if name == "WebFetch":
         return {"url": inp.get("url")}
+    if name == "Browser":
+        from orbweaver.browser import classifier_payload
+
+        return classifier_payload(inp)
     if name == "WebSearch":
         return {"query": inp.get("query")}
+    if name == "MemoryGraph":
+        return {"id": inp.get("id"), "depth": inp.get("depth")}
     if name == "SpawnSubagent":
         return {"task": inp.get("task")}
-    if name in {"Glob", "Grep", "AskUser"}:
+    if name in {"Glob", "Grep", "AskUser", "TodoWrite"}:
         return ""
     return inp
 

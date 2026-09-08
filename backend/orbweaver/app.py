@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from time import time
 from typing import Any
 from uuid import UUID
 
@@ -20,10 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from orbweaver import __version__
-from orbweaver.agent import TurnCancelled, agent_turn, pending_ask_user
+from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel, pending_ask_user
 from orbweaver.auth import mint_token, require_user
 from orbweaver.config import settings
 from orbweaver.memory import remember, rewrite_search_query
+from orbweaver.ratelimit import get_rate_limiter
 from orbweaver.store import (
     SESSION_TYPE,
     Entity,
@@ -84,7 +84,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_hits: dict[str, list[float]] = defaultdict(list)
+
 _RATE_LIMIT_WINDOW_S = 60.0
 _RATE_LIMIT_MAX = 120
 
@@ -144,12 +144,12 @@ async def rate_limit(request: Request, call_next):
     if request.url.path in {"/health", "/"}:
         return await call_next(request)
     key = _rate_limit_key(request)
-    now = time()
-    window = [t for t in _hits[key] if now - t < _RATE_LIMIT_WINDOW_S]
-    if len(window) >= _RATE_LIMIT_MAX:
+    limiter = get_rate_limiter()
+    if hasattr(limiter, "max_hits"):
+        limiter.max_hits = _RATE_LIMIT_MAX
+        limiter.window_seconds = _RATE_LIMIT_WINDOW_S
+    if not await limiter.hit(str(key)):
         return JSONResponse({"detail": "rate limited"}, status_code=429)
-    window.append(now)
-    _hits[key] = window
     return await call_next(request)
 
 
@@ -189,6 +189,7 @@ class SessionBody(BaseModel):
     workspace_uri: str
     workspace_kind: str = "local"
     title: str = "New chat"
+    channel: str | None = None
 
 
 class WorkspaceMkdirBody(BaseModel):
@@ -238,7 +239,32 @@ class RunningTurn:
 
 
 _running_turns: dict[UUID, RunningTurn] = {}
-_GENERIC_TITLES = {"", "web", "session", "New chat"}
+_ws_subscribers: dict[UUID, set[WebSocket]] = defaultdict(set)
+_GENERIC_TITLES = {"", "web", "session", "New chat", "vscode"}
+
+
+def reset_ws_subscribers_for_tests() -> None:
+    _ws_subscribers.clear()
+
+
+def _stored_channel(jsonld: dict[str, Any]) -> str:
+    return normalize_channel(str(jsonld.get("channel") or ""))
+
+
+def _broadcast(session_id: UUID, msg: dict[str, Any]) -> None:
+    sockets = list(_ws_subscribers.get(session_id) or ())
+    if not sockets:
+        return
+    loop = asyncio.get_running_loop()
+
+    async def send_one(ws: WebSocket) -> None:
+        try:
+            await ws.send_json(msg)
+        except Exception:
+            _ws_subscribers[session_id].discard(ws)
+
+    for ws in sockets:
+        loop.create_task(send_one(ws))
 
 
 def _event_dict(e) -> dict[str, Any]:
@@ -434,6 +460,7 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
         uri = validate_workspace_uri(body.workspace_uri)
     except WorkspaceURIError as e:
         raise HTTPException(400, str(e)) from e
+    channel = normalize_channel(body.channel)
     uid = new_uuid()
     ent = Entity(
         id=uid,
@@ -449,8 +476,16 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
             "created_at": datetime.now(UTC).isoformat(),
         },
     )
+    if channel:
+        ent.jsonld["channel"] = channel
     await get_store().put_entity(ent)
-    return {"id": str(uid), "at_id": ent.at_id, "workspace_uri": uri, "title": ent.jsonld["title"]}
+    return {
+        "id": str(uid),
+        "at_id": ent.at_id,
+        "workspace_uri": uri,
+        "title": ent.jsonld["title"],
+        "channel": channel,
+    }
 
 
 @app.get("/v1/sessions")
@@ -470,6 +505,7 @@ async def list_sessions(_u: dict = Depends(_user)) -> dict[str, Any]:
                 "workspace_uri": str(ent.jsonld.get("workspace_uri") or "workspace:default"),
                 "workspace_kind": normalize_workspace_kind(ent.jsonld.get("workspace_kind")),
                 "status": str(ent.jsonld.get("status") or "active"),
+                "channel": _stored_channel(ent.jsonld),
                 "created_at": str(ent.jsonld.get("created_at") or ""),
                 "last_event_at": last_at,
                 "event_count": len(events),
@@ -521,6 +557,7 @@ async def _run_turn(
         await store.put_entity(sess)
     state = RunningTurn(cancel=asyncio.Event())
     _running_turns[session_id] = state
+    result: dict[str, Any] | None = None
     try:
         events = await agent_turn(
             store,
@@ -528,34 +565,37 @@ async def _run_turn(
             user_text,
             ws,
             workspace_kind=kind,
+            emit=lambda msg: _broadcast(session_id, msg),
             cancel=state.cancel,
             turn_state=state,
             resume=resume,
             interactive=True,
         )
         if state.cancel.is_set():
-            return await _finish_cancelled_turn(store, sess, state, events, user_text)
-        stored = await store.list_events(session_id)
-        pending = pending_ask_user(stored)
-        status = "waiting_ask" if pending else "ok"
-        question = ""
-        if pending:
-            question = str((pending.payload or {}).get("input", {}).get("question") or "")
-            if not question:
-                for ev in reversed(stored):
-                    if ev.kind == "ask_user":
-                        question = str((ev.payload or {}).get("question") or "")
-                        break
-        out: dict[str, Any] = {
-            "events": [_event_dict(e) for e in events],
-            "status": status,
-            "user_seq": state.user_seq,
-        }
-        if question:
-            out["question"] = question
-        return out
+            result = await _finish_cancelled_turn(store, sess, state, events, user_text)
+        else:
+            stored = await store.list_events(session_id)
+            pending = pending_ask_user(stored)
+            status = "waiting_ask" if pending else "ok"
+            question = ""
+            if pending:
+                question = str((pending.payload or {}).get("input", {}).get("question") or "")
+                if not question:
+                    for ev in reversed(stored):
+                        if ev.kind == "ask_user":
+                            question = str((ev.payload or {}).get("question") or "")
+                            break
+            result = {
+                "events": [_event_dict(e) for e in events],
+                "status": status,
+                "user_seq": state.user_seq,
+            }
+            if question:
+                result["question"] = question
+        return result
     except TurnCancelled as e:
-        return await _finish_cancelled_turn(store, sess, state, e.produced, user_text)
+        result = await _finish_cancelled_turn(store, sess, state, e.produced, user_text)
+        return result
     except Exception as e:
         import anthropic
 
@@ -566,6 +606,15 @@ async def _run_turn(
         current = _running_turns.get(session_id)
         if current is state:
             _running_turns.pop(session_id, None)
+        if result is not None:
+            _broadcast(
+                session_id,
+                {
+                    "kind": "turn_done",
+                    "status": result.get("status"),
+                    "user_seq": result.get("user_seq"),
+                },
+            )
 
 
 @app.post("/v1/sessions/{session_id}/turns")
@@ -590,6 +639,7 @@ async def inject_turn(
     store = get_store()
     ev = await store.append_event(session_id, "user", {"text": text, "injected": True})
     state.inject.set()
+    _broadcast(session_id, _event_dict(ev))
     return {"status": "injected", "seq": ev.seq, "event": _event_dict(ev)}
 
 
@@ -669,24 +719,44 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
     if not sess:
         await websocket.close(code=4404)
         return
+    _ws_subscribers[session_id].add(websocket)
     try:
+        await websocket.send_json({"kind": "subscribed", "session_id": str(session_id)})
         while True:
             raw = await websocket.receive_text()
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            typ = str(data.get("type") or data.get("kind") or "")
+            if typ in {"subscribe", "ping"}:
+                if typ == "ping":
+                    await websocket.send_json({"kind": "pong"})
+                continue
+            if typ == "cancel":
+                state = _running_turns.get(session_id)
+                if state:
+                    state.discard = bool(data.get("discard"))
+                    state.cancel.set()
+                    await websocket.send_json(
+                        {"kind": "cancelling", "discard": state.discard}
+                    )
+                else:
+                    await websocket.send_json({"kind": "idle"})
+                continue
             text = data.get("text") or ""
             if not text:
                 continue
-            ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
-            if changed:
-                await store.put_entity(sess)
-
-            def emit(msg: dict[str, Any]) -> None:
-                asyncio.get_event_loop().create_task(websocket.send_json(msg))
-
-            await agent_turn(store, session_id, text, ws, workspace_kind=kind, emit=emit)
-            await websocket.send_json({"kind": "turn_done"})
+            try:
+                await _run_turn(store, sess, session_id, text)
+            except HTTPException as e:
+                await websocket.send_json(
+                    {"kind": "error", "status": e.status_code, "detail": e.detail}
+                )
     except WebSocketDisconnect:
         return
+    finally:
+        _ws_subscribers[session_id].discard(websocket)
 
 
 @app.post("/v1/stt")

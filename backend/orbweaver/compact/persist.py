@@ -12,10 +12,15 @@ SKIP_PERSIST = frozenset(
         "Read",
         "WebFetch",
         "WebSearch",
+        "Browser",
         "MemorySearch",
+        "MemoryGraph",
         "MemoryRemember",
         "MemoryPin",
         "MemoryForget",
+        "TodoWrite",
+        "Delete",
+        "ReadLints",
     }
 )
 PREVIEW_CHARS = 2000

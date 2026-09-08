@@ -6,6 +6,7 @@ from typing import Any
 
 from orbweaver.compact.project import last_boundary
 from orbweaver.config import settings
+from orbweaver.image import is_image_path
 from orbweaver.store import Event
 from orbweaver.tokens import estimate_tokens
 
@@ -69,6 +70,8 @@ def rehydrate_messages(
     blocks: list[str] = []
     for path in recent_read_paths(events, keep_from, n_files):
         if path in already:
+            continue
+        if is_image_path(path):
             continue
         try:
             text = workspace.read(path)

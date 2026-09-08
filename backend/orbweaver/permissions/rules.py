@@ -16,12 +16,15 @@ SAFE_ALLOWLIST = frozenset(
         "Grep",
         "AskUser",
         "MemorySearch",
+        "MemoryGraph",
         "MemoryRemember",
         "MemoryPin",
         "MemoryForget",
         "SendPhoto",
         "GenerateImage",
         "WebSearch",
+        "TodoWrite",
+        "ReadLints",
     }
 )
 
@@ -98,12 +101,21 @@ def parse_rules(blob: str) -> list[tuple[str, str | None]]:
 def _subject(tool: str, inp: dict[str, Any]) -> str:
     if tool == "Bash":
         return str(inp.get("command") or "")
-    if tool in {"Read", "Write", "ProposePatch", "SendPhoto"}:
+    if tool in {"Read", "Write", "ProposePatch", "NotebookEdit", "SendPhoto", "Delete"}:
         return str(inp.get("path") or "")
+    if tool == "ReadLints":
+        paths = inp.get("paths") or inp.get("path") or ""
+        if isinstance(paths, list):
+            return " ".join(str(p) for p in paths)
+        return str(paths)
     if tool == "GenerateImage":
         return str(inp.get("prompt") or inp.get("path") or "")
     if tool == "WebFetch":
         return str(inp.get("url") or "")
+    if tool == "Browser":
+        from orbweaver.browser import summarize_browser
+
+        return summarize_browser(inp)
     if tool == "WebSearch":
         return str(inp.get("query") or "")
     if tool == "SpawnSubagent":

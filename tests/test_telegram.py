@@ -38,6 +38,7 @@ async def test_telegram_session_reuse():
     c = await session_for_telegram_user(store, 7)
     assert a.id == b.id
     assert a.jsonld["workspace_kind"] == "local"
+    assert a.jsonld["channel"] == "telegram"
     assert a.jsonld["telegram_chat_id"] == 42
     updated = await session_for_telegram_user(store, 42, chat_id=999)
     assert updated.id == a.id

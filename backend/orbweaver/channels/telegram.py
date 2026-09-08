@@ -168,6 +168,9 @@ async def session_for_telegram_user(
             if chat_id is not None and ent.jsonld.get("telegram_chat_id") != chat_id:
                 ent.jsonld["telegram_chat_id"] = chat_id
                 changed = True
+            if ent.jsonld.get("channel") != "telegram":
+                ent.jsonld["channel"] = "telegram"
+                changed = True
             if changed:
                 await store.put_entity(ent)
             return ent
@@ -182,6 +185,7 @@ async def session_for_telegram_user(
             "workspace_uri": "workspace:default",
             "workspace_kind": WORKSPACE_KIND_LOCAL,
             "title": f"telegram:{user_id}",
+            "channel": "telegram",
             "telegram_user_id": user_id,
             "telegram_chat_id": chat_id if chat_id is not None else user_id,
             "status": "active",
@@ -206,6 +210,9 @@ async def _session_workspace(update, context):
         if chat_id is not None and sess.jsonld.get("telegram_chat_id") != chat_id:
             sess.jsonld["telegram_chat_id"] = chat_id
             changed = True
+        if sess.jsonld.get("channel") != "telegram":
+            sess.jsonld["channel"] = "telegram"
+            changed = True
         ws, kind, kind_changed = bind_workspace(sess.jsonld, settings.workspace_root)
         if changed or kind_changed:
             await store.put_entity(sess)
@@ -226,6 +233,7 @@ async def _run_turn(update, context, text: str, images: list[dict[str, str]] | N
         interactive=True,
         images=images,
         system_extra=TELEGRAM_IMAGE_HINT,
+        channel="telegram",
     )
     await update.message.reply_text(texts_for_reply(events) or "(no assistant text)")
 

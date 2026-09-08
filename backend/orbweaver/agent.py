@@ -22,12 +22,14 @@ from orbweaver.compact import (
     usage_input_tokens,
 )
 from orbweaver.config import settings
-from orbweaver.image import hydrate_workspace_images
-from orbweaver.memory import pinned_prompt, remember, rewrite_search_query
+from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
+from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
+from orbweaver.lints import read_lints
+from orbweaver.todos import inject_session_todos, persist_todos
 from orbweaver.tooltext import format_read, format_webfetch
 
 DEFAULT_MAX_ROUNDS = 48
@@ -45,10 +47,11 @@ TOOL_SPEC = [
     {
         "name": "Read",
         "description": (
-            "Read a file as numbered lines. Relative paths are the session workspace. "
-            "Absolute paths in extra sandbox roots are auto-allowed; other host paths are "
-            "classified. Use offset (1-based line, or negative from the end) and limit to "
-            "page; do not page files with Bash. The result says how to continue when truncated."
+            "Read a file as numbered lines, or an image as vision (jpg/png/webp/gif). "
+            "Relative paths are the session workspace. Absolute paths in extra sandbox "
+            "roots are auto-allowed; other host paths are classified. Use offset "
+            "(1-based line, or negative from the end) and limit to page text; do not "
+            "page files with Bash. The result says how to continue when truncated."
         ),
         "input_schema": {
             "type": "object",
@@ -70,6 +73,44 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
             "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "NotebookEdit",
+        "description": (
+            "Edit one cell in a .ipynb notebook. Do not Write the whole notebook JSON. "
+            "action is replace (default), insert, or delete. replace can set source or "
+            "search-replace with old_string/new_string."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "cell_idx": {"type": "integer", "description": "0-based cell index."},
+                "action": {"type": "string", "enum": ["replace", "insert", "delete"]},
+                "source": {"type": "string", "description": "Full replacement or insert source."},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "cell_type": {
+                    "type": "string",
+                    "enum": ["code", "markdown", "raw"],
+                    "description": "Cell type for insert (default code).",
+                },
+            },
+            "required": ["path", "cell_idx"],
+        },
+    },
+    {
+        "name": "Delete",
+        "description": (
+            "Delete a file or directory in the session working set. Same deny/ask rules as "
+            "Write: always-deny secrets (.env, keys), and paths outside the working set are "
+            "blocked. Prefer this over Bash rm."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
         },
     },
     {
@@ -107,6 +148,24 @@ TOOL_SPEC = [
         },
     },
     {
+        "name": "ReadLints",
+        "description": (
+            "Return diagnostics for files you just edited. Runs ORBWEAVER_LINTER when set "
+            "(use {paths} or trailing paths). Otherwise a Python AST stub reports syntax "
+            "errors. Paths default to recent Write/ProposePatch targets."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Workspace paths to check. Empty uses recently edited files.",
+                }
+            },
+        },
+    },
+    {
         "name": "Bash",
         "description": (
             "Run a shell command in the workspace. Sandboxed by default: host files are readable, "
@@ -134,13 +193,47 @@ TOOL_SPEC = [
         "name": "WebFetch",
         "description": (
             "HTTP GET a known URL and return extracted readable text (HTML is stripped). "
-            "Find URLs with WebSearch first. Do not keep fetching nearby docs URLs when the "
-            "result says the page is JavaScript-rendered."
+            "Find URLs with WebSearch first. When the result says the page is "
+            "JavaScript-rendered, use Browser instead of fetching nearby docs URLs."
         ),
         "input_schema": {
             "type": "object",
             "properties": {"url": {"type": "string"}},
             "required": ["url"],
+        },
+    },
+    {
+        "name": "Browser",
+        "description": (
+            "Drive a headless Chromium session to verify UI. Actions: navigate, click, type, "
+            "snapshot (visible text and controls after JavaScript), screenshot (PNG under "
+            "attachments/). Use this when WebFetch reports a JavaScript-rendered page or when "
+            "you changed web/ and need to click through a flow. Requires "
+            'pip install -e ".[browser]" and playwright install chromium. file:// and '
+            "workspace-relative paths must stay in the workspace. Classified like WebFetch "
+            "(not auto-allowed)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["navigate", "click", "type", "snapshot", "screenshot"],
+                },
+                "url": {
+                    "type": "string",
+                    "description": "navigate: http(s) URL, file://, or workspace-relative path",
+                },
+                "selector": {"type": "string", "description": "CSS selector for click/type"},
+                "text": {"type": "string", "description": "Text to type into the selector"},
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "screenshot: workspace PNG path, default attachments/browser-<id>.png"
+                    ),
+                },
+            },
+            "required": ["action"],
         },
     },
     {
@@ -169,6 +262,24 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"query": {"type": "string"}},
             "required": ["query"],
+        },
+    },
+    {
+        "name": "MemoryGraph",
+        "description": (
+            "Walk the shared memory graph around an entity @id (same neighborhood as "
+            "GET /memory/graph). Use after MemorySearch when you have an entity id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Entity @id to walk from."},
+                "depth": {
+                    "type": "integer",
+                    "description": "Neighborhood hops (default 1, max 4).",
+                },
+            },
+            "required": ["id"],
         },
     },
     {
@@ -215,6 +326,38 @@ TOOL_SPEC = [
         },
     },
     {
+        "name": "TodoWrite",
+        "description": (
+            "Create or update the session todo list. Persisted on the session so compaction "
+            "does not erase the plan. merge true updates by id; merge false replaces the list."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "content": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed", "cancelled"],
+                            },
+                        },
+                        "required": ["content"],
+                    },
+                },
+                "merge": {
+                    "type": "boolean",
+                    "description": "If true, merge by id into the existing list.",
+                },
+            },
+            "required": ["todos"],
+        },
+    },
+    {
         "name": "SpawnSubagent",
         "description": (
             "Spawn a nested agent with its own event stream to complete a focused task. "
@@ -231,13 +374,24 @@ TOOL_SPEC = [
     },
     {
         "name": "ScheduleTask",
-        "description": "Ask the host to schedule a job (ISO-8601 due_at).",
+        "description": (
+            "Ask the host to schedule a job. due_at is ISO-8601. "
+            "Optional recurrence: minute, hour, or day (also 'every hour'), "
+            "or a 5-field cron expression (minute hour day-of-month month "
+            "day-of-week), e.g. '0 9 * * mon'. Omit recurrence for a one-shot."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "due_at": {"type": "string"},
                 "message": {"type": "string"},
-                "recurrence": {"type": "string"},
+                "recurrence": {
+                    "type": "string",
+                    "description": (
+                        "minute/hour/day, or 5-field cron "
+                        "(minute hour day month weekday)."
+                    ),
+                },
             },
             "required": ["due_at", "message"],
         },
@@ -278,6 +432,55 @@ TOOL_SPEC = [
     },
 ]
 
+PROPOSE_PATCH_TOOL = "ProposePatch"
+VSCODE_CHANNEL = "vscode"
+
+
+def normalize_channel(value: str | None) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-").replace(" ", "")
+    if raw in {"vscode", "vs-code", "visualstudiocode"}:
+        return VSCODE_CHANNEL
+    return raw
+
+
+def resolve_channel(
+    jsonld: dict[str, Any] | None = None,
+    *,
+    channel: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Client channel for tool/prompt filtering. Only vscode keeps ProposePatch."""
+    if channel and str(channel).strip():
+        return normalize_channel(channel)
+    extra = extra or {}
+    extra_ch = extra.get("channel") or extra.get("client")
+    if extra_ch and str(extra_ch).strip():
+        return normalize_channel(str(extra_ch))
+    jsonld = jsonld or {}
+    stored = jsonld.get("channel") or jsonld.get("client")
+    if stored and str(stored).strip():
+        return normalize_channel(str(stored))
+    if jsonld.get("telegram_user_id") is not None or jsonld.get("telegram_chat_id") is not None:
+        return "telegram"
+    title = str(jsonld.get("title") or "").strip().lower()
+    if title == "vscode" or title.startswith("vscode:") or title.startswith("vscode/"):
+        return VSCODE_CHANNEL
+    return ""
+
+
+def channel_allows_proposepatch(channel: str) -> bool:
+    return normalize_channel(channel) == VSCODE_CHANNEL
+
+
+def tools_for_channel(
+    channel: str,
+    tool_spec: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    spec = list(tool_spec if tool_spec is not None else TOOL_SPEC)
+    if channel_allows_proposepatch(channel):
+        return spec
+    return [t for t in spec if t.get("name") != PROPOSE_PATCH_TOOL]
+
 
 def _events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     """Build Anthropic messages from a (possibly projected) event list."""
@@ -300,37 +503,48 @@ def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dic
     messages = events_to_messages(prompt_events(events))
     messages = hydrate_workspace_images(messages, workspace)
     messages = rehydrate_messages(messages, events, workspace)
+    messages = inject_session_todos(messages, events)
     if not messages:
         messages = [{"role": "user", "content": user_text}]
     return messages
 
 
-def static_system() -> str:
+def static_system(channel: str = "") -> str:
+    write_line = "In auto mode, in-project Write applies immediately. "
+    if channel_allows_proposepatch(channel):
+        write_line += "Prefer ProposePatch when a visible diff overlay helps the user. "
     return (
         f"You are Orbweaver, a coding agent. The running gateway is Orbweaver {__version__} "
         f"(semantic version). If asked what version is running, answer {__version__}. "
         "Use tools to read and patch the workspace. Sandboxed Bash can read host files; "
         "do not set permissions [\"all\"] just to inspect logs or journals. "
-        "In auto mode, in-project Write applies immediately. Prefer ProposePatch when a "
-        "visible diff overlay helps the user. Use MemorySearch when past decisions might "
-        "matter. Keep pins small. If the sandbox cannot run a command, ask the user "
+        f"{write_line}"
+        "In auto mode, in-project Delete applies immediately. TodoWrite keeps the plan "
+        "on this session across compaction. After edits, ReadLints for diagnostics. "
+        "Use NotebookEdit for .ipynb cells instead of rewriting the whole JSON. "
+        "Use MemorySearch when past decisions might "
+        "matter, and MemoryGraph to walk entity neighborhoods. Keep pins small. If the "
+        "sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
         "stay blocked; do not route around them. Call independent tools in parallel in "
         "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
         "Use WebSearch to find sources, then WebFetch a few result URLs; do not guess "
-        "docs paths. Finish with a user-visible answer before the tool-round budget runs out; "
+        "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
+        "Finish with a user-visible answer before the tool-round budget runs out; "
         "spawn a subagent for a long exploration instead of burning parent rounds."
     )
 
 
-def build_agent_system(pins: str, extra: str = "", skills: str = "") -> list[dict[str, Any]]:
+def build_agent_system(
+    pins: str, extra: str = "", skills: str = "", channel: str = ""
+) -> list[dict[str, Any]]:
     rest = pins or "(no pinned memory)"
     if skills:
         rest = rest + "\n\n" + skills
     if extra:
         rest = rest + "\n\n" + extra
     return [
-        {"type": "text", "text": static_system(), "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": static_system(channel), "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": rest},
     ]
 
@@ -394,14 +608,26 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     store: Store = ctx["store"]
     session_id: UUID = ctx["session_id"]
     if name == "Read":
+        path = str(inp.get("path") or "")
+        if is_image_path(path):
+            return format_image_read(ws, path)
         try:
-            raw = ws.read(inp["path"])
+            raw = ws.read(path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
-        return format_read(raw, path=str(inp["path"]), offset=inp.get("offset"), limit=inp.get("limit"))
+        return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
+    if name == "NotebookEdit":
+        from orbweaver.notebook import apply_notebook_edit
+
+        return apply_notebook_edit(ws, inp)
+    if name == "Delete":
+        try:
+            return ws.delete(inp["path"])
+        except (OSError, PermissionError) as e:
+            return f"error deleting {inp.get('path')}: {e}"
     if name == "ProposePatch":
         result = ws.propose_patch(inp["path"], inp.get("old_string") or "", inp["new_string"])
         return json.dumps(result)[:200_000]
@@ -409,6 +635,8 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         return "\n".join(ws.glob(inp["pattern"])[:200])
     if name == "Grep":
         return "\n".join(ws.grep(inp["pattern"], inp.get("glob") or "**/*"))
+    if name == "ReadLints":
+        return read_lints(ws, inp, ctx.get("events"))
     if name == "Bash":
         from orbweaver.permissions.pipeline import bash_permissions
 
@@ -424,6 +652,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         r = httpx.get(inp["url"], timeout=20.0, follow_redirects=True)  # noqa: ASYNC210
         ctype = r.headers.get("content-type") or ""
         return format_webfetch(str(inp.get("url") or ""), r.status_code, ctype, r.text)
+    if name == "Browser":
+        from orbweaver.browser import run_browser
+
+        return await run_browser(inp, ctx)
     if name == "WebSearch":
         from orbweaver.websearch import run_websearch
 
@@ -444,6 +676,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             ids.append(str(c.id))
             lines.append(f"[{c.id} score={score:.3f}] {c.text}")
         return json.dumps({"chunk_ids": ids, "text": "\n".join(lines) or "(no hits)"})
+    if name == "MemoryGraph":
+        hops = inp.get("depth", 1)
+        neighborhood = await graph_neighborhood(store, str(inp.get("id") or ""), hops)
+        return json.dumps(neighborhood)
     if name == "MemoryRemember":
         from orbweaver.store import PinBudgetError
 
@@ -475,6 +711,9 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             raise _ask_user_headless_abort(question)
         # Interactive wait is handled in agent_turn so the reply can be the tool result.
         return json.dumps({"ask": question})
+    if name == "TodoWrite":
+        todos = await persist_todos(store, session_id, inp)
+        return json.dumps({"todos": todos})
     if name == "SpawnSubagent":
         from orbweaver.subagent import run_subagent
 
@@ -486,11 +725,21 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
                 due = due.replace(tzinfo=UTC)
         except ValueError as e:
             return f"invalid due_at: {e}"
+        rec = inp.get("recurrence")
+        if rec:
+            from orbweaver.channels.cron import _parse_recurrence
+
+            if _parse_recurrence(str(rec), due) is None:
+                return (
+                    "invalid recurrence: use minute, hour, day "
+                    "(or 'every hour'), or a 5-field cron expression "
+                    "like '0 9 * * mon'"
+                )
         job = Job(
             id=new_uuid(),
             due_at=due,
             payload={"message": inp.get("message") or ""},
-            recurrence=inp.get("recurrence"),
+            recurrence=rec,
             session_id=session_id,
         )
         await store.put_job(job)
@@ -584,6 +833,7 @@ async def agent_turn(
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     subagent_depth: int = 0,
     images: list[dict[str, str]] | None = None,
+    channel: str | None = None,
 ) -> list[Event]:
     _raise_if_cancelled(cancel)
     wait_ok = interactive if interactive is not None else not headless
@@ -667,6 +917,8 @@ async def agent_turn(
     client = anthropic.AsyncAnthropic(
         api_key=settings.anthropic_api_key, default_headers=headers or None
     )
+    sess = await store.get_entity(session_id)
+    resolved_channel = resolve_channel(sess.jsonld if sess else None, channel=channel)
     denial_state = denial_state_for(session_id)
     ctx = {
         "workspace": workspace,
@@ -681,10 +933,16 @@ async def agent_turn(
         "cancel": cancel,
         "fire": fire,
         "subagent_depth": subagent_depth,
+        "channel": resolved_channel,
     }
     pins = await pinned_prompt(store)
-    system = build_agent_system(pins, system_extra, skills=workspace_skills_prompt(workspace))
-    active_tools = tools if tools is not None else TOOL_SPEC
+    system = build_agent_system(
+        pins,
+        system_extra,
+        skills=workspace_skills_prompt(workspace),
+        channel=resolved_channel,
+    )
+    active_tools = tools if tools is not None else tools_for_channel(resolved_channel)
     if not resume:
         await maybe_compact(
             store, session_id, client=client, workspace=workspace, system=system
