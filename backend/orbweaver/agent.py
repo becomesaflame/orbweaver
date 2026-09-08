@@ -109,7 +109,11 @@ TOOL_SPEC = [
     {
         "name": "Bash",
         "description": (
-            "Run a shell command in the workspace. Sandboxed by default: host files are readable, "
+            "Run a shell command in the workspace. Default timeout is 30 seconds if unspecified; "
+            "pass timeout (seconds, max 600) or block_until_ms for long commands such as pytest "
+            "or installs. Set background true to start a job and return a job_id immediately; "
+            "later call Bash with that job_id (optional timeout to wait) to poll or collect "
+            "output when it finishes. Sandboxed by default: host files are readable, "
             "writes stay in the working set, network uses a domain allowlist, Unix sockets are "
             "denied unless granted. Host reads and allowlisted sockets/domains do not need "
             "escalation. If the sandbox blocks the command, ask the user before setting "
@@ -120,14 +124,32 @@ TOOL_SPEC = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "command": {"type": "string"},
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to run. Required unless job_id is set.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Seconds to wait (default 30, max 600). Job lifetime when background.",
+                },
+                "block_until_ms": {
+                    "type": "integer",
+                    "description": "Alternate timeout in milliseconds (same default/cap as timeout).",
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "If true, start the command and return a job_id without waiting.",
+                },
+                "job_id": {
+                    "type": "string",
+                    "description": "Poll/collect a previously backgrounded job instead of running a command.",
+                },
                 "unsandboxed": {"type": "boolean"},
                 "permissions": {
                     "type": "array",
                     "items": {"type": "string", "enum": ["full_network", "all"]},
                 },
             },
-            "required": ["command"],
         },
     },
     {
@@ -368,7 +390,11 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
 
         perms = sorted(bash_permissions(inp))
         return ws.bash(
-            inp["command"],
+            inp.get("command") or "",
+            timeout=inp.get("timeout"),
+            block_until_ms=inp.get("block_until_ms"),
+            background=bool(inp.get("background")),
+            job_id=inp.get("job_id"),
             unsandboxed=bool(inp.get("unsandboxed")),
             permissions=perms,
         )

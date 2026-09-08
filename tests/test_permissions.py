@@ -335,3 +335,14 @@ async def test_classifier_ask_headless_aborts(tmp_path, monkeypatch):
     with pytest.raises(TurnAborted) as ei:
         await can_use_tool("WebFetch", {"url": "https://example.com"}, _ctx(tmp_path, headless=True))
     assert ei.value.payload["reason"] == "ask_required_headless"
+
+
+@pytest.mark.asyncio
+async def test_bash_job_collect_skips_classifier(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run when collecting a bash job")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    decision = await can_use_tool("Bash", {"job_id": "bj_abc123"}, _ctx(tmp_path))
+    assert decision.behavior == "allow"
+    assert decision.fast_path == "allowlist"

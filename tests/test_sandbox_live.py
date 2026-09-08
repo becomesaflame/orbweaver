@@ -135,3 +135,28 @@ def test_sandboxed_git_init_remote_and_rm(live_root):
     assert "Device or resource busy" not in rm
     assert "sandbox_denied" not in rm
     assert not (live_root / ".git").exists()
+
+
+def test_sandboxed_bash_timeout_expiry(live_root):
+    ws = LocalWorkspace("workspace:default", str(live_root))
+    out = ws.bash("sleep 5", timeout=1)
+    assert "timeout: command exceeded 1s" in out
+
+
+def test_sandboxed_bash_raised_timeout_completes(live_root):
+    """A command that would miss the old 30s default must succeed when timeout is raised."""
+    ws = LocalWorkspace("workspace:default", str(live_root))
+    out = ws.bash("sleep 31; echo sandbox-over-default", timeout=40)
+    assert "sandbox-over-default" in out
+    assert "timeout:" not in out
+
+
+def test_sandboxed_bash_background_start_and_collect(live_root):
+    import json
+
+    ws = LocalWorkspace("workspace:default", str(live_root))
+    started = json.loads(ws.bash("sleep 0.4; echo sandbox-job-done", background=True, timeout=15))
+    assert started["status"] == "running"
+    finished = json.loads(ws.collect_job(started["job_id"], wait_s=10))
+    assert finished["status"] == "exited"
+    assert "sandbox-job-done" in finished["output"]
