@@ -81,27 +81,33 @@ async def _streaming_slow_turn(
 
 
 def test_ws_rejects_missing_token():
-    with TestClient(app) as client:
-        with pytest.raises(WebSocketDisconnect) as exc:
-            with client.websocket_connect(_ws_url(str(uuid4()))) as ws:
-                ws.receive_text()
-        assert exc.value.code == 4401
+    with (
+        TestClient(app) as client,
+        pytest.raises(WebSocketDisconnect) as exc,
+        client.websocket_connect(_ws_url(str(uuid4()))) as ws,
+    ):
+        ws.receive_text()
+    assert exc.value.code == 4401
 
 
 def test_ws_rejects_invalid_token():
-    with TestClient(app) as client:
-        with pytest.raises(WebSocketDisconnect) as exc:
-            with client.websocket_connect(_ws_url(str(uuid4()), "not-a-jwt")) as ws:
-                ws.receive_text()
-        assert exc.value.code == 4401
+    with (
+        TestClient(app) as client,
+        pytest.raises(WebSocketDisconnect) as exc,
+        client.websocket_connect(_ws_url(str(uuid4()), "not-a-jwt")) as ws,
+    ):
+        ws.receive_text()
+    assert exc.value.code == 4401
 
 
 def test_ws_rejects_unknown_session():
-    with TestClient(app) as client:
-        with pytest.raises(WebSocketDisconnect) as exc:
-            with client.websocket_connect(_ws_url(str(uuid4()), _token())) as ws:
-                ws.receive_text()
-        assert exc.value.code == 4404
+    with (
+        TestClient(app) as client,
+        pytest.raises(WebSocketDisconnect) as exc,
+        client.websocket_connect(_ws_url(str(uuid4()), _token())) as ws,
+    ):
+        ws.receive_text()
+    assert exc.value.code == 4404
 
 
 def test_ws_event_order(tmp_path, monkeypatch):

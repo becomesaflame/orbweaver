@@ -314,7 +314,11 @@ TOOL_SPEC = [
     },
     {
         "name": "AskUser",
-        "description": "Ask the user a question and wait.",
+        "description": (
+            "Ask the user a question and wait for their reply on web or Telegram. "
+            "The turn pauses until they answer; that reply becomes this tool's result. "
+            "Do not use this on cron or other headless sessions — those abort."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"question": {"type": "string"}},
@@ -569,6 +573,48 @@ def _blocked_tool_result(decision) -> str:
     )
 
 
+def can_wait_for_user(ctx: dict[str, Any]) -> bool:
+    """Web and Telegram can pause for a reply; cron/subagent/other headless cannot."""
+    if ctx.get("interactive"):
+        return True
+    return not bool(ctx.get("headless"))
+
+
+def pending_ask_user(events: list[Event]) -> Event | None:
+    """Unanswered AskUser tool_call, if the turn is waiting for a reply."""
+    answered: set[str] = set()
+    asks: list[Event] = []
+    for ev in events:
+        name = str((ev.payload or {}).get("name") or "")
+        if ev.kind == "tool_call" and name == "AskUser":
+            asks.append(ev)
+        elif ev.kind in {"tool_result", "MemoryRecall"}:
+            tid = (ev.payload or {}).get("tool_use_id")
+            if tid:
+                answered.add(str(tid))
+    for ev in reversed(asks):
+        uid = str((ev.payload or {}).get("id") or ev.id)
+        if uid not in answered:
+            return ev
+    return None
+
+
+def _ask_user_headless_abort(question: str) -> TurnAborted:
+    text = (
+        "AskUser cannot wait for a reply on this headless session. "
+        "Rephrase so the work can finish without asking, or run it from web or Telegram."
+    )
+    return TurnAborted(
+        text,
+        {
+            "reason": "ask_user_headless",
+            "last_tool": "AskUser",
+            "last_input": question[:240],
+            "text": text,
+        },
+    )
+
+
 async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     ws = ctx["workspace"]
     store: Store = ctx["store"]
@@ -670,7 +716,13 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         await store.forget_chunk(UUID(inp["id"]))
         return "forgotten"
     if name == "AskUser":
-        return json.dumps({"ask": inp["question"]})
+        question = str(inp.get("question") or "").strip()
+        if not question:
+            return "error: question is required"
+        if not can_wait_for_user(ctx):
+            raise _ask_user_headless_abort(question)
+        # Interactive wait is handled in agent_turn so the reply can be the tool result.
+        return json.dumps({"ask": question})
     if name == "TodoWrite":
         todos = await persist_todos(store, session_id, inp)
         return json.dumps({"todos": todos})
@@ -787,6 +839,7 @@ async def agent_turn(
     turn_state: Any | None = None,
     resume: bool = False,
     headless: bool = False,
+    interactive: bool | None = None,
     tools: list[dict[str, Any]] | None = None,
     system_extra: str = "",
     max_rounds: int = DEFAULT_MAX_ROUNDS,
@@ -795,9 +848,16 @@ async def agent_turn(
     channel: str | None = None,
 ) -> list[Event]:
     _raise_if_cancelled(cancel)
+    wait_ok = interactive if interactive is not None else not headless
+    prior = await store.list_events(session_id)
+    pending = pending_ask_user(prior)
+    answer_text = (user_text or "").strip()
+    if pending and resume and not answer_text:
+        return []
+    answering = bool(pending and answer_text and not resume)
     if resume:
         if turn_state is not None:
-            for ev in reversed(await store.list_events(session_id)):
+            for ev in reversed(prior):
                 if ev.kind == "user":
                     turn_state.user_seq = ev.seq
                     if not user_text:
@@ -805,6 +865,8 @@ async def agent_turn(
                     break
     else:
         payload: dict[str, Any] = {"text": user_text}
+        if answering:
+            payload["ask_answer"] = True
         if images:
             payload["images"] = images
         user_ev = await store.append_event(session_id, "user", payload)
@@ -837,6 +899,20 @@ async def agent_turn(
         payload.setdefault("text", exc.message)
         fire(await store.append_event(session_id, "turn_aborted", payload))
         fire(await store.append_event(session_id, "assistant", {"text": exc.message}))
+
+    if answering and pending is not None:
+        uid = str((pending.payload or {}).get("id") or pending.id)
+        fire(
+            await store.append_event(
+                session_id,
+                "tool_result",
+                {
+                    "tool_use_id": uid,
+                    "name": "AskUser",
+                    "content": answer_text,
+                },
+            )
+        )
 
     check()
     if not settings.anthropic_api_key:
@@ -872,6 +948,7 @@ async def agent_turn(
         "workspace_kind": workspace_kind,
         "auto_write": True,
         "headless": headless,
+        "interactive": wait_ok,
         "denial_state": denial_state,
         "events": [],
         "cancel": cancel,
@@ -934,6 +1011,7 @@ async def agent_turn(
             if not tool_uses:
                 break
             stop_after_ask = False
+            waiting_ask = False
             for block in tool_uses:
                 check()
                 call_ev = await store.append_event(
@@ -966,6 +1044,27 @@ async def agent_turn(
                     result = _blocked_tool_result(decision)
                     if decision.behavior == "ask":
                         stop_after_ask = True
+                elif block.name == "AskUser":
+                    question = str(dict(block.input).get("question") or "").strip()
+                    if not question:
+                        result = "error: question is required"
+                    elif not can_wait_for_user(ctx):
+                        await record_abort(_ask_user_headless_abort(question))
+                        return produced
+                    else:
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "ask_user",
+                                {
+                                    "question": question,
+                                    "tool_use_id": block.id,
+                                    "name": "AskUser",
+                                },
+                            )
+                        )
+                        waiting_ask = True
+                        break
                 else:
                     result = await run_tools(block.name, dict(block.input), ctx)
                     result, persisted_path = persist_tool_result(
@@ -1007,6 +1106,8 @@ async def agent_turn(
                             session_id, "schedule_request", {"input": dict(block.input)}
                         )
                     )
+            if waiting_ask:
+                break
             if stop_after_ask:
                 fire(
                     await store.append_event(
