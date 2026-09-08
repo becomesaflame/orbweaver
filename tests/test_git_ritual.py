@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import anthropic
 import pytest
+
 from orbweaver.agent import GIT_NOT_DONE_NUDGE, agent_turn, run_tools, static_system
 from orbweaver.git_ritual import (
     ADD_ALL_WARNING,
