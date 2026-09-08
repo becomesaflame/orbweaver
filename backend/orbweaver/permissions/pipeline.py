@@ -46,7 +46,7 @@ class TurnAborted(Exception):
 def summarize_input(name: str, inp: dict[str, Any]) -> str:
     if name == "Bash":
         return str(inp.get("command") or "")[:240]
-    if name in {"Read", "Write", "ProposePatch", "SendPhoto", "Delete"}:
+    if name in {"Read", "Write", "ProposePatch", "NotebookEdit", "SendPhoto", "Delete"}:
         return str(inp.get("path") or "")[:240]
     if name == "ReadLints":
         paths = inp.get("paths") or inp.get("path") or ""
@@ -57,8 +57,14 @@ def summarize_input(name: str, inp: dict[str, Any]) -> str:
         return str(inp.get("prompt") or "")[:240]
     if name == "WebFetch":
         return str(inp.get("url") or "")[:240]
+    if name == "Browser":
+        from orbweaver.browser import summarize_browser
+
+        return summarize_browser(inp)
     if name == "WebSearch":
         return str(inp.get("query") or "")[:240]
+    if name == "MemoryGraph":
+        return str(inp.get("id") or "")[:240]
     if name == "SpawnSubagent":
         return str(inp.get("task") or "")[:240]
     return name
@@ -139,7 +145,7 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
     if name == "Bash" and str(inp.get("job_id") or "").strip():
         return PermissionDecision("allow", "bash job collect", "allowlist")
 
-    if name in {"Read", "Write", "ProposePatch", "SendPhoto", "Delete"}:
+    if name in {"Read", "Write", "ProposePatch", "NotebookEdit", "SendPhoto", "Delete"}:
         path = str(inp.get("path") or "")
         if path_is_always_denied(path):
             return PermissionDecision("deny", f"path denied: {path}", "deny_rule")
@@ -213,7 +219,7 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
         else:
             return PermissionDecision("allow", "safe tool allowlist", "allowlist")
 
-    if name in {"Write", "ProposePatch", "Delete"} and workspace and in_project_path(str(inp.get("path") or ""), workspace):
+    if name in {"Write", "ProposePatch", "NotebookEdit", "Delete"} and workspace and in_project_path(str(inp.get("path") or ""), workspace):
         return PermissionDecision("allow", "in-project file edit", "acceptEdits")
 
     if name == "Bash" and settings.orbweaver_auto_allow_bash_if_sandboxed and bash_sandboxable(inp, workspace_kind):

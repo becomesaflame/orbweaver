@@ -1,247 +1,469 @@
 import * as vscode from "vscode";
-import * as http from "http";
-import * as https from "https";
-import * as path from "path";
+import {
+  SessionEvent,
+  SessionRow,
+  SessionSocket,
+  cancelTurn,
+  continueTurn,
+  createSession,
+  injectTurn,
+  listEvents,
+  listSessions,
+  readConfig,
+  renameSession,
+} from "./client";
+import { DiffManager, PatchProposal } from "./diffs";
+import { PlanManager } from "./plans";
 
-interface PatchProposal {
-  path: string;
-  old: string;
-  new: string;
-  updated?: string;
-}
+class SessionTree implements vscode.TreeDataProvider<SessionRow> {
+  private rows: SessionRow[] = [];
+  private readonly _onChange = new vscode.EventEmitter<void>();
+  readonly onDidChangeTreeData = this._onChange.event;
 
-let added: vscode.TextEditorDecorationType;
-let removed: vscode.TextEditorDecorationType;
-let lastPatch: { uri: vscode.Uri; proposal: PatchProposal } | undefined;
-let sessionId: string | undefined;
+  constructor(private readonly getActive: () => string | undefined) {}
 
-function cfg() {
-  const c = vscode.workspace.getConfiguration("orbweaver");
-  return {
-    gateway: String(c.get("gatewayUrl") || "http://127.0.0.1:8080").replace(/\/$/, ""),
-    token: String(c.get("token") || ""),
-    workspaceUri: String(c.get("workspaceUri") || "workspace:default"),
-  };
-}
-
-function request(method: string, urlPath: string, body?: unknown): Promise<any> {
-  const { gateway, token } = cfg();
-  const u = new URL(gateway + urlPath);
-  const payload = body === undefined ? undefined : JSON.stringify(body);
-  const lib = u.protocol === "https:" ? https : http;
-  return new Promise((resolve, reject) => {
-    const req = lib.request(
-      {
-        hostname: u.hostname,
-        port: u.port,
-        path: u.pathname + u.search,
-        method,
-        headers: {
-          "content-type": "application/json",
-          ...(token ? { authorization: "Bearer " + token } : {}),
-          ...(payload ? { "content-length": Buffer.byteLength(payload) } : {}),
-        },
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (d) => chunks.push(d));
-        res.on("end", () => {
-          const text = Buffer.concat(chunks).toString("utf8");
-          if ((res.statusCode || 500) >= 400) {
-            reject(new Error(text));
-            return;
-          }
-          resolve(text ? JSON.parse(text) : {});
-        });
-      }
-    );
-    req.on("error", reject);
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
-
-function workspaceUri(): string {
-  const configured = cfg().workspaceUri.trim();
-  if (configured) return configured;
-  return "workspace:default";
-}
-
-async function ensureSession(): Promise<string> {
-  if (sessionId) return sessionId;
-  const { token } = cfg();
-  if (!token) {
-    throw new Error("Set orbweaver.token to a JWT from `python -m orbweaver.cli mint` on the gateway host");
+  refresh(rows: SessionRow[]): void {
+    this.rows = rows;
+    this._onChange.fire();
   }
-  const created = await request("POST", "/v1/sessions", {
-    workspace_uri: workspaceUri(),
-    workspace_kind: "local",
-    title: vscode.workspace.name || "vscode",
-    channel: "vscode",
-  });
-  sessionId = created.id;
-  return sessionId!;
-}
 
-function applyDecorations(editor: vscode.TextEditor, proposal: PatchProposal) {
-  const doc = editor.document.getText();
-  const idx = proposal.old ? doc.indexOf(proposal.old) : -1;
-  if (idx < 0) {
-    const start = new vscode.Position(0, 0);
-    editor.setDecorations(added, [
-      { range: new vscode.Range(start, start), hoverMessage: "Orbweaver patch (old_string not in buffer)" },
-    ]);
-    return;
+  getTreeItem(row: SessionRow): vscode.TreeItem {
+    const item = new vscode.TreeItem(row.title || "New chat", vscode.TreeItemCollapsibleState.None);
+    item.id = row.id;
+    item.description = row.preview || row.workspace_uri;
+    item.tooltip = (row.workspace_uri || "") + (row.channel ? ` · ${row.channel}` : "");
+    item.command = { command: "orbweaver.openSession", title: "Open", arguments: [row.id] };
+    item.contextValue = "orbweaverSession";
+    if (row.id === this.getActive()) item.iconPath = new vscode.ThemeIcon("comment-discussion");
+    return item;
   }
-  const start = editor.document.positionAt(idx);
-  const end = editor.document.positionAt(idx + proposal.old.length);
-  editor.setDecorations(removed, [{ range: new vscode.Range(start, end), hoverMessage: "deletion" }]);
-  editor.setDecorations(added, [
-    { range: new vscode.Range(end, end), hoverMessage: "addition:\n" + proposal.new },
-  ]);
-}
 
-async function showPatch(proposal: PatchProposal) {
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) return;
-  const uri = vscode.Uri.joinPath(folder.uri, proposal.path);
-  const doc = await vscode.workspace.openTextDocument(uri);
-  const editor = await vscode.window.showTextDocument(doc);
-  lastPatch = { uri, proposal };
-  applyDecorations(editor, proposal);
+  getChildren(): SessionRow[] {
+    return this.rows;
+  }
 }
 
 class ChatViewProvider implements vscode.WebviewViewProvider {
-  constructor(private readonly ctx: vscode.ExtensionContext) {}
-  resolveWebviewView(webviewView: vscode.WebviewView) {
+  private view: vscode.WebviewView | undefined;
+  private busy = false;
+  private stopped = false;
+
+  constructor(
+    private readonly ctx: vscode.ExtensionContext,
+    private readonly getSessionId: () => string | undefined,
+    private readonly diffs: DiffManager
+  ) {}
+
+  resolveWebviewView(webviewView: vscode.WebviewView): void {
+    this.view = webviewView;
     webviewView.webview.options = { enableScripts: true };
-    webviewView.webview.html = html();
+    webviewView.webview.html = chatHtml();
     webviewView.webview.onDidReceiveMessage(async (msg) => {
-      if (msg.type === "send") {
-        try {
-          const sid = await ensureSession();
-          const r = await request("POST", `/v1/sessions/${sid}/turns`, { text: msg.text });
-          webviewView.webview.postMessage({ type: "events", events: r.events });
-          for (const ev of r.events || []) {
-            if (ev.kind === "patch_proposal" || ev.kind === "tool_result") {
-              try {
-                const payload = ev.payload?.content || ev.payload;
-                const parsed = typeof payload === "string" ? JSON.parse(payload) : payload;
-                if (parsed && parsed.path && parsed.ok) await showPatch(parsed);
-              } catch {
-                /* ignore */
-              }
-            }
-          }
-        } catch (e) {
-          webviewView.webview.postMessage({ type: "error", text: String(e) });
+      const sid = this.getSessionId();
+      try {
+        if (msg.type === "ready") {
+          this.post({ type: "patches", patches: this.diffs.list().map((p) => p.path) });
+          return;
         }
+        if (msg.type === "send") {
+          await vscode.commands.executeCommand("orbweaver.send", String(msg.text || ""));
+          return;
+        }
+        if (msg.type === "stop" && sid) {
+          await cancelTurn(sid, false);
+          return;
+        }
+        if (msg.type === "inject" && sid) {
+          const text = String(msg.text || "").trim();
+          if (!text) return;
+          const ev = await injectTurn(sid, text);
+          this.post({ type: "event", event: ev });
+          return;
+        }
+        if (msg.type === "continue" && sid) {
+          await vscode.commands.executeCommand("orbweaver.continue");
+          return;
+        }
+        if (msg.type === "accept") {
+          await vscode.commands.executeCommand("orbweaver.acceptDiff", msg.path);
+          return;
+        }
+        if (msg.type === "reject") {
+          await vscode.commands.executeCommand("orbweaver.rejectDiff", msg.path);
+          return;
+        }
+        if (msg.type === "openDiff") {
+          await vscode.commands.executeCommand("orbweaver.openDiff", msg.path);
+        }
+      } catch (e) {
+        this.post({ type: "error", text: String(e) });
       }
     });
   }
-}
 
-function html(): string {
-  return `<!DOCTYPE html>
-<html><body style="font-family:sans-serif;color:var(--vscode-foreground);">
-<div id="log"></div>
-<textarea id="t" style="width:100%;min-height:4rem;"></textarea>
-<button id="s">Send</button>
-<script>
-const vscode = acquireVsCodeApi();
-const log = document.getElementById("log");
-document.getElementById("s").onclick = () => {
-  const t = document.getElementById("t");
-  vscode.postMessage({ type: "send", text: t.value });
-  t.value = "";
-};
-window.addEventListener("message", (e) => {
-  const m = e.data;
-  const p = document.createElement("pre");
-  if (m.type === "events" && Array.isArray(m.events)) {
-    const bits = [];
-    for (const ev of m.events) {
-      const text = ev.payload && ev.payload.text;
-      if (ev.kind === "assistant" || ev.kind === "turn_aborted" || ev.kind === "cron_result") {
-        bits.push((ev.kind === "turn_aborted" ? "aborted: " : "") + (text || JSON.stringify(ev.payload)));
-      }
-    }
-    p.textContent = bits.length ? bits.join("\n\n") : JSON.stringify(m, null, 2);
-  } else {
-    p.textContent = JSON.stringify(m, null, 2);
+  setBusy(busy: boolean): void {
+    this.busy = busy;
+    this.post({ type: "busy", busy, stopped: this.stopped });
   }
-  log.appendChild(p);
-});
-</script>
-</body></html>`;
+
+  setStopped(stopped: boolean): void {
+    this.stopped = stopped;
+    this.post({ type: "busy", busy: this.busy, stopped });
+  }
+
+  showHistory(events: SessionEvent[]): void {
+    this.post({ type: "history", events });
+  }
+
+  showEvent(event: SessionEvent): void {
+    this.post({ type: "event", event });
+  }
+
+  showError(text: string): void {
+    this.post({ type: "error", text });
+  }
+
+  setTitle(title: string, workspaceUri: string): void {
+    this.post({ type: "meta", title, workspaceUri });
+  }
+
+  setPatches(paths: string[]): void {
+    this.post({ type: "patches", patches: paths });
+  }
+
+  private post(msg: unknown): void {
+    this.view?.webview.postMessage(msg);
+  }
 }
 
-export function activate(context: vscode.ExtensionContext) {
-  added = vscode.window.createTextEditorDecorationType({
-    backgroundColor: "rgba(80,180,80,0.25)",
-    isWholeLine: true,
-  });
-  removed = vscode.window.createTextEditorDecorationType({
-    backgroundColor: "rgba(180,80,80,0.25)",
-    isWholeLine: true,
-    textDecoration: "line-through",
-  });
+export function activate(context: vscode.ExtensionContext): void {
+  const diffs = new DiffManager();
+  const plans = new PlanManager(context);
+  let sessionId: string | undefined = context.workspaceState.get("orbweaver.sessionId");
+  let sessions: SessionRow[] = [];
+  const tree = new SessionTree(() => sessionId);
+  const chat = new ChatViewProvider(context, () => sessionId, diffs);
+  diffs.onPendingChange = (pending) => chat.setPatches(pending.map((p) => p.path));
+
+  const socket = new SessionSocket(
+    (ev) => {
+      if (ev.kind === "subscribed") return;
+      if (ev.kind === "turn_done") {
+        chat.setBusy(false);
+        chat.setStopped(ev.status === "stopped");
+        refreshSessions().catch(() => undefined);
+        return;
+      }
+      if (ev.kind === "error") {
+        chat.showError(String(ev.detail || "turn error"));
+        chat.setBusy(false);
+        return;
+      }
+      chat.showEvent(ev);
+      maybePatch(ev);
+    },
+    () => {
+      /* reconnect on next send */
+    }
+  );
+
+  async function refreshSessions(): Promise<SessionRow[]> {
+    try {
+      sessions = await listSessions();
+      tree.refresh(sessions);
+      return sessions;
+    } catch (e) {
+      tree.refresh([]);
+      throw e;
+    }
+  }
+
+  async function bindSession(id: string, opts: { history?: boolean } = {}): Promise<void> {
+    sessionId = id;
+    diffs.sessionId = id;
+    await context.workspaceState.update("orbweaver.sessionId", id);
+    const row = sessions.find((s) => s.id === id);
+    chat.setTitle(row?.title || "Chat", row?.workspace_uri || readConfig().workspaceUri);
+    tree.refresh(sessions);
+    try {
+      await socket.connect(id);
+    } catch (e) {
+      chat.showError(String(e));
+    }
+    if (opts.history !== false) {
+      const events = await listEvents(id);
+      chat.showHistory(events);
+      chat.setStopped(events.length > 0 && events[events.length - 1].kind !== "assistant");
+    }
+  }
+
+  async function ensureSession(): Promise<string> {
+    if (sessionId) return sessionId;
+    const created = await createSession();
+    sessions = [created, ...sessions.filter((s) => s.id !== created.id)];
+    tree.refresh(sessions);
+    await bindSession(created.id, { history: false });
+    chat.showHistory([]);
+    return created.id;
+  }
+
+  function maybePatch(ev: SessionEvent): void {
+    if (ev.kind !== "patch_proposal" && !(ev.kind === "tool_result" && ev.payload?.name === "ProposePatch")) {
+      return;
+    }
+    try {
+      const raw = ev.payload?.content ?? ev.payload;
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (parsed && parsed.path) void diffs.applyProposal(parsed as PatchProposal);
+    } catch {
+      /* ignore */
+    }
+  }
+
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider("orbweaver.chat", new ChatViewProvider(context)),
+    diffs,
+    plans,
+    vscode.workspace.registerTextDocumentContentProvider("orbweaver-diff", diffs),
+    vscode.languages.registerCodeLensProvider({ scheme: "file" }, diffs),
+    vscode.window.registerWebviewViewProvider("orbweaver.chat", chat),
+    vscode.window.registerTreeDataProvider("orbweaver.sessions", tree),
+    vscode.window.onDidChangeActiveTextEditor(() => diffs.refreshVisible()),
     vscode.commands.registerCommand("orbweaver.openChat", () =>
       vscode.commands.executeCommand("orbweaver.chat.focus")
     ),
-    vscode.commands.registerCommand("orbweaver.acceptDiff", async () => {
-      if (!lastPatch) return;
-      const proposal = lastPatch.proposal;
-      const edit = new vscode.WorkspaceEdit();
-      const doc = await vscode.workspace.openTextDocument(lastPatch.uri);
-      const text = doc.getText();
-      const next = proposal.old && text.includes(proposal.old)
-        ? text.replace(proposal.old, proposal.new)
-        : proposal.updated || proposal.new;
-      edit.replace(lastPatch.uri, new vscode.Range(doc.positionAt(0), doc.positionAt(text.length)), next);
-      await vscode.workspace.applyEdit(edit);
-      if (sessionId) {
-        await request("POST", `/v1/sessions/${sessionId}/correction`, {
-          text: "accepted patch for " + proposal.path,
-          path: proposal.path,
-          accepted: true,
-        });
+    vscode.commands.registerCommand("orbweaver.newSession", async () => {
+      try {
+        const created = await createSession();
+        sessions = [created, ...sessions.filter((s) => s.id !== created.id)];
+        tree.refresh(sessions);
+        await bindSession(created.id, { history: false });
+        chat.showHistory([]);
+        chat.setStopped(false);
+        await vscode.commands.executeCommand("orbweaver.chat.focus");
+      } catch (e) {
+        vscode.window.showErrorMessage(String(e));
       }
-      vscode.window.activeTextEditor?.setDecorations(added, []);
-      vscode.window.activeTextEditor?.setDecorations(removed, []);
     }),
-    vscode.commands.registerCommand("orbweaver.rejectDiff", async () => {
-      if (!lastPatch || !sessionId) return;
-      await request("POST", `/v1/sessions/${sessionId}/correction`, {
-        text: "rejected patch for " + lastPatch.proposal.path,
-        path: lastPatch.proposal.path,
-        accepted: false,
-      });
-      vscode.window.activeTextEditor?.setDecorations(added, []);
-      vscode.window.activeTextEditor?.setDecorations(removed, []);
-    }),
-    vscode.commands.registerCommand("orbweaver.openPlan", async () => {
-      const uris = await vscode.window.showOpenDialog({
-        canSelectMany: false,
-        filters: { Plans: ["md", "html", "markdown"] },
-      });
-      if (!uris?.[0]) return;
-      const doc = await vscode.workspace.openTextDocument(uris[0]);
-      if (uris[0].path.endsWith(".html")) {
-        const panel = vscode.window.createWebviewPanel(
-          "orbweaver.plan",
-          path.basename(uris[0].fsPath),
-          vscode.ViewColumn.Beside,
-          { enableScripts: true }
+    vscode.commands.registerCommand("orbweaver.refreshSessions", async () => {
+      try {
+        await refreshSessions();
+        if (sessionId) chat.setTitle(
+          sessions.find((s) => s.id === sessionId)?.title || "Chat",
+          sessions.find((s) => s.id === sessionId)?.workspace_uri || readConfig().workspaceUri
         );
-        panel.webview.html = doc.getText();
-      } else {
-        await vscode.window.showTextDocument(doc);
+      } catch (e) {
+        vscode.window.showErrorMessage(String(e));
       }
-    })
+    }),
+    vscode.commands.registerCommand("orbweaver.openSession", async (id: string) => {
+      try {
+        if (!sessions.length) await refreshSessions();
+        await bindSession(id);
+        await vscode.commands.executeCommand("orbweaver.chat.focus");
+      } catch (e) {
+        vscode.window.showErrorMessage(String(e));
+      }
+    }),
+    vscode.commands.registerCommand("orbweaver.renameSession", async (row?: SessionRow) => {
+      const id = row?.id || sessionId;
+      if (!id) return;
+      const current = sessions.find((s) => s.id === id);
+      const next = await vscode.window.showInputBox({
+        prompt: "Rename chat",
+        value: current?.title || "",
+      });
+      if (!next?.trim()) return;
+      await renameSession(id, next.trim());
+      await refreshSessions();
+    }),
+    vscode.commands.registerCommand("orbweaver.send", async (text?: string) => {
+      try {
+        const sid = await ensureSession();
+        const body = (text || "").trim();
+        if (!body) return;
+        chat.setBusy(true);
+        chat.setStopped(false);
+        chat.showEvent({ kind: "user", payload: { text: body } });
+        if (socket.sessionId !== sid) await socket.connect(sid);
+        socket.sendTurn(body);
+      } catch (e) {
+        chat.setBusy(false);
+        chat.showError(String(e));
+      }
+    }),
+    vscode.commands.registerCommand("orbweaver.continue", async () => {
+      const sid = sessionId;
+      if (!sid) return;
+      chat.setBusy(true);
+      chat.setStopped(false);
+      try {
+        if (socket.sessionId !== sid) await socket.connect(sid);
+        await continueTurn(sid);
+      } catch (e) {
+        chat.setBusy(false);
+        chat.showError(String(e));
+      }
+    }),
+    vscode.commands.registerCommand("orbweaver.acceptDiff", (filePath?: string) => diffs.accept(filePath)),
+    vscode.commands.registerCommand("orbweaver.rejectDiff", (filePath?: string) => diffs.reject(filePath)),
+    vscode.commands.registerCommand("orbweaver.openDiff", (filePath?: string) => diffs.openDiff(filePath)),
+    vscode.commands.registerCommand("orbweaver.openPlan", () => plans.pickOrOpen()),
+    vscode.commands.registerCommand("orbweaver.newPlan", () => plans.create("md")),
+    vscode.commands.registerCommand("orbweaver.newHtmlPlan", () => plans.create("html")),
+    vscode.commands.registerCommand("orbweaver.previewPlan", () => plans.showPreview())
   );
+
+  refreshSessions()
+    .then(async (rows) => {
+      if (sessionId && rows.some((s) => s.id === sessionId)) {
+        await bindSession(sessionId);
+        return;
+      }
+      if (rows[0]) await bindSession(rows[0].id);
+    })
+    .catch((e) => chat.showError(String(e)));
 }
 
 export function deactivate() {}
+
+function chatHtml(): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: var(--vscode-editor-background) }
+  body {
+    font-family: var(--vscode-font-family);
+    color: var(--vscode-foreground);
+    margin: 0; display: flex; flex-direction: column; height: 100vh;
+  }
+  #meta { padding: 0.5rem 0.7rem 0.35rem; font-size: 0.75rem; opacity: 0.75; }
+  #log { flex: 1; overflow: auto; padding: 0.4rem 0.7rem 0.8rem; }
+  .msg { margin: 0.4rem 0; padding: 0.45rem 0.55rem; border-radius: 6px;
+    background: var(--vscode-editor-background); border-left: 3px solid #888; white-space: pre-wrap; }
+  .user { border-left-color: var(--vscode-button-background); }
+  .assistant { border-left-color: #c4a574; }
+  .tool { opacity: 0.8; font-size: 0.85em; }
+  .error { border-left-color: #c05050; }
+  #patches { padding: 0 0.7rem; }
+  .patch { display: flex; gap: 0.35rem; align-items: center; margin: 0.25rem 0; font-size: 0.8rem; }
+  .patch span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #composer { display: flex; flex-direction: column; gap: 0.35rem; padding: 0.55rem 0.7rem 0.8rem;
+    border-top: 1px solid var(--vscode-widget-border); }
+  textarea { width: 100%; min-height: 4rem; resize: vertical; box-sizing: border-box;
+    background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border); padding: 0.4rem; }
+  .row { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+  button { font: inherit; background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground); border: 0; padding: 0.3rem 0.55rem; border-radius: 4px; }
+  button.ghost { background: transparent; color: var(--vscode-foreground);
+    border: 1px solid var(--vscode-widget-border); }
+  button:disabled { opacity: 0.45; }
+</style>
+</head>
+<body>
+  <div id="meta">No session</div>
+  <div id="log"></div>
+  <div id="patches"></div>
+  <div id="composer">
+    <textarea id="t" placeholder="Message (Enter to send, Shift+Enter newline)"></textarea>
+    <div class="row">
+      <button id="send">Send</button>
+      <button id="stop" class="ghost" disabled>Stop</button>
+      <button id="inject" class="ghost" disabled>Add to turn</button>
+      <button id="cont" class="ghost" disabled>Continue</button>
+    </div>
+  </div>
+<script>
+const vscode = acquireVsCodeApi();
+const log = document.getElementById("log");
+const meta = document.getElementById("meta");
+const patches = document.getElementById("patches");
+const t = document.getElementById("t");
+let busy = false;
+let stopped = false;
+function add(kind, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + kind;
+  d.textContent = (kind === "tool" || kind === "error" ? kind + ": " : "") + text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+function renderEvent(ev) {
+  const p = ev.payload || {};
+  if (ev.kind === "user" || ev.kind === "assistant") add(ev.kind, p.text || "");
+  else if (ev.kind === "turn_aborted" || ev.kind === "cron_result") add("assistant", p.text || JSON.stringify(p));
+  else if (ev.kind === "turn_interrupted") add("assistant", "Stopped");
+  else if (ev.kind === "tool_call") add("tool", (p.name || "tool") + " " + JSON.stringify(p.input || {}).slice(0, 240));
+  else if (ev.kind === "patch_proposal") add("tool", "patch " + ((typeof p.content === "string" ? "" : (p.content || {}).path) || ""));
+  else if (ev.kind === "subscribed" || ev.kind === "turn_done") return;
+  else add("tool", ev.kind);
+}
+function paintPatches(list) {
+  patches.replaceChildren();
+  (list || []).forEach((path) => {
+    const row = document.createElement("div");
+    row.className = "patch";
+    const name = document.createElement("span");
+    name.textContent = path;
+    const open = document.createElement("button");
+    open.className = "ghost"; open.textContent = "Diff";
+    open.onclick = () => vscode.postMessage({ type: "openDiff", path });
+    const acc = document.createElement("button");
+    acc.textContent = "Accept";
+    acc.onclick = () => vscode.postMessage({ type: "accept", path });
+    const rej = document.createElement("button");
+    rej.className = "ghost"; rej.textContent = "Reject";
+    rej.onclick = () => vscode.postMessage({ type: "reject", path });
+    row.append(name, open, acc, rej);
+    patches.appendChild(row);
+  });
+}
+function sync() {
+  document.getElementById("send").textContent = busy ? "…" : "Send";
+  document.getElementById("send").disabled = busy;
+  document.getElementById("stop").disabled = !busy;
+  document.getElementById("inject").disabled = !busy || !t.value.trim();
+  document.getElementById("cont").disabled = busy || !stopped;
+}
+document.getElementById("send").onclick = () => {
+  const text = t.value.trim();
+  if (!text || busy) return;
+  vscode.postMessage({ type: "send", text });
+  t.value = "";
+  sync();
+};
+document.getElementById("stop").onclick = () => vscode.postMessage({ type: "stop" });
+document.getElementById("inject").onclick = () => {
+  const text = t.value.trim();
+  if (!text) return;
+  vscode.postMessage({ type: "inject", text });
+  t.value = "";
+  sync();
+};
+document.getElementById("cont").onclick = () => vscode.postMessage({ type: "continue" });
+t.addEventListener("input", sync);
+t.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    if (busy) document.getElementById("inject").click();
+    else document.getElementById("send").click();
+  }
+});
+window.addEventListener("message", (e) => {
+  const m = e.data || {};
+  if (m.type === "history") {
+    log.replaceChildren();
+    (m.events || []).forEach(renderEvent);
+  } else if (m.type === "event") renderEvent(m.event);
+  else if (m.type === "error") add("error", m.text || "error");
+  else if (m.type === "busy") { busy = !!m.busy; stopped = !!m.stopped; sync(); }
+  else if (m.type === "meta") meta.textContent = (m.title || "Chat") + " · " + (m.workspaceUri || "");
+  else if (m.type === "patches") paintPatches(m.patches || []);
+});
+vscode.postMessage({ type: "ready" });
+sync();
+</script>
+</body></html>`;
+}
