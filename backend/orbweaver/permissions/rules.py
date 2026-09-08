@@ -214,11 +214,13 @@ def is_protected_git_push(command: str) -> bool:
 def path_is_always_denied(rel: str) -> bool:
     name = Path(rel).name.lower()
     parts = Path(rel).parts
+    lowered = [p.lower() for p in parts]
     if name in ALWAYS_DENY_NAMES:
+        return True
+    if name == "mcp.json" and ".orbweaver" in lowered:
         return True
     if name.endswith((".pem", ".key")):
         return True
-    lowered = [p.lower() for p in parts]
     if ".ssh" in lowered or ".gnupg" in lowered:
         return True
     return str(rel).startswith("/etc") or "/etc/" in str(rel)

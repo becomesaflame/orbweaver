@@ -67,6 +67,10 @@ def summarize_input(name: str, inp: dict[str, Any]) -> str:
         return str(inp.get("id") or "")[:240]
     if name == "SpawnSubagent":
         return str(inp.get("task") or "")[:240]
+    if name.startswith("mcp_"):
+        from orbweaver.permissions.rules import json_fallback
+
+        return json_fallback(inp)[:240]
     return name
 
 

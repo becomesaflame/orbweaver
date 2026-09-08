@@ -537,6 +537,15 @@ def tools_for_channel(
     return [t for t in spec if t.get("name") != PROPOSE_PATCH_TOOL]
 
 
+async def session_tools(workspace=None, channel: str | None = None) -> list[dict[str, Any]]:
+    """Built-in tools (channel-filtered) plus tools from configured MCP servers."""
+    from orbweaver.mcp import mcp_tool_specs
+
+    extra = await mcp_tool_specs(workspace)
+    base = list(TOOL_SPEC) if channel is None else tools_for_channel(channel)
+    return base + extra
+
+
 def _events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     """Build Anthropic messages from a (possibly projected) event list."""
     return events_to_messages(events)
@@ -585,8 +594,10 @@ def static_system(channel: str = "") -> str:
         "one round. Prefer Read offset/limit and Grep (ripgrep) over Bash for paging files. "
         "Use WebSearch to find sources, then WebFetch a few result URLs; do not guess "
         "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
-        "Finish with a user-visible answer before the tool-round budget runs out; "
-        "spawn a subagent for a long exploration instead of burning parent rounds."
+        "Configured MCP servers appear as mcp_<server>_<tool> and use the "
+        "same permission pipeline as other tools. Finish with a user-visible answer "
+        "before the tool-round budget runs out; spawn a subagent for a long exploration "
+        "instead of burning parent rounds."
     )
 
 
@@ -840,6 +851,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         from orbweaver.channels.telegram import generate_and_maybe_send
 
         return await generate_and_maybe_send(ctx, inp)
+    if name.startswith("mcp_"):
+        from orbweaver.mcp import call_mcp_tool
+
+        return await call_mcp_tool(name, inp, ws)
     return f"unknown tool {name}"
 
 
@@ -1027,7 +1042,9 @@ async def agent_turn(
         skills=workspace_skills_prompt(workspace),
         channel=resolved_channel,
     )
-    active_tools = tools if tools is not None else tools_for_channel(resolved_channel)
+    active_tools = (
+        tools if tools is not None else await session_tools(workspace, resolved_channel)
+    )
     if not resume:
         await maybe_compact(
             store, session_id, client=client, workspace=workspace, system=system
