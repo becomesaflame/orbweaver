@@ -227,13 +227,24 @@ TOOL_SPEC = [
     },
     {
         "name": "ScheduleTask",
-        "description": "Ask the host to schedule a job (ISO-8601 due_at).",
+        "description": (
+            "Ask the host to schedule a job. due_at is ISO-8601. "
+            "Optional recurrence: minute, hour, or day (also 'every hour'), "
+            "or a 5-field cron expression (minute hour day-of-month month "
+            "day-of-week), e.g. '0 9 * * mon'. Omit recurrence for a one-shot."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "due_at": {"type": "string"},
                 "message": {"type": "string"},
-                "recurrence": {"type": "string"},
+                "recurrence": {
+                    "type": "string",
+                    "description": (
+                        "minute/hour/day, or 5-field cron "
+                        "(minute hour day month weekday)."
+                    ),
+                },
             },
             "required": ["due_at", "message"],
         },
@@ -488,11 +499,21 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
                 due = due.replace(tzinfo=UTC)
         except ValueError as e:
             return f"invalid due_at: {e}"
+        rec = inp.get("recurrence")
+        if rec:
+            from orbweaver.channels.cron import _parse_recurrence
+
+            if _parse_recurrence(str(rec), due) is None:
+                return (
+                    "invalid recurrence: use minute, hour, day "
+                    "(or 'every hour'), or a 5-field cron expression "
+                    "like '0 9 * * mon'"
+                )
         job = Job(
             id=new_uuid(),
             due_at=due,
             payload={"message": inp.get("message") or ""},
-            recurrence=inp.get("recurrence"),
+            recurrence=rec,
             session_id=session_id,
         )
         await store.put_job(job)
