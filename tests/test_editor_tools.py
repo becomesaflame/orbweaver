@@ -151,6 +151,38 @@ async def test_readlints_configured_linter(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_readlints_configured_linter_survives_bwrap_eperm(tmp_path, monkeypatch):
+    """CI runners reject bwrap loopback setup; stdout must still be parsed."""
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("src/ok.py", "x = 1\n")
+    monkeypatch.setattr(settings, "orbweaver_linter", "echo {paths}:2:1: stub lint")
+    orig = ws.bash
+
+    def bash(command, timeout=30, sandbox=True, unsandboxed=False, permissions=None):
+        if sandbox and not unsandboxed:
+            return (
+                "sandbox_unavailable: bwrap: loopback: Failed RTM_NEWADDR: "
+                "Operation not permitted"
+            )
+        return orig(
+            command,
+            timeout=timeout,
+            sandbox=False,
+            unsandboxed=unsandboxed,
+            permissions=permissions,
+        )
+
+    ws.bash = bash
+    result = await run_tools("ReadLints", {"paths": ["src/ok.py"]}, _ctx(store, ws, sid))
+    body = json.loads(result)
+    assert body["diagnostics"]
+    assert body["diagnostics"][0]["message"] == "stub lint"
+    assert body["diagnostics"][0]["line"] == 2
+
+
+@pytest.mark.asyncio
 async def test_readlints_defaults_to_recent_edits(tmp_path):
     store = reset_store_for_tests()
     sid = uuid4()

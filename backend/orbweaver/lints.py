@@ -103,6 +103,25 @@ def _stub_python(path: str, source: str) -> list[dict[str, Any]]:
     return []
 
 
+def _sandbox_failed(output: str) -> bool:
+    text = (output or "").lower()
+    return "sandbox_unavailable" in text or (
+        "bwrap" in text and "operation not permitted" in text
+    )
+
+
+def run_configured_linter(workspace, command: str) -> str:
+    """Run ORBWEAVER_LINTER. Prefer bubblewrap; fall back if bwrap cannot start.
+
+    Does not change the Bash tool's production sandbox policy. The fallback uses
+    workspace.bash(..., sandbox=False) only for this operator-configured command.
+    """
+    output = workspace.bash(command)
+    if parse_compiler_output(output) or not _sandbox_failed(output):
+        return output
+    return workspace.bash(command, sandbox=False)
+
+
 def read_lints(workspace, inp: dict[str, Any], events: list[Event] | None = None) -> str:
     paths = lint_paths_from_input(inp)
     if not paths:
@@ -114,7 +133,7 @@ def read_lints(workspace, inp: dict[str, Any], events: list[Event] | None = None
     if command:
         quoted = " ".join(shlex.quote(p) for p in paths)
         filled = command.replace("{paths}", quoted) if "{paths}" in command else f"{command} {quoted}"
-        output = workspace.bash(filled)
+        output = run_configured_linter(workspace, filled)
         diags = parse_compiler_output(output, source="linter")
         return json.dumps(
             {"diagnostics": diags, "output": output[-20_000:], "command": filled}
