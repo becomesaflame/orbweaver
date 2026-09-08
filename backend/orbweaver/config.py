@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     orbweaver_image_api_url: str = "https://api.openai.com/v1/images/generations"
     orbweaver_image_model: str = "dall-e-3"
     orbweaver_image_size: str = "1024x1024"
+    orbweaver_linter: str = ""  # e.g. ruff check {paths} ; empty uses the Python AST stub
     orbweaver_search_provider: str = ""  # duckduckgo | brave | empty auto
     orbweaver_brave_api_key: str = ""
     brave_search_api_key: str = ""
