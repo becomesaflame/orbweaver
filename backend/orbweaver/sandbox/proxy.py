@@ -62,7 +62,7 @@ def resolve_unblocked(hostname: str, port: int) -> list[tuple[socket.AddressFami
     infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     ok: list[tuple[socket.AddressFamily, tuple]] = []
     for fam, _kind, _proto, _canon, sockaddr in infos:
-        ip = sockaddr[0]
+        ip = str(sockaddr[0])
         if ip_is_blocked(ip):
             continue
         ok.append((fam, sockaddr))

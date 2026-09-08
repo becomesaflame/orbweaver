@@ -12,7 +12,16 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,7 +32,7 @@ from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel
 from orbweaver.auth import mint_token, require_user
 from orbweaver.config import settings
 from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
-from orbweaver.ratelimit import get_rate_limiter
+from orbweaver.ratelimit import FileRateLimiter, get_rate_limiter
 from orbweaver.store import (
     SESSION_TYPE,
     Entity,
@@ -41,6 +50,7 @@ from orbweaver.uris import (
     validate_workspace_uri,
 )
 from orbweaver.workspace import bind_workspace, normalize_workspace_kind
+
 
 def _web_dir() -> Path:
     env = os.environ.get("ORBWEAVER_WEB_DIR")
@@ -145,7 +155,7 @@ async def rate_limit(request: Request, call_next):
         return await call_next(request)
     key = _rate_limit_key(request)
     limiter = get_rate_limiter()
-    if hasattr(limiter, "max_hits"):
+    if isinstance(limiter, FileRateLimiter):
         limiter.max_hits = _RATE_LIMIT_MAX
         limiter.window_seconds = _RATE_LIMIT_WINDOW_S
     if not await limiter.hit(str(key)):
@@ -364,8 +374,9 @@ async def put_entity(body: EntityBody, _u: dict = Depends(_user)) -> dict[str, s
     ent = Entity(id=uid, at_id=str(at_id), at_type=str(at_type), jsonld=jsonld, pinned=body.pinned)
     try:
         if body.pinned:
-            from orbweaver.store import ensure_pin_budget
             import json as _j
+
+            from orbweaver.store import ensure_pin_budget
 
             await ensure_pin_budget(store, extra_text=_j.dumps(jsonld))
         await store.put_entity(ent)

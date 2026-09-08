@@ -7,15 +7,9 @@ from uuid import UUID
 from orbweaver.embeddings import embed_text
 from orbweaver.store import (
     Chunk,
-    Entity,
-    PinBudgetError,
     Store,
-    agent_at_id,
     new_uuid,
-    session_at_id,
 )
-from orbweaver.tokens import estimate_tokens
-from orbweaver.uris import validate_workspace_uri
 
 
 async def pinned_prompt(store: Store) -> str:
