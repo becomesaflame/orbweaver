@@ -77,6 +77,7 @@ async function ensureSession(): Promise<string> {
     workspace_uri: workspaceUri(),
     workspace_kind: "local",
     title: vscode.workspace.name || "vscode",
+    channel: "vscode",
   });
   sessionId = created.id;
   return sessionId!;

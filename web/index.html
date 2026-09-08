@@ -680,7 +680,8 @@
         body: JSON.stringify({
           workspace_uri: uri || $("wuri").value,
           workspace_kind: "local",
-          title: "New chat"
+          title: "New chat",
+          channel: "web"
         })
       });
       const session = {

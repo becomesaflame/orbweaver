@@ -339,6 +339,55 @@ TOOL_SPEC = [
     },
 ]
 
+PROPOSE_PATCH_TOOL = "ProposePatch"
+VSCODE_CHANNEL = "vscode"
+
+
+def normalize_channel(value: str | None) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-").replace(" ", "")
+    if raw in {"vscode", "vs-code", "visualstudiocode"}:
+        return VSCODE_CHANNEL
+    return raw
+
+
+def resolve_channel(
+    jsonld: dict[str, Any] | None = None,
+    *,
+    channel: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Client channel for tool/prompt filtering. Only vscode keeps ProposePatch."""
+    if channel and str(channel).strip():
+        return normalize_channel(channel)
+    extra = extra or {}
+    extra_ch = extra.get("channel") or extra.get("client")
+    if extra_ch and str(extra_ch).strip():
+        return normalize_channel(str(extra_ch))
+    jsonld = jsonld or {}
+    stored = jsonld.get("channel") or jsonld.get("client")
+    if stored and str(stored).strip():
+        return normalize_channel(str(stored))
+    if jsonld.get("telegram_user_id") is not None or jsonld.get("telegram_chat_id") is not None:
+        return "telegram"
+    title = str(jsonld.get("title") or "").strip().lower()
+    if title == "vscode" or title.startswith("vscode:") or title.startswith("vscode/"):
+        return VSCODE_CHANNEL
+    return ""
+
+
+def channel_allows_proposepatch(channel: str) -> bool:
+    return normalize_channel(channel) == VSCODE_CHANNEL
+
+
+def tools_for_channel(
+    channel: str,
+    tool_spec: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    spec = list(tool_spec if tool_spec is not None else TOOL_SPEC)
+    if channel_allows_proposepatch(channel):
+        return spec
+    return [t for t in spec if t.get("name") != PROPOSE_PATCH_TOOL]
+
 
 def _events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     """Build Anthropic messages from a (possibly projected) event list."""
@@ -367,17 +416,20 @@ def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dic
     return messages
 
 
-def static_system() -> str:
+def static_system(channel: str = "") -> str:
+    write_line = "In auto mode, in-project Write applies immediately. "
+    if channel_allows_proposepatch(channel):
+        write_line += "Prefer ProposePatch when a visible diff overlay helps the user. "
     return (
         f"You are Orbweaver, a coding agent. The running gateway is Orbweaver {__version__} "
         f"(semantic version). If asked what version is running, answer {__version__}. "
         "Use tools to read and patch the workspace. Sandboxed Bash can read host files; "
         "do not set permissions [\"all\"] just to inspect logs or journals. "
-        "In auto mode, in-project Write and Delete apply immediately. Prefer ProposePatch "
-        "when a visible diff overlay helps the user. TodoWrite keeps the plan on this "
-        "session across compaction. After edits, ReadLints for diagnostics. Use "
-        "MemorySearch when past decisions might matter. Keep pins small. If the sandbox "
-        "cannot run a command, ask the user "
+        f"{write_line}"
+        "In auto mode, in-project Delete applies immediately. TodoWrite keeps the plan "
+        "on this session across compaction. After edits, ReadLints for diagnostics. "
+        "Use MemorySearch when past decisions might "
+        "matter. Keep pins small. If the sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
         "stay blocked; do not route around them. Call independent tools in parallel in "
         "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
@@ -387,14 +439,16 @@ def static_system() -> str:
     )
 
 
-def build_agent_system(pins: str, extra: str = "", skills: str = "") -> list[dict[str, Any]]:
+def build_agent_system(
+    pins: str, extra: str = "", skills: str = "", channel: str = ""
+) -> list[dict[str, Any]]:
     rest = pins or "(no pinned memory)"
     if skills:
         rest = rest + "\n\n" + skills
     if extra:
         rest = rest + "\n\n" + extra
     return [
-        {"type": "text", "text": static_system(), "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": static_system(channel), "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": rest},
     ]
 
@@ -609,6 +663,7 @@ async def agent_turn(
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     subagent_depth: int = 0,
     images: list[dict[str, str]] | None = None,
+    channel: str | None = None,
 ) -> list[Event]:
     _raise_if_cancelled(cancel)
     if resume:
@@ -669,6 +724,8 @@ async def agent_turn(
     client = anthropic.AsyncAnthropic(
         api_key=settings.anthropic_api_key, default_headers=headers or None
     )
+    sess = await store.get_entity(session_id)
+    resolved_channel = resolve_channel(sess.jsonld if sess else None, channel=channel)
     denial_state = denial_state_for(session_id)
     ctx = {
         "workspace": workspace,
@@ -682,10 +739,16 @@ async def agent_turn(
         "cancel": cancel,
         "fire": fire,
         "subagent_depth": subagent_depth,
+        "channel": resolved_channel,
     }
     pins = await pinned_prompt(store)
-    system = build_agent_system(pins, system_extra, skills=workspace_skills_prompt(workspace))
-    active_tools = tools if tools is not None else TOOL_SPEC
+    system = build_agent_system(
+        pins,
+        system_extra,
+        skills=workspace_skills_prompt(workspace),
+        channel=resolved_channel,
+    )
+    active_tools = tools if tools is not None else tools_for_channel(resolved_channel)
     if not resume:
         await maybe_compact(
             store, session_id, client=client, workspace=workspace, system=system

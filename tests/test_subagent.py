@@ -91,6 +91,9 @@ async def test_spawn_creates_hidden_child_session(tmp_path, ws, monkeypatch, aut
     names = {t["name"] for t in captured["kwargs"]["tools"]}
     assert CHILD_BLOCKED_TOOLS.isdisjoint(names)
     assert "Read" in names
+    assert "ProposePatch" not in names
+    assert "Write" in names
+    assert child.jsonld.get("channel") in {None, ""}
     parent_kinds = [e.kind for e in await store.list_events(sid)]
     assert "subagent_started" in parent_kinds
     assert "subagent_finished" in parent_kinds
@@ -231,3 +234,31 @@ def test_parent_tool_spec_still_includes_spawn():
     assert "Delete" in names
     assert "TodoWrite" in names
     assert "ReadLints" in names
+    assert "ProposePatch" in names
+
+
+@pytest.mark.asyncio
+async def test_vscode_parent_subagent_keeps_proposepatch(ws, monkeypatch):
+    store = reset_store_for_tests()
+    captured = {}
+
+    async def fake_turn(store, session_id, user_text, workspace, **kwargs):
+        captured["kwargs"] = kwargs
+        await store.append_event(session_id, "assistant", {"text": "patched"})
+        return []
+
+    monkeypatch.setattr("orbweaver.agent.agent_turn", fake_turn)
+    sid = uuid4()
+    await store.put_entity(_parent_entity(store, sid, channel="vscode"))
+    result = await run_tools(
+        "SpawnSubagent",
+        {"task": "edit files", "label": "edit"},
+        _ctx(store, ws, sid, channel="vscode"),
+    )
+    body = json.loads(result)
+    child = await store.get_entity(UUID(body["child_session_id"]))
+    assert child.jsonld["channel"] == "vscode"
+    names = {t["name"] for t in captured["kwargs"]["tools"]}
+    assert "ProposePatch" in names
+    assert "SpawnSubagent" not in names
+    assert captured["kwargs"]["channel"] == "vscode"
