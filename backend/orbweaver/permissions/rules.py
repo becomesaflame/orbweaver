@@ -19,6 +19,7 @@ SAFE_ALLOWLIST = frozenset(
         "MemoryRemember",
         "MemoryPin",
         "MemoryForget",
+        "WorkspaceSearch",
         "SendPhoto",
         "GenerateImage",
         "WebSearch",
@@ -104,7 +105,7 @@ def _subject(tool: str, inp: dict[str, Any]) -> str:
         return str(inp.get("prompt") or inp.get("path") or "")
     if tool == "WebFetch":
         return str(inp.get("url") or "")
-    if tool == "WebSearch":
+    if tool in {"WebSearch", "WorkspaceSearch", "MemorySearch"}:
         return str(inp.get("query") or "")
     if tool == "SpawnSubagent":
         return str(inp.get("task") or "")

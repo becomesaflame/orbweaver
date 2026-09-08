@@ -1,8 +1,11 @@
+import json
+
 import pytest
 
 from orbweaver.config import settings
-from orbweaver.memory import remember, rewrite_search_query
-from orbweaver.store import Event, PinBudgetError, reset_store_for_tests, new_uuid
+from orbweaver.agent import run_tools
+from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
+from orbweaver.store import Entity, Event, PinBudgetError, reset_store_for_tests, new_uuid
 from orbweaver.tokens import estimate_tokens
 
 
@@ -56,3 +59,56 @@ def test_search_query_uses_conversation():
 
 def test_token_estimate():
     assert estimate_tokens("abcd") >= 1
+
+
+@pytest.mark.asyncio
+async def test_search_expands_graph_neighbors(store):
+    eid = new_uuid()
+    project = "urn:orbweaver:entity:project-airbed"
+    await store.put_entity(
+        Entity(
+            id=eid,
+            at_id="urn:orbweaver:entity:decision-1",
+            at_type="Decision",
+            jsonld={
+                "@id": "urn:orbweaver:entity:decision-1",
+                "@type": "Decision",
+                "about": project,
+            },
+        )
+    )
+    await remember(
+        store, "chose LocalWorkspace for Telegram sessions", source="test", entity_ids=[eid]
+    )
+    hits = await store.search_chunks("chose LocalWorkspace for Telegram sessions", k=3)
+    graph = await expand_chunk_graph(store, hits)
+    assert any(g["o"] == project and g["p"] == "about" for g in graph)
+
+
+@pytest.mark.asyncio
+async def test_memory_search_tool_includes_graph(store):
+    eid = new_uuid()
+    project = "urn:orbweaver:entity:project-airbed"
+    await store.put_entity(
+        Entity(
+            id=eid,
+            at_id="urn:orbweaver:entity:decision-2",
+            at_type="Decision",
+            jsonld={
+                "@id": "urn:orbweaver:entity:decision-2",
+                "@type": "Decision",
+                "about": project,
+            },
+        )
+    )
+    await remember(store, "pin budget is four thousand tokens", entity_ids=[eid])
+    sid = new_uuid()
+    ctx = {"workspace": None, "store": store, "session_id": sid}
+    expanded = await run_tools("MemorySearch", {"query": "pin budget tokens"}, ctx)
+    body = json.loads(expanded)
+    assert body["chunk_ids"]
+    assert any(g["o"] == project for g in body["graph"])
+    skipped = await run_tools(
+        "MemorySearch", {"query": "pin budget tokens", "expand_graph": False}, ctx
+    )
+    assert json.loads(skipped)["graph"] == []

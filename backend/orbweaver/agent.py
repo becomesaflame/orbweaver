@@ -163,11 +163,40 @@ TOOL_SPEC = [
         },
     },
     {
-        "name": "MemorySearch",
-        "description": "Search shared memory using the conversation plus current query.",
+        "name": "WorkspaceSearch",
+        "description": (
+            "Hybrid search over project source files in the session workspace. Indexes text "
+            "files on demand (skips binaries, huge files, .git, and gitignored paths). Use "
+            "this to find where something is implemented. Do not MemoryRemember every file. "
+            "MemorySearch is only for stored facts, not source."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {"query": {"type": "string"}},
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {
+                    "type": "integer",
+                    "description": "How many hits to return (default 8, max 20).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "MemorySearch",
+        "description": (
+            "Search shared memory (remembered facts), not project source. Use WorkspaceSearch "
+            "to find code. Graph neighbors of hit chunks are included unless expand_graph is false."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "expand_graph": {
+                    "type": "boolean",
+                    "description": "Include JSON-LD neighbors of matching chunks (default true).",
+                },
+            },
             "required": ["query"],
         },
     },
@@ -308,8 +337,9 @@ def static_system() -> str:
         "Use tools to read and patch the workspace. Sandboxed Bash can read host files; "
         "do not set permissions [\"all\"] just to inspect logs or journals. "
         "In auto mode, in-project Write applies immediately. Prefer ProposePatch when a "
-        "visible diff overlay helps the user. Use MemorySearch when past decisions might "
-        "matter. Keep pins small. If the sandbox cannot run a command, ask the user "
+        "visible diff overlay helps the user. Use WorkspaceSearch to find code in the "
+        "workspace. Use MemorySearch when past decisions or stored facts might matter. "
+        "Keep pins small. If the sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
         "stay blocked; do not route around them. Call independent tools in parallel in "
         "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
@@ -382,7 +412,13 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         from orbweaver.websearch import run_websearch
 
         return run_websearch(inp)
+    if name == "WorkspaceSearch":
+        from orbweaver.codesearch import run_workspace_search
+
+        return run_workspace_search(ws, inp)
     if name == "MemorySearch":
+        from orbweaver.memory import expand_chunk_graph
+
         events = live_events(await store.list_events(session_id))
         already = set()
         for ev in events:
@@ -392,12 +428,22 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         hits = await store.search_chunks(q, k=8)
         lines = []
         ids = []
+        kept: list[tuple] = []
         for c, score in hits:
             if str(c.id) in already:
                 continue
             ids.append(str(c.id))
+            kept.append((c, score))
             lines.append(f"[{c.id} score={score:.3f}] {c.text}")
-        return json.dumps({"chunk_ids": ids, "text": "\n".join(lines) or "(no hits)"})
+        expand = inp.get("expand_graph", True)
+        graph = await expand_chunk_graph(store, kept) if expand else []
+        return json.dumps(
+            {
+                "chunk_ids": ids,
+                "text": "\n".join(lines) or "(no hits)",
+                "graph": graph,
+            }
+        )
     if name == "MemoryRemember":
         from orbweaver.store import PinBudgetError
 
