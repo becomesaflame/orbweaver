@@ -81,7 +81,7 @@ async def mcp_tool_specs(workspace=None, *, config: McpConfig | None = None) -> 
             continue
         try:
             tools = await session.list_tools()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log.warning("MCP server %s tools/list failed: %s", spec.name, e)
             continue
         for tool in tools:

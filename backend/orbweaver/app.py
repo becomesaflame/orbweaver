@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from orbweaver import __version__
-from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel
+from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel, pending_ask_user
 from orbweaver.auth import mint_token, require_user
 from orbweaver.config import settings
 from orbweaver.memory import remember, rewrite_search_query
@@ -580,15 +580,29 @@ async def _run_turn(
             cancel=state.cancel,
             turn_state=state,
             resume=resume,
+            interactive=True,
         )
         if state.cancel.is_set():
             result = await _finish_cancelled_turn(store, sess, state, events, user_text)
         else:
+            stored = await store.list_events(session_id)
+            pending = pending_ask_user(stored)
+            status = "waiting_ask" if pending else "ok"
+            question = ""
+            if pending:
+                question = str((pending.payload or {}).get("input", {}).get("question") or "")
+                if not question:
+                    for ev in reversed(stored):
+                        if ev.kind == "ask_user":
+                            question = str((ev.payload or {}).get("question") or "")
+                            break
             result = {
                 "events": [_event_dict(e) for e in events],
-                "status": "ok",
+                "status": status,
                 "user_seq": state.user_seq,
             }
+            if question:
+                result["question"] = question
         return result
     except TurnCancelled as e:
         result = await _finish_cancelled_turn(store, sess, state, e.produced, user_text)
@@ -649,6 +663,8 @@ async def continue_turn(session_id: UUID, _u: dict = Depends(_user)) -> dict[str
     events = await store.list_events(session_id)
     if not events:
         raise HTTPException(400, "nothing to continue")
+    if pending_ask_user(events):
+        raise HTTPException(400, "answer the pending AskUser question first")
     return await _run_turn(store, sess, session_id, "", resume=True)
 
 

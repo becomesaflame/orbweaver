@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Local stdio MCP server for tests. No network, no third-party credentials."""
 
 from __future__ import annotations
