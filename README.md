@@ -38,6 +38,24 @@ export DATABASE_URL=postgresql://orbweaver:orbweaver@localhost:5432/orbweaver
 
 `docker compose up` also starts the gateway with a workspace bind mount.
 
+### Hindsight (optional)
+
+Long-term facts can go to a sibling [Hindsight](https://hindsight.vectorize.io) service. Pins, session events, and JSON-LD stay in Orbweaver. Set:
+
+```bash
+export HINDSIGHT_API_URL=http://127.0.0.1:8888
+export HINDSIGHT_API_KEY=...          # same tenant key as the Hindsight server
+export HINDSIGHT_BANK_ID=personal     # every harness must use this bank
+```
+
+```bash
+docker compose --profile hindsight up -d
+# gateway on the same compose network:
+export HINDSIGHT_API_URL=http://hindsight:8888
+```
+
+Point Cursor / Claude Code at `http://127.0.0.1:8888/mcp/personal/` (or the Tailscale URL) with `Authorization: Bearer <HINDSIGHT_API_KEY>`. The gateway uses the HTTP SDK, not MCP (Orbweaver MCP is stdio-only).
+
 ### VS Code extension
 
 ```bash

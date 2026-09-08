@@ -78,3 +78,5 @@ async def test_memory_requires_jwt():
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         r = await client.post("/memory/search", json={"query": "x"})
         assert r.status_code == 401
+        r = await client.post("/memory/reflect", json={"query": "x"})
+        assert r.status_code == 401

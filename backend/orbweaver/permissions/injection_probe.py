@@ -12,7 +12,7 @@ from orbweaver.permissions.prompts import INJECTION_PROBE_SYSTEM
 log = logging.getLogger(__name__)
 
 PROBE_TOOLS = frozenset(
-    {"WebFetch", "WebSearch", "Browser", "Bash", "Read", "MemorySearch", "WorkspaceSearch"}
+    {"WebFetch", "WebSearch", "Browser", "Bash", "Read", "MemorySearch", "MemoryReflect", "WorkspaceSearch"}
 )
 MIN_CHARS = 40
 CHUNK = 4000

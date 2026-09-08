@@ -46,6 +46,7 @@ _EXACT_SECRET_NAMES = frozenset(
         "ORBWEAVER_IMAGE_API_KEY",
         "ORBWEAVER_JWT_SECRET",
         "TELEGRAM_BOT_TOKEN",
+        "HINDSIGHT_API_KEY",
     }
 )
 
@@ -82,6 +83,7 @@ def _live_secret_values() -> list[str]:
         settings.telegram_bot_token,
         settings.orbweaver_image_api_key,
         settings.database_url,
+        settings.hindsight_api_key,
     ]
     values = [v for v in raw if isinstance(v, str) and len(v) >= _MIN_LIVE_VALUE_LEN]
     values.sort(key=len, reverse=True)
