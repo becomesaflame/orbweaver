@@ -78,6 +78,8 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
         return {"url": inp.get("url")}
     if name == "WebSearch":
         return {"query": inp.get("query")}
+    if name == "MemoryGraph":
+        return {"id": inp.get("id"), "depth": inp.get("depth")}
     if name == "SpawnSubagent":
         return {"task": inp.get("task")}
     if name in {"Glob", "Grep", "AskUser", "TodoWrite"}:
