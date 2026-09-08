@@ -40,7 +40,13 @@ async def sweep() -> None:
                     await store.put_entity(sess)
                 await store.append_event(session_id, "cron", {"job_id": str(job.id)})
                 events = await agent_turn(
-                    store, session_id, message, ws, workspace_kind=kind, headless=True
+                    store,
+                    session_id,
+                    message,
+                    ws,
+                    workspace_kind=kind,
+                    headless=True,
+                    channel="cron",
                 )
                 aborted = next((e for e in events if e.kind == "turn_aborted"), None)
                 chat_id = sess.jsonld.get("telegram_chat_id")

@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from orbweaver import __version__
-from orbweaver.agent import TurnCancelled, agent_turn
+from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel
 from orbweaver.auth import mint_token, require_user
 from orbweaver.config import settings
 from orbweaver.memory import remember, rewrite_search_query
@@ -189,6 +189,7 @@ class SessionBody(BaseModel):
     workspace_uri: str
     workspace_kind: str = "local"
     title: str = "New chat"
+    channel: str | None = None
 
 
 class WorkspaceMkdirBody(BaseModel):
@@ -449,6 +450,9 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
             "created_at": datetime.now(UTC).isoformat(),
         },
     )
+    channel = normalize_channel(body.channel)
+    if channel:
+        ent.jsonld["channel"] = channel
     await get_store().put_entity(ent)
     return {"id": str(uid), "at_id": ent.at_id, "workspace_uri": uri, "title": ent.jsonld["title"]}
 
