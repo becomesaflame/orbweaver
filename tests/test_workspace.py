@@ -147,6 +147,31 @@ def test_legacy_docker_kind_becomes_local(tmp_path: Path):
     assert ws.read("x.txt") == "ok"
 
 
+def test_delete_working_set_file(tmp_path: Path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("src/gone.py", "x")
+    assert (tmp_path / "src" / "gone.py").is_file()
+    assert ws.delete("src/gone.py") == "deleted src/gone.py"
+    assert not (tmp_path / "src" / "gone.py").exists()
+    assert ws.delete("src/gone.py") == "not found: src/gone.py"
+
+
+def test_delete_denies_env_and_escape(tmp_path: Path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    (tmp_path / ".env").write_text("SECRET=1", encoding="utf-8")
+    try:
+        ws.delete(".env")
+        raise AssertionError("should have refused .env")
+    except PermissionError:
+        pass
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "SECRET=1"
+    try:
+        ws.delete("../escape.txt")
+        raise AssertionError("should have refused escape")
+    except PermissionError:
+        pass
+
+
 def test_write_and_read_bytes(tmp_path: Path):
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     rel = ws.write_bytes("attachments/a.bin", b"\x00\x01")
