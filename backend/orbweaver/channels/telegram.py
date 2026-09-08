@@ -237,7 +237,7 @@ async def _run_turn(update, context, text: str, images: list[dict[str, str]] | N
             channel="telegram",
         )
         reply = texts_for_reply(events) or "(no assistant text)"
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.exception("telegram turn failed")
         reply = f"Turn failed: {e}"[:3500]
     if update.message:
