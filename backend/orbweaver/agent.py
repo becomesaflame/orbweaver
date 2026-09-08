@@ -1012,6 +1012,17 @@ async def agent_turn(
                 try:
                     decision = await can_use_tool(block.name, dict(block.input), ctx)
                 except TurnAborted as e:
+                    fire(
+                        await store.append_event(
+                            session_id,
+                            "tool_result",
+                            {
+                                "tool_use_id": block.id,
+                                "name": block.name,
+                                "content": e.message,
+                            },
+                        )
+                    )
                     await record_abort(e)
                     return produced
                 fire(

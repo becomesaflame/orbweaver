@@ -130,6 +130,36 @@ def _user_message_content(payload: dict[str, Any]) -> str | list[dict[str, Any]]
     return blocks or str(text)
 
 
+INTERRUPTED_TOOL = "Tool was interrupted before a result was recorded."
+
+
+def _flush_pending_tools(
+    messages: list[dict[str, Any]],
+    pending_tool: list[dict[str, Any]],
+    *,
+    stub_results: bool,
+) -> None:
+    if not pending_tool:
+        return
+    messages.append({"role": "assistant", "content": list(pending_tool)})
+    if stub_results:
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block["id"],
+                        "content": INTERRUPTED_TOOL,
+                        "is_error": True,
+                    }
+                    for block in pending_tool
+                ],
+            }
+        )
+    pending_tool.clear()
+
+
 def _append_user_content(messages: list[dict[str, Any]], content: str | list[dict[str, Any]]) -> None:
     if not (messages and messages[-1]["role"] == "user"):
         messages.append({"role": "user", "content": content})
@@ -158,8 +188,10 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
         k = ev.kind
         p = ev.payload
         if k == "user":
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
             _append_user_content(messages, _user_message_content(p))
         elif k == "assistant":
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append({"role": "assistant", "content": p.get("text") or ""})
         elif k == "tool_call":
             pending_tool.append(
@@ -172,8 +204,8 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
             )
         elif k in {"tool_result", "MemoryRecall"}:
             if pending_tool:
-                messages.append({"role": "assistant", "content": pending_tool})
-                pending_tool = []
+                messages.append({"role": "assistant", "content": list(pending_tool)})
+                pending_tool.clear()
             content = p.get("content") or p.get("text") or json.dumps(p)[:8000]
             image_payload = parse_image_read_payload(content)
             if image_payload is None:
@@ -198,6 +230,7 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                 }
             )
         elif k == "UserCorrection":
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append(
                 {
                     "role": "user",
@@ -205,11 +238,11 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                 }
             )
         elif k in BOUNDARY_KINDS:
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append(
                 {"role": "user", "content": f"[compacted earlier turns]\n{p.get('text') or ''}"}
             )
-    if pending_tool:
-        messages.append({"role": "assistant", "content": pending_tool})
+    _flush_pending_tools(messages, pending_tool, stub_results=True)
     return messages
 
 
