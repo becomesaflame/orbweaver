@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from orbweaver.config import settings
+from orbweaver.redact import redact_secrets
 
 SKIP_PERSIST = frozenset({"Read", "MemorySearch", "MemoryRemember", "MemoryPin", "MemoryForget"})
 PREVIEW_CHARS = 2000
@@ -18,6 +19,7 @@ def persist_tool_result(
 ) -> tuple[str, str | None]:
     """Return (stored_content, relative_path_or_none). No-op when small, skipped, or no workspace."""
     text = content if isinstance(content, str) else str(content)
+    text = redact_secrets(text)
     threshold = int(settings.compact_tool_result_chars)
     if workspace is None or name in SKIP_PERSIST or len(text) <= threshold:
         return text, None
