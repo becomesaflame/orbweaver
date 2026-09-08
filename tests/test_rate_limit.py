@@ -3,7 +3,7 @@ from httpx import ASGITransport, AsyncClient
 from starlette.requests import Request
 
 from orbweaver import app as app_mod
-from orbweaver.app import _hits, app, rate_limit_client_ip
+from orbweaver.app import app, rate_limit_client_ip
 from orbweaver.config import settings
 
 
@@ -24,13 +24,6 @@ def _request(headers: dict[str, str] | None = None, host: str = "10.0.0.1") -> R
             "server": ("test", 80),
         }
     )
-
-
-@pytest.fixture(autouse=True)
-def _clear_hits():
-    _hits.clear()
-    yield
-    _hits.clear()
 
 
 def test_trust_proxy_defaults_off():

@@ -163,7 +163,7 @@
         <div class="card"><dl><dt>Retention</dt><dd>Store decay off in the first pass (<code>λ = 0</code>). Forget is explicit only. Pinning is first-class with a 4k token cap. Automatic eviction is phase 6.</dd></dl></div>
         <div class="card"><dl><dt>Workspaces</dt><dd>Same tools, different place. <code>LocalWorkspace</code> (bubblewrap write confinement) for VS Code, web, Telegram, and cron. A real containerized agent is not in this pass.</dd></dl></div>
         <div class="card"><dl><dt>Process</dt><dd>Gateway and channel adapters are one FastAPI process. The agent never talks to Telegram or cron.</dd></dl></div>
-        <div class="card"><dl><dt>Auth</dt><dd>JWT for VS Code and web chat. Telegram: bot token + allowlisted user IDs; the adapter mints an internal JWT. Rate limits per identity.</dd></dl></div>
+        <div class="card"><dl><dt>Auth</dt><dd>JWT for VS Code and web chat. Telegram: bot token + allowlisted user IDs; the adapter mints an internal JWT. Rate limits per identity (120/min sliding window), shared across workers and restarts via Postgres (<code>rate_limit_hits</code>) or a file under <code>ORBWEAVER_DATA_DIR</code> (default <code>~/.orbweaver</code>).</dd></dl></div>
         <div class="card"><dl><dt>Plan mode</dt><dd>Orbweaver plan mode must edit HTML and Markdown. HTML with diagrams is still an editable plan, not a one-way export.</dd></dl></div>
         <div class="card"><dl><dt>Portability</dt><dd>UUID schema and remap-able <code>workspace_uri</code> in phase 1. Snapshot CLI and off-site backups in phase 6. Secrets never travel in the pack.</dd></dl></div>
         <div class="card"><dl><dt>Provenance</dt><dd>Original Python agent loop. Claude Code leak-port <em>patterns</em> for permissions, sandbox, and classifier (Clawd-Code, pycc, Claw Code) — no leaked TypeScript copied. VS Code diffs reimplemented from Continue APIs. Track borrowed trees in <code>PROVENANCE.md</code>.</dd></dl></div>
@@ -277,6 +277,7 @@ sequenceDiagram
           <tr><td><code>events</code></td><td>Append-only session event log.</td></tr>
           <tr><td><code>jobs</code></td><td>Cron / background work.</td></tr>
           <tr><td><code>instance_meta</code></td><td>Embedding model, dim, schema version, instance id.</td></tr>
+          <tr><td><code>rate_limit_hits</code></td><td>Sliding-window request timestamps when <code>ORBWEAVER_STORE=postgres</code>. Hashed identity keys; pruned outside the 60s window.</td></tr>
         </tbody>
       </table>
       <p><code>workspace_uri</code> is remap-able: git remote+ref, relative <code>file:./proj</code>, or a named mount. Absolute laptop paths are forbidden in stored data.</p>
