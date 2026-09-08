@@ -381,5 +381,5 @@ def run_workspace_search(workspace: Any, inp: dict[str, Any]) -> str:
     root = getattr(workspace, "root", None)
     if root is None:
         return "WorkspaceSearch: no workspace root."
-    hits = search_workspace(root, query, k=inp.get("max_results"))
+    hits = search_workspace(root, query, k=clamp_results(inp.get("max_results")))
     return format_hits(query, hits)
