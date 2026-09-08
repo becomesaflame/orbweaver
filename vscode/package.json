@@ -1,8 +1,8 @@
 {
   "name": "orbweaver",
   "displayName": "Orbweaver",
-  "description": "Orbweaver coding agent: chat, inline diffs, HTML+Markdown plan mode",
-  "version": "0.0.0",
+  "description": "Orbweaver coding agent: streaming chat, real diffs, sessions, living plan mode",
+  "version": "0.1.0",
   "publisher": "orbweaver",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
@@ -11,9 +11,16 @@
   "contributes": {
     "commands": [
       { "command": "orbweaver.openChat", "title": "Orbweaver: Open Chat" },
+      { "command": "orbweaver.newSession", "title": "Orbweaver: New Chat", "icon": "$(add)" },
+      { "command": "orbweaver.refreshSessions", "title": "Orbweaver: Refresh Sessions", "icon": "$(refresh)" },
+      { "command": "orbweaver.renameSession", "title": "Orbweaver: Rename Chat" },
       { "command": "orbweaver.acceptDiff", "title": "Orbweaver: Accept Diff" },
       { "command": "orbweaver.rejectDiff", "title": "Orbweaver: Reject Diff" },
-      { "command": "orbweaver.openPlan", "title": "Orbweaver: Open Plan (Markdown or HTML)" }
+      { "command": "orbweaver.openDiff", "title": "Orbweaver: Open Diff" },
+      { "command": "orbweaver.openPlan", "title": "Orbweaver: Open Plan" },
+      { "command": "orbweaver.newPlan", "title": "Orbweaver: New Markdown Plan" },
+      { "command": "orbweaver.newHtmlPlan", "title": "Orbweaver: New HTML Plan" },
+      { "command": "orbweaver.previewPlan", "title": "Orbweaver: Preview Plan" }
     ],
     "viewsContainers": {
       "activitybar": [
@@ -22,7 +29,18 @@
     },
     "views": {
       "orbweaver": [
+        { "id": "orbweaver.sessions", "name": "Sessions" },
         { "type": "webview", "id": "orbweaver.chat", "name": "Chat" }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        { "command": "orbweaver.newSession", "when": "view == orbweaver.sessions", "group": "navigation" },
+        { "command": "orbweaver.refreshSessions", "when": "view == orbweaver.sessions", "group": "navigation" },
+        { "command": "orbweaver.openPlan", "when": "view == orbweaver.chat", "group": "navigation" }
+      ],
+      "view/item/context": [
+        { "command": "orbweaver.renameSession", "when": "view == orbweaver.sessions && viewItem == orbweaverSession" }
       ]
     },
     "configuration": {
