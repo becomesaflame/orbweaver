@@ -318,6 +318,11 @@ class PostgresStore:
     async def reschedule_job(self, job: Job) -> None:
         await self.put_job(job)
 
+    async def delete_job(self, job_id: uuid.UUID) -> None:
+        pool = self._pool_req()
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM jobs WHERE id=$1", job_id)
+
     async def meta_get(self, key: str) -> str | None:
         pool = self._pool_req()
         async with pool.acquire() as conn:
@@ -334,6 +339,37 @@ class PostgresStore:
                 key,
                 value,
             )
+
+    async def rate_limit_hit(
+        self,
+        key: str,
+        now: float,
+        window_seconds: float = 60.0,
+        max_hits: int = 120,
+    ) -> bool:
+        """Atomically record a hit. Return True if the key is still under the limit."""
+        pool = self._pool_req()
+        cutoff = now - window_seconds
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", key)
+                await conn.execute(
+                    "DELETE FROM rate_limit_hits WHERE rate_key=$1 AND ts < $2",
+                    key,
+                    cutoff,
+                )
+                count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM rate_limit_hits WHERE rate_key=$1",
+                    key,
+                )
+                if int(count or 0) >= max_hits:
+                    return False
+                await conn.execute(
+                    "INSERT INTO rate_limit_hits(rate_key, ts) VALUES ($1, $2)",
+                    key,
+                    now,
+                )
+                return True
 
 
 def _json(val: Any) -> dict[str, Any]:

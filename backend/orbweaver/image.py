@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,14 @@ MAX_BYTES = 4_500_000
 JPEG_QUALITY = 85
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 PHOTO_MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
+IMAGE_READ_KEY = "__orbweaver_image__"
+_EXT_MEDIA = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
 
 
 def is_image_path(path: str) -> bool:
@@ -65,6 +74,55 @@ def save_inbound_image(workspace, data: bytes, stem: str) -> dict[str, str]:
     return {"path": rel, "media_type": media_type}
 
 
+def format_image_read(workspace: Any, path: str) -> str:
+    """Read an image path as a vision marker instead of UTF-8 text."""
+    try:
+        data = workspace.read_bytes(path)
+    except (OSError, PermissionError, FileNotFoundError, IsADirectoryError, AttributeError) as e:
+        return f"error reading {path}: {e}"
+    if not data:
+        return f"error reading {path}: empty image"
+    media = sniff_media_type(data)
+    if media == "application/octet-stream":
+        media = _EXT_MEDIA.get(Path(path).suffix.lower(), "image/jpeg")
+    return json.dumps(
+        {
+            IMAGE_READ_KEY: True,
+            "path": path,
+            "media_type": media,
+            "bytes": len(data),
+        }
+    )
+
+
+def parse_image_read_payload(content: Any) -> dict[str, Any] | None:
+    if isinstance(content, dict) and content.get(IMAGE_READ_KEY):
+        return content
+    if not isinstance(content, str) or IMAGE_READ_KEY not in content:
+        return None
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict) and parsed.get(IMAGE_READ_KEY):
+        return parsed
+    return None
+
+
+def image_read_tool_content(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    path = str(parsed.get("path") or "")
+    media = str(parsed.get("media_type") or "image/jpeg")
+    nbytes = parsed.get("bytes")
+    text = f"Read image {path} ({media}"
+    if nbytes is not None:
+        text += f", {nbytes} bytes"
+    text += ")."
+    return [
+        *user_image_blocks([{"path": path, "media_type": media}]),
+        {"type": "text", "text": text},
+    ]
+
+
 def user_image_blocks(images: list[dict[str, str]]) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     for img in images:
@@ -84,6 +142,48 @@ def user_image_blocks(images: list[dict[str, str]]) -> list[dict[str, Any]]:
     return blocks
 
 
+def _hydrate_image_block(block: dict[str, Any], workspace: Any) -> dict[str, Any] | None:
+    src = block.get("source") or {}
+    if src.get("type") != "workspace_path":
+        return block
+    path = str(src.get("path") or "")
+    try:
+        data = workspace.read_bytes(path)
+    except (OSError, PermissionError, FileNotFoundError, IsADirectoryError, AttributeError) as e:
+        log.warning("image hydrate failed for %s: %s", path, e)
+        return None
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": src.get("media_type") or sniff_media_type(data),
+            "data": base64.b64encode(data).decode("ascii"),
+        },
+    }
+
+
+def _hydrate_content_blocks(blocks: list[Any], workspace: Any) -> list[Any]:
+    out: list[Any] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            out.append(block)
+            continue
+        if block.get("type") == "image":
+            hydrated = _hydrate_image_block(block, workspace)
+            if hydrated is not None:
+                out.append(hydrated)
+            continue
+        if block.get("type") == "tool_result":
+            inner = block.get("content")
+            if isinstance(inner, list):
+                new_block = dict(block)
+                new_block["content"] = _hydrate_content_blocks(inner, workspace)
+                out.append(new_block)
+                continue
+        out.append(block)
+    return out
+
+
 def hydrate_workspace_images(messages: list[dict[str, Any]], workspace: Any) -> list[dict[str, Any]]:
     """Replace workspace_path image sources with base64 for the Anthropic API."""
     if workspace is None:
@@ -94,33 +194,8 @@ def hydrate_workspace_images(messages: list[dict[str, Any]], workspace: Any) -> 
         if not isinstance(content, list):
             out.append(msg)
             continue
-        blocks: list[Any] = []
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "image":
-                blocks.append(block)
-                continue
-            src = block.get("source") or {}
-            if src.get("type") != "workspace_path":
-                blocks.append(block)
-                continue
-            path = str(src.get("path") or "")
-            try:
-                data = workspace.read_bytes(path)
-            except (OSError, PermissionError, FileNotFoundError, IsADirectoryError, AttributeError) as e:
-                log.warning("image hydrate failed for %s: %s", path, e)
-                continue
-            blocks.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": src.get("media_type") or sniff_media_type(data),
-                        "data": base64.b64encode(data).decode("ascii"),
-                    },
-                }
-            )
         new_msg = dict(msg)
-        new_msg["content"] = blocks
+        new_msg["content"] = _hydrate_content_blocks(content, workspace)
         out.append(new_msg)
     return out
 

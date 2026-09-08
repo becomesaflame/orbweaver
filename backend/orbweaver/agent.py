@@ -22,12 +22,14 @@ from orbweaver.compact import (
     usage_input_tokens,
 )
 from orbweaver.config import settings
-from orbweaver.image import hydrate_workspace_images
+from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
 from orbweaver.memory import pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
+from orbweaver.lints import read_lints
+from orbweaver.todos import inject_session_todos, persist_todos
 from orbweaver.tooltext import format_read, format_webfetch
 
 DEFAULT_MAX_ROUNDS = 48
@@ -45,10 +47,11 @@ TOOL_SPEC = [
     {
         "name": "Read",
         "description": (
-            "Read a file as numbered lines. Relative paths are the session workspace. "
-            "Absolute paths in extra sandbox roots are auto-allowed; other host paths are "
-            "classified. Use offset (1-based line, or negative from the end) and limit to "
-            "page; do not page files with Bash. The result says how to continue when truncated."
+            "Read a file as numbered lines, or an image as vision (jpg/png/webp/gif). "
+            "Relative paths are the session workspace. Absolute paths in extra sandbox "
+            "roots are auto-allowed; other host paths are classified. Use offset "
+            "(1-based line, or negative from the end) and limit to page text; do not "
+            "page files with Bash. The result says how to continue when truncated."
         ),
         "input_schema": {
             "type": "object",
@@ -70,6 +73,19 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
             "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "Delete",
+        "description": (
+            "Delete a file or directory in the session working set. Same deny/ask rules as "
+            "Write: always-deny secrets (.env, keys), and paths outside the working set are "
+            "blocked. Prefer this over Bash rm."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
         },
     },
     {
@@ -104,6 +120,24 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"pattern": {"type": "string"}, "glob": {"type": "string"}},
             "required": ["pattern"],
+        },
+    },
+    {
+        "name": "ReadLints",
+        "description": (
+            "Return diagnostics for files you just edited. Runs ORBWEAVER_LINTER when set "
+            "(use {paths} or trailing paths). Otherwise a Python AST stub reports syntax "
+            "errors. Paths default to recent Write/ProposePatch targets."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Workspace paths to check. Empty uses recently edited files.",
+                }
+            },
         },
     },
     {
@@ -211,6 +245,38 @@ TOOL_SPEC = [
         },
     },
     {
+        "name": "TodoWrite",
+        "description": (
+            "Create or update the session todo list. Persisted on the session so compaction "
+            "does not erase the plan. merge true updates by id; merge false replaces the list."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "content": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed", "cancelled"],
+                            },
+                        },
+                        "required": ["content"],
+                    },
+                },
+                "merge": {
+                    "type": "boolean",
+                    "description": "If true, merge by id into the existing list.",
+                },
+            },
+            "required": ["todos"],
+        },
+    },
+    {
         "name": "SpawnSubagent",
         "description": (
             "Spawn a nested agent with its own event stream to complete a focused task. "
@@ -227,13 +293,24 @@ TOOL_SPEC = [
     },
     {
         "name": "ScheduleTask",
-        "description": "Ask the host to schedule a job (ISO-8601 due_at).",
+        "description": (
+            "Ask the host to schedule a job. due_at is ISO-8601. "
+            "Optional recurrence: minute, hour, or day (also 'every hour'), "
+            "or a 5-field cron expression (minute hour day-of-month month "
+            "day-of-week), e.g. '0 9 * * mon'. Omit recurrence for a one-shot."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "due_at": {"type": "string"},
                 "message": {"type": "string"},
-                "recurrence": {"type": "string"},
+                "recurrence": {
+                    "type": "string",
+                    "description": (
+                        "minute/hour/day, or 5-field cron "
+                        "(minute hour day month weekday)."
+                    ),
+                },
             },
             "required": ["due_at", "message"],
         },
@@ -305,7 +382,7 @@ def resolve_channel(
     if jsonld.get("telegram_user_id") is not None or jsonld.get("telegram_chat_id") is not None:
         return "telegram"
     title = str(jsonld.get("title") or "").strip().lower()
-    if title == "vscode" or title.startswith("vscode:") or title.startswith("vscode/"):
+    if title == "vscode" or title.startswith(("vscode:", "vscode/")):
         return VSCODE_CHANNEL
     return ""
 
@@ -345,6 +422,7 @@ def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dic
     messages = events_to_messages(prompt_events(events))
     messages = hydrate_workspace_images(messages, workspace)
     messages = rehydrate_messages(messages, events, workspace)
+    messages = inject_session_todos(messages, events)
     if not messages:
         messages = [{"role": "user", "content": user_text}]
     return messages
@@ -360,6 +438,8 @@ def static_system(channel: str = "") -> str:
         "Use tools to read and patch the workspace. Sandboxed Bash can read host files; "
         "do not set permissions [\"all\"] just to inspect logs or journals. "
         f"{write_line}"
+        "In auto mode, in-project Delete applies immediately. TodoWrite keeps the plan "
+        "on this session across compaction. After edits, ReadLints for diagnostics. "
         "Use MemorySearch when past decisions might "
         "matter. Keep pins small. If the sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
@@ -402,14 +482,22 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     store: Store = ctx["store"]
     session_id: UUID = ctx["session_id"]
     if name == "Read":
+        path = str(inp.get("path") or "")
+        if is_image_path(path):
+            return format_image_read(ws, path)
         try:
-            raw = ws.read(inp["path"])
+            raw = ws.read(path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
-        return format_read(raw, path=str(inp["path"]), offset=inp.get("offset"), limit=inp.get("limit"))
+        return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
+    if name == "Delete":
+        try:
+            return ws.delete(inp["path"])
+        except (OSError, PermissionError) as e:
+            return f"error deleting {inp.get('path')}: {e}"
     if name == "ProposePatch":
         result = ws.propose_patch(inp["path"], inp.get("old_string") or "", inp["new_string"])
         return json.dumps(result)[:200_000]
@@ -417,6 +505,8 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         return "\n".join(ws.glob(inp["pattern"])[:200])
     if name == "Grep":
         return "\n".join(ws.grep(inp["pattern"], inp.get("glob") or "**/*"))
+    if name == "ReadLints":
+        return read_lints(ws, inp, ctx.get("events"))
     if name == "Bash":
         from orbweaver.permissions.pipeline import bash_permissions
 
@@ -477,6 +567,9 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         return "forgotten"
     if name == "AskUser":
         return json.dumps({"ask": inp["question"]})
+    if name == "TodoWrite":
+        todos = await persist_todos(store, session_id, inp)
+        return json.dumps({"todos": todos})
     if name == "SpawnSubagent":
         from orbweaver.subagent import run_subagent
 
@@ -488,11 +581,21 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
                 due = due.replace(tzinfo=UTC)
         except ValueError as e:
             return f"invalid due_at: {e}"
+        rec = inp.get("recurrence")
+        if rec:
+            from orbweaver.channels.cron import _parse_recurrence
+
+            if _parse_recurrence(str(rec), due) is None:
+                return (
+                    "invalid recurrence: use minute, hour, day "
+                    "(or 'every hour'), or a 5-field cron expression "
+                    "like '0 9 * * mon'"
+                )
         job = Job(
             id=new_uuid(),
             due_at=due,
             payload={"message": inp.get("message") or ""},
-            recurrence=inp.get("recurrence"),
+            recurrence=rec,
             session_id=session_id,
         )
         await store.put_job(job)
