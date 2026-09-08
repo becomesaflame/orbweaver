@@ -62,6 +62,7 @@ async def _streaming_slow_turn(
     cancel=None,
     turn_state=None,
     resume=False,
+    **_kwargs,
 ):
     produced = []
     if not resume:
