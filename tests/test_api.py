@@ -149,6 +149,33 @@ async def test_browse_workspaces(tmp_path: Path, monkeypatch, auth_header):
 
 
 @pytest.mark.asyncio
+async def test_session_channel_vscode(auth_header):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        bad = await client.post(
+            "/v1/sessions",
+            json={"workspace_uri": "workspace:default", "channel": "VS CODE"},
+            headers=auth_header,
+        )
+        assert bad.status_code == 400
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "workspace_uri": "workspace:default",
+                "workspace_kind": "local",
+                "title": "vscode",
+                "channel": "vscode",
+            },
+            headers=auth_header,
+        )
+        assert created.status_code == 200, created.text
+        assert created.json()["channel"] == "vscode"
+        listed = await client.get("/v1/sessions", headers=auth_header)
+        row = next(s for s in listed.json()["sessions"] if s["id"] == created.json()["id"])
+        assert row["channel"] == "vscode"
+
+
+@pytest.mark.asyncio
 async def test_health_includes_version():
     from orbweaver import __version__
 
