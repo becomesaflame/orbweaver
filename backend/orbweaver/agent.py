@@ -74,7 +74,8 @@ TOOL_SPEC = [
             "Relative paths are the session workspace. Absolute paths in extra sandbox "
             "roots are auto-allowed; other host paths are classified. Use offset "
             "(1-based line, or negative from the end) and limit to page text; do not "
-            "page files with Bash. The result says how to continue when truncated."
+            "page files with Bash. The result says how to continue when truncated. "
+            "Text files larger than 10 MB, or with a NUL in the first 8 KiB, are rejected."
         ),
         "input_schema": {
             "type": "object",
@@ -791,7 +792,7 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         if is_image_path(path):
             return format_image_read(ws, path)
         try:
-            raw = ws.read(path)
+            raw = ws.read_text_for_tool(path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
         return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
