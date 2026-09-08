@@ -9,6 +9,8 @@ from orbweaver.sandbox.bwrap import build_bwrap_argv
 from orbweaver.sandbox.policy import load_sandbox_policy
 from orbweaver.sandbox.proxy import wrap_command_with_proxy
 from orbweaver.sandbox.ssh import (
+    SANDBOX_OPENSSH,
+    SANDBOX_SSH_DIR,
     ensure_ssh_sandbox,
     filter_ssh_argv,
     ssh_identity_bind_args,
@@ -45,6 +47,22 @@ def test_bwrap_overlays_ssh_and_hides_config_d(tmp_path: Path):
         assert "/usr/bin/ssh" in argv
         wrapper = tmp_path / "tmp" / "ow-ssh" / "ssh"
         assert str(wrapper.resolve()) in argv
+        assert SANDBOX_OPENSSH in argv
+        assert argv[argv.index(SANDBOX_OPENSSH) - 2 : argv.index(SANDBOX_OPENSSH)] == [
+            "--ro-bind",
+            "/usr/bin/ssh",
+        ]
+        assert str((tmp_path / "tmp" / "ow-ssh" / "openssh").resolve()) not in argv
+        tmpfs_tmp = None
+        for idx, a in enumerate(argv):
+            if a == "--tmpfs" and idx + 1 < len(argv) and argv[idx + 1] == "/tmp":
+                tmpfs_tmp = idx
+                break
+        assert tmpfs_tmp is not None
+        assert argv[argv.index(SANDBOX_SSH_DIR) - 1] == "--dir"
+        assert tmpfs_tmp < argv.index(SANDBOX_SSH_DIR)
+        wrapper_text = wrapper.read_text(encoding="utf-8")
+        assert SANDBOX_OPENSSH in wrapper_text
 
 
 def test_bwrap_full_network_skips_proxycommand(tmp_path: Path):
