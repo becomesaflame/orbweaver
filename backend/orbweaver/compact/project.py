@@ -131,6 +131,7 @@ def _user_message_content(payload: dict[str, Any]) -> str | list[dict[str, Any]]
 
 
 INTERRUPTED_TOOL = "Tool was interrupted before a result was recorded."
+STOP_KINDS = frozenset({"turn_interrupted", "turn_aborted"})
 
 
 def _flush_pending_tools(
@@ -229,6 +230,8 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                     ],
                 }
             )
+        elif k in STOP_KINDS:
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
         elif k == "UserCorrection":
             _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append(

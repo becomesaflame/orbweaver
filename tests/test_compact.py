@@ -290,3 +290,90 @@ def test_events_to_messages_stubs_orphan_tool_use():
     assert any(b.get("tool_use_id") == "toolu_01V85rqU59D9VfMou3GjerMm" for b in results)
     assert messages[-1]["role"] == "user"
     assert "Go ahead" in str(messages[-1]["content"])
+
+
+def _tool_result_ids(messages: list[dict]) -> list[str]:
+    ids: list[str] = []
+    for m in messages:
+        if m["role"] != "user" or not isinstance(m["content"], list):
+            continue
+        for b in m["content"]:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                ids.append(str(b.get("tool_use_id")))
+    return ids
+
+
+def _tool_use_ids(messages: list[dict]) -> list[str]:
+    ids: list[str] = []
+    for m in messages:
+        if m["role"] != "assistant" or not isinstance(m["content"], list):
+            continue
+        for b in m["content"]:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                ids.append(str(b.get("id")))
+    return ids
+
+
+def test_events_to_messages_stubs_interrupted_tool_before_later_result():
+    """Stop mid-Read, then Continue a Bash: the Read must not share the Bash result."""
+    from orbweaver.store import Event
+
+    sid = uuid4()
+    events = [
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=1,
+            kind="tool_call",
+            payload={
+                "id": "toolu_read",
+                "name": "Read",
+                "input": {"path": "backend/orbweaver/agent.py", "offset": 601},
+            },
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="turn_interrupted",
+            payload={"reason": "stop"},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=3,
+            kind="tool_call",
+            payload={
+                "id": "toolu_bash",
+                "name": "Bash",
+                "input": {"command": "grep turn_state agent.py"},
+            },
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=4,
+            kind="tool_result",
+            payload={
+                "tool_use_id": "toolu_bash",
+                "name": "Bash",
+                "content": "956:    turn_state: Any | None = None,",
+            },
+        ),
+        Event(id=uuid4(), session_id=sid, seq=5, kind="user", payload={"text": "what caused the error?"}),
+    ]
+    messages = events_to_messages(events)
+    uses = _tool_use_ids(messages)
+    results = _tool_result_ids(messages)
+    assert uses == ["toolu_read", "toolu_bash"]
+    assert results == ["toolu_read", "toolu_bash"]
+    assert uses == results
+    read_stub = [
+        b
+        for m in messages
+        if m["role"] == "user" and isinstance(m["content"], list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("tool_use_id") == "toolu_read"
+    ]
+    assert read_stub and read_stub[0].get("is_error") is True
+    assert "interrupted" in str(read_stub[0].get("content") or "").lower()
