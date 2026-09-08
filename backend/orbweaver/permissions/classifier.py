@@ -68,7 +68,7 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
         if perms:
             return {"command": cmd, "permissions": sorted(set(perms))}
         return cmd
-    if name in {"Read", "Write", "ProposePatch", "SendPhoto", "Delete"}:
+    if name in {"Read", "Write", "ProposePatch", "NotebookEdit", "SendPhoto", "Delete"}:
         return {"path": inp.get("path")}
     if name == "ReadLints":
         return {"paths": inp.get("paths") or inp.get("path")}
