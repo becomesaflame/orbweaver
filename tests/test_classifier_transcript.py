@@ -79,6 +79,9 @@ def test_parse_block_and_projection():
     ) == {"command": "curl https://example.com", "permissions": ["full_network"]}
     assert to_classifier_input("Glob", {"pattern": "*"}) == ""
     assert to_classifier_input("WebSearch", {"query": "max_turns"}) == {"query": "max_turns"}
+    assert to_classifier_input(
+        "Browser", {"action": "navigate", "url": "https://example.com", "text": "secret"}
+    ) == {"action": "navigate", "url": "https://example.com", "selector": None}
 
 
 @pytest.mark.asyncio

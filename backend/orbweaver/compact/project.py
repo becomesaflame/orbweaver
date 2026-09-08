@@ -7,11 +7,12 @@ from dataclasses import replace
 from typing import Any
 
 from orbweaver.config import settings
+from orbweaver.image import image_read_tool_content, parse_image_read_payload, user_image_blocks
 from orbweaver.store import Event
 from orbweaver.tokens import estimate_tokens
 
 BOUNDARY_KINDS = frozenset({"compact_boundary", "compact_summary"})
-COMPACTABLE_TOOLS = frozenset({"Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"})
+COMPACTABLE_TOOLS = frozenset({"Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Browser"})
 PAIR_KINDS = frozenset(
     {
         "tool_call",
@@ -122,8 +123,6 @@ def _user_message_content(payload: dict[str, Any]) -> str | list[dict[str, Any]]
     images = payload.get("images") or []
     if not images:
         return text
-    from orbweaver.image import user_image_blocks
-
     blocks = user_image_blocks(images)
     if text:
         blocks.append({"type": "text", "text": str(text)})
@@ -175,6 +174,16 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                 messages.append({"role": "assistant", "content": pending_tool})
                 pending_tool = []
             content = p.get("content") or p.get("text") or json.dumps(p)[:8000]
+            image_payload = parse_image_read_payload(content)
+            if image_payload is None:
+                image_payload = parse_image_read_payload(p)
+            if image_payload is not None:
+                content = image_read_tool_content(image_payload)
+            elif p.get("images"):
+                blocks = user_image_blocks(p.get("images") or [])
+                if content:
+                    blocks.append({"type": "text", "text": str(content)})
+                content = blocks or content
             messages.append(
                 {
                     "role": "user",

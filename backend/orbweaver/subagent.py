@@ -17,6 +17,35 @@ except ImportError:  # pragma: no cover
 CHILD_BLOCKED_TOOLS = frozenset({"SpawnSubagent", "AskUser", "ScheduleTask"})
 SUBAGENT_MAX_ROUNDS = 48
 RESULT_TEXT_CAP = 8000
+DEFAULT_SUBAGENT_TYPE = "implement"
+SUBAGENT_TYPES = frozenset({"explore", "implement", "shell"})
+_TYPE_ALIASES = {
+    "explore": "explore",
+    "research": "explore",
+    "implement": "implement",
+    "impl": "implement",
+    "general": "implement",
+    "shell": "shell",
+    "bash": "shell",
+}
+EXPLORE_TOOLS = frozenset(
+    {
+        "Read",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "MemorySearch",
+        "MemoryGraph",
+        "ReadLints",
+    }
+)
+SHELL_TOOLS = frozenset({"Bash", "Read", "Glob", "Grep", "ReadLints"})
+_TYPE_TOOLS: dict[str, frozenset[str] | None] = {
+    "explore": EXPLORE_TOOLS,
+    "implement": None,
+    "shell": SHELL_TOOLS,
+}
 SUBAGENT_SYSTEM_EXTRA = (
     "You are an Orbweaver subagent. Complete the assigned task using tools. "
     "Do not ask the user questions. Do not schedule jobs or spawn further subagents. "
@@ -24,6 +53,20 @@ SUBAGENT_SYSTEM_EXTRA = (
     "shared memory is available via MemorySearch. Pinned memory is already in this "
     "system prompt."
 )
+_TYPE_EXTRA = {
+    "explore": (
+        "You are an explore subagent. Read and search only. Do not write files, "
+        "edit notebooks, or run shell commands."
+    ),
+    "implement": (
+        "You are an implement subagent. Make the assigned change. Prefer patches. "
+        "Do not spawn further agents."
+    ),
+    "shell": (
+        "You are a shell subagent. Run commands for the assigned task. "
+        "Do not write workspace files with Write; use Bash only when needed."
+    ),
+}
 
 
 def is_subagent_session(entity: Entity | None) -> bool:
@@ -33,8 +76,27 @@ def is_subagent_session(entity: Entity | None) -> bool:
     return jsonld.get("role") == "subagent" or bool(jsonld.get("parent_session"))
 
 
-def child_tool_spec(tool_spec: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [t for t in tool_spec if t.get("name") not in CHILD_BLOCKED_TOOLS]
+def normalize_subagent_type(raw: Any) -> str | None:
+    spec = str(raw or "").strip().lower()
+    if not spec:
+        return DEFAULT_SUBAGENT_TYPE
+    return _TYPE_ALIASES.get(spec)
+
+
+def child_tool_spec(
+    tool_spec: list[dict[str, Any]],
+    subagent_type: str = DEFAULT_SUBAGENT_TYPE,
+) -> list[dict[str, Any]]:
+    allowed = _TYPE_TOOLS.get(subagent_type, None)
+    out = [t for t in tool_spec if t.get("name") not in CHILD_BLOCKED_TOOLS]
+    if allowed is None:
+        return out
+    return [t for t in out if t.get("name") in allowed]
+
+
+def subagent_system_extra(subagent_type: str = DEFAULT_SUBAGENT_TYPE) -> str:
+    extra = _TYPE_EXTRA.get(subagent_type) or SUBAGENT_SYSTEM_EXTRA
+    return SUBAGENT_SYSTEM_EXTRA + " " + extra
 
 
 def _last_assistant(events: list[Event]) -> str:
@@ -86,6 +148,9 @@ async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     task = str(inp.get("task") or "").strip()
     if not task:
         return "error: task is required"
+    kind = normalize_subagent_type(inp.get("type") or inp.get("role"))
+    if kind is None:
+        return f"error: type must be one of {sorted(SUBAGENT_TYPES)}"
     label = str(inp.get("label") or "").strip()
     title = (label or task)[:80]
 
@@ -110,6 +175,7 @@ async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         "title": title,
         "status": "active",
         "role": "subagent",
+        "subagent_type": kind,
         "parent_session": session_at_id(parent_id),
         "created_at": datetime.now(UTC).isoformat(),
     }
@@ -125,7 +191,12 @@ async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     await _parent_event(
         ctx,
         "subagent_started",
-        {"child_session_id": str(child_id), "task": task[:500], "label": label or title},
+        {
+            "child_session_id": str(child_id),
+            "task": task[:500],
+            "label": label or title,
+            "type": kind,
+        },
     )
 
     status = "ok"
@@ -138,8 +209,8 @@ async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             workspace_kind=workspace_kind,
             cancel=ctx.get("cancel"),
             headless=True,
-            tools=child_tool_spec(tools_for_channel(parent_channel)),
-            system_extra=SUBAGENT_SYSTEM_EXTRA,
+            tools=child_tool_spec(tools_for_channel(parent_channel), kind),
+            system_extra=subagent_system_extra(kind),
             max_rounds=SUBAGENT_MAX_ROUNDS,
             subagent_depth=1,
             channel=parent_channel or None,

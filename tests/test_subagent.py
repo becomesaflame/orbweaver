@@ -11,7 +11,9 @@ from orbweaver.store import SESSION_TYPE, Entity, reset_store_for_tests, session
 from orbweaver.subagent import (
     CHILD_BLOCKED_TOOLS,
     SUBAGENT_MAX_ROUNDS,
+    child_tool_spec,
     is_subagent_session,
+    normalize_subagent_type,
 )
 from orbweaver.workspace import LocalWorkspace
 
@@ -225,6 +227,68 @@ async def test_empty_task_does_not_create_session(ws):
     assert kids == []
 
 
+def test_child_tool_spec_by_type():
+    names = {t["name"] for t in TOOL_SPEC}
+    explore = {t["name"] for t in child_tool_spec(TOOL_SPEC, "explore")}
+    implement = {t["name"] for t in child_tool_spec(TOOL_SPEC, "implement")}
+    shell = {t["name"] for t in child_tool_spec(TOOL_SPEC, "shell")}
+    assert CHILD_BLOCKED_TOOLS.isdisjoint(explore | implement | shell)
+    assert "Read" in explore
+    assert "MemoryGraph" in explore
+    assert "Write" not in explore
+    assert "Bash" not in explore
+    assert "NotebookEdit" not in explore
+    assert "Write" in implement
+    assert "Bash" in implement
+    assert "NotebookEdit" in implement
+    assert "Bash" in shell
+    assert "Read" in shell
+    assert "Write" not in shell
+    assert "NotebookEdit" not in shell
+    assert names >= {"Read", "Write", "Bash"}
+    assert normalize_subagent_type("") == "implement"
+    assert normalize_subagent_type("research") == "explore"
+    assert normalize_subagent_type("nope") is None
+
+
+@pytest.mark.asyncio
+async def test_typed_subagent_explore_and_unknown(ws, monkeypatch):
+    store = reset_store_for_tests()
+    monkeypatch.setattr("orbweaver.subagent.review_subagent_return", _passthrough_review)
+    captured = {}
+
+    async def fake_turn(store, session_id, user_text, workspace, **kwargs):
+        captured["kwargs"] = kwargs
+        await store.append_event(session_id, "assistant", {"text": "looked"})
+        return []
+
+    monkeypatch.setattr("orbweaver.agent.agent_turn", fake_turn)
+    sid = uuid4()
+    await store.put_entity(_parent_entity(store, sid))
+    result = await run_tools(
+        "SpawnSubagent",
+        {"task": "scan the repo", "type": "explore"},
+        _ctx(store, ws, sid),
+    )
+    body = json.loads(result)
+    child = await store.get_entity(UUID(body["child_session_id"]))
+    assert child.jsonld["subagent_type"] == "explore"
+    names = {t["name"] for t in captured["kwargs"]["tools"]}
+    assert "Read" in names
+    assert "Write" not in names
+    assert "Bash" not in names
+    assert "explore" in captured["kwargs"]["system_extra"]
+
+    before = len(await store.list_entities(SESSION_TYPE))
+    bad = await run_tools(
+        "SpawnSubagent",
+        {"task": "nope", "role": "overlord"},
+        _ctx(store, ws, sid),
+    )
+    assert "type must be" in bad
+    assert len(await store.list_entities(SESSION_TYPE)) == before
+
+
 def test_parent_tool_spec_still_includes_spawn():
     names = {t["name"] for t in TOOL_SPEC}
     assert "SpawnSubagent" in names
@@ -237,6 +301,7 @@ def test_parent_tool_spec_still_includes_spawn():
     assert "TodoWrite" in names
     assert "ReadLints" in names
     assert "ProposePatch" in names
+    assert "Browser" in names
 
 
 @pytest.mark.asyncio

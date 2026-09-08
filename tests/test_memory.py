@@ -2,10 +2,22 @@ import json
 
 import pytest
 
+from orbweaver.agent import TOOL_SPEC, run_tools
 from orbweaver.config import settings
-from orbweaver.agent import run_tools
-from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
-from orbweaver.store import Entity, Event, PinBudgetError, reset_store_for_tests, new_uuid
+from orbweaver.memory import (
+    GRAPH_MAX_DEPTH,
+    expand_chunk_graph,
+    graph_neighborhood,
+    remember,
+    rewrite_search_query,
+)
+from orbweaver.store import (
+    Entity,
+    Event,
+    PinBudgetError,
+    new_uuid,
+    reset_store_for_tests,
+)
 from orbweaver.tokens import estimate_tokens
 
 
@@ -112,3 +124,63 @@ async def test_memory_search_tool_includes_graph(store):
         "MemorySearch", {"query": "pin budget tokens", "expand_graph": False}, ctx
     )
     assert json.loads(skipped)["graph"] == []
+
+
+@pytest.mark.asyncio
+async def test_graph_neighborhood_walks_jsonld_edges(store):
+    project = "urn:orbweaver:entity:project-airbed"
+    await store.put_entity(
+        Entity(
+            id=new_uuid(),
+            at_id="urn:orbweaver:entity:decision-graph-1",
+            at_type="Decision",
+            jsonld={
+                "@id": "urn:orbweaver:entity:decision-graph-1",
+                "@type": "Decision",
+                "about": project,
+            },
+        )
+    )
+    out = await graph_neighborhood(store, "urn:orbweaver:entity:decision-graph-1", depth=1)
+    assert out["id"] == "urn:orbweaver:entity:decision-graph-1"
+    assert out["depth"] == 1
+    assert any(t["o"] == project and t["p"] == "about" for t in out["triples"])
+
+
+@pytest.mark.asyncio
+async def test_graph_neighborhood_caps_depth_and_requires_id(store):
+    empty = await graph_neighborhood(store, "  ", depth=2)
+    assert empty["error"] == "id is required"
+    assert empty["triples"] == []
+    deep = await graph_neighborhood(store, "urn:orbweaver:entity:x", depth=99)
+    assert deep["depth"] == GRAPH_MAX_DEPTH
+
+
+@pytest.mark.asyncio
+async def test_memory_graph_tool(store, tmp_path):
+    from orbweaver.workspace import LocalWorkspace
+
+    await store.put_entity(
+        Entity(
+            id=new_uuid(),
+            at_id="urn:orbweaver:entity:decision-graph-2",
+            at_type="Decision",
+            jsonld={
+                "@id": "urn:orbweaver:entity:decision-graph-2",
+                "@type": "Decision",
+                "about": "urn:orbweaver:entity:project-x",
+            },
+        )
+    )
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    result = await run_tools(
+        "MemoryGraph",
+        {"id": "urn:orbweaver:entity:decision-graph-2", "depth": 1},
+        {"workspace": ws, "store": store, "session_id": new_uuid()},
+    )
+    body = json.loads(result)
+    assert body["id"] == "urn:orbweaver:entity:decision-graph-2"
+    assert any(t["p"] == "about" for t in body["triples"])
+    names = {t["name"] for t in TOOL_SPEC}
+    assert "MemoryGraph" in names
+    assert "WorkspaceSearch" in names
