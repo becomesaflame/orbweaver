@@ -13,6 +13,7 @@ from orbweaver.compact import (
     rehydrate_messages,
     reset_compact_state,
 )
+from orbweaver.compact.project import ensure_tool_use_results, unpaired_tool_use_ids
 from orbweaver.compact.usage import (
     compact_failures,
     estimate_prompt_tokens,
@@ -377,3 +378,86 @@ def test_events_to_messages_stubs_interrupted_tool_before_later_result():
     ]
     assert read_stub and read_stub[0].get("is_error") is True
     assert "interrupted" in str(read_stub[0].get("content") or "").lower()
+    assert unpaired_tool_use_ids(messages) == []
+
+
+def test_ensure_tool_use_results_fills_gap_before_user_text():
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "toolu_a", "name": "Read", "input": {"path": "a.py"}},
+            ],
+        },
+        {"role": "user", "content": "continue please"},
+    ]
+    assert unpaired_tool_use_ids(messages) == ["toolu_a"]
+    fixed = ensure_tool_use_results(messages)
+    assert unpaired_tool_use_ids(fixed) == []
+    follow = fixed[2]
+    assert follow["role"] == "user"
+    blocks = follow["content"]
+    assert blocks[0]["type"] == "tool_result"
+    assert blocks[0]["tool_use_id"] == "toolu_a"
+    assert blocks[0]["is_error"] is True
+    assert any(b.get("type") == "text" and "continue please" in b.get("text", "") for b in blocks)
+
+
+def test_ensure_tool_use_results_stubs_unmatched_use_beside_a_real_result():
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_bash", "content": "ok"}],
+        },
+    ]
+    assert unpaired_tool_use_ids(messages) == ["toolu_read"]
+    fixed = ensure_tool_use_results(messages)
+    assert unpaired_tool_use_ids(fixed) == []
+    ids = [
+        b["tool_use_id"]
+        for b in fixed[1]["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    ]
+    assert ids == ["toolu_read", "toolu_bash"]
+    assert ensure_tool_use_results(fixed) == fixed
+
+
+def test_events_to_messages_pairs_when_only_the_later_tool_has_a_result():
+    from orbweaver.store import Event
+
+    sid = uuid4()
+    events = [
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=1,
+            kind="tool_call",
+            payload={"id": "toolu_read", "name": "Read", "input": {"path": "a.py"}},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="tool_call",
+            payload={"id": "toolu_bash", "name": "Bash", "input": {"command": "true"}},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=3,
+            kind="tool_result",
+            payload={"tool_use_id": "toolu_bash", "name": "Bash", "content": "ok"},
+        ),
+    ]
+    messages = events_to_messages(events)
+    assert unpaired_tool_use_ids(messages) == []
+    assert "toolu_read" in _tool_result_ids(messages)
+    assert "toolu_bash" in _tool_result_ids(messages)

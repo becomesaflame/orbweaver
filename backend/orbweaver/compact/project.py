@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from typing import Any
 
@@ -10,6 +11,8 @@ from orbweaver.config import settings
 from orbweaver.image import image_read_tool_content, parse_image_read_payload, user_image_blocks
 from orbweaver.store import Event
 from orbweaver.tokens import estimate_tokens
+
+log = logging.getLogger(__name__)
 
 BOUNDARY_KINDS = frozenset({"compact_boundary", "compact_summary"})
 COMPACTABLE_TOOLS = frozenset({"Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Browser"})
@@ -182,6 +185,93 @@ def _append_user_content(messages: list[dict[str, Any]], content: str | list[dic
         messages.append({"role": "user", "content": content})
 
 
+def _content_blocks(content: Any) -> list[Any]:
+    if isinstance(content, list):
+        return list(content)
+    if isinstance(content, str) and content:
+        return [{"type": "text", "text": content}]
+    return []
+
+
+def _tool_use_blocks(msg: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not msg or msg.get("role") != "assistant":
+        return []
+    return [
+        b
+        for b in _content_blocks(msg.get("content"))
+        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+    ]
+
+
+def _tool_result_id_set(msg: dict[str, Any] | None) -> set[str]:
+    if not msg or msg.get("role") != "user":
+        return set()
+    return {
+        str(b.get("tool_use_id"))
+        for b in _content_blocks(msg.get("content"))
+        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")
+    }
+
+
+def _stub_tool_result(tool_use_id: str) -> dict[str, Any]:
+    return {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": INTERRUPTED_TOOL,
+        "is_error": True,
+    }
+
+
+def unpaired_tool_use_ids(messages: list[dict[str, Any]]) -> list[str]:
+    """Ids of assistant tool_use blocks not covered by the next user tool_result message."""
+    missing: list[str] = []
+    for i, msg in enumerate(messages):
+        nxt = messages[i + 1] if i + 1 < len(messages) else None
+        have = _tool_result_id_set(nxt)
+        for block in _tool_use_blocks(msg):
+            uid = str(block["id"])
+            if uid not in have:
+                missing.append(uid)
+    return missing
+
+
+def ensure_tool_use_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Guarantee each assistant tool_use is followed by matching tool_result blocks.
+
+    Anthropic rejects a messages.create where a tool_use has no tool_result in the
+    immediately following user message. Stub missing results rather than send that.
+    """
+    out: list[dict[str, Any]] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        uses = _tool_use_blocks(msg)
+        out.append(msg)
+        if not uses:
+            i += 1
+            continue
+        needed = [str(b["id"]) for b in uses]
+        nxt = messages[i + 1] if i + 1 < n else None
+        have = _tool_result_id_set(nxt)
+        missing = [uid for uid in needed if uid not in have]
+        if not missing:
+            i += 1
+            continue
+        log.warning("stubbing unpaired tool_use before LLM call: %s", missing)
+        stubs = [_stub_tool_result(uid) for uid in missing]
+        if nxt is not None and nxt.get("role") == "user":
+            merged = dict(nxt)
+            rest = _content_blocks(nxt.get("content"))
+            merged["content"] = stubs + rest
+            out.append(merged)
+            i += 2
+            continue
+        out.append({"role": "user", "content": stubs})
+        i += 1
+    return out
+
+
 def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     pending_tool: list[dict[str, Any]] = []
@@ -246,7 +336,7 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                 {"role": "user", "content": f"[compacted earlier turns]\n{p.get('text') or ''}"}
             )
     _flush_pending_tools(messages, pending_tool, stub_results=True)
-    return messages
+    return ensure_tool_use_results(messages)
 
 
 def extractive_summary(dropped: list[Event]) -> str:

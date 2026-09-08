@@ -14,6 +14,7 @@ from uuid import UUID
 
 from orbweaver import __version__
 from orbweaver.compact import (
+    ensure_tool_use_results,
     events_to_messages,
     live_events,
     maybe_compact,
@@ -662,7 +663,7 @@ def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dic
     messages = inject_session_todos(messages, events)
     if not messages:
         messages = [{"role": "user", "content": user_text}]
-    return messages
+    return ensure_tool_use_results(messages)
 
 
 def static_system(channel: str = "") -> str:
@@ -1259,6 +1260,7 @@ async def agent_turn(
                 )
             elif ctx.pop("git_not_done_nudge_pending", False):
                 _nudge_user(messages, GIT_NOT_DONE_NUDGE)
+            messages = ensure_tool_use_results(messages)
             try:
                 resp = await _await_or_cancel(
                     client.messages.create(
@@ -1425,6 +1427,7 @@ async def agent_turn(
                 messages,
                 GIT_NOT_DONE_CONCLUDE if ctx.get("git_not_done") else CONCLUDE_NUDGE,
             )
+            messages = ensure_tool_use_results(messages)
             try:
                 resp = await _await_or_cancel(
                     client.messages.create(

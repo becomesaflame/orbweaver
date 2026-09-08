@@ -3,6 +3,7 @@
 from orbweaver.compact.persist import persist_tool_result
 from orbweaver.compact.pipeline import maybe_compact
 from orbweaver.compact.project import (
+    ensure_tool_use_results,
     events_to_messages,
     live_events,
     microcompact_events,
@@ -18,6 +19,7 @@ from orbweaver.compact.usage import (
 )
 
 __all__ = [
+    "ensure_tool_use_results",
     "estimate_prompt_tokens",
     "event_token_count",
     "events_to_messages",
