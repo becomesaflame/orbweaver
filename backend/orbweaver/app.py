@@ -4,13 +4,11 @@ import asyncio
 import ipaddress
 import json
 import os
-from collections import defaultdict
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from time import time
 from typing import Any
 from uuid import UUID
 
@@ -21,10 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from orbweaver import __version__
-from orbweaver.agent import TurnCancelled, agent_turn
+from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel
 from orbweaver.auth import mint_token, require_user
 from orbweaver.config import settings
 from orbweaver.memory import remember, rewrite_search_query
+from orbweaver.ratelimit import get_rate_limiter
 from orbweaver.store import (
     SESSION_TYPE,
     Entity,
@@ -85,7 +84,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_hits: dict[str, list[float]] = defaultdict(list)
+
 _RATE_LIMIT_WINDOW_S = 60.0
 _RATE_LIMIT_MAX = 120
 
@@ -145,12 +144,12 @@ async def rate_limit(request: Request, call_next):
     if request.url.path in {"/health", "/"}:
         return await call_next(request)
     key = _rate_limit_key(request)
-    now = time()
-    window = [t for t in _hits[key] if now - t < _RATE_LIMIT_WINDOW_S]
-    if len(window) >= _RATE_LIMIT_MAX:
+    limiter = get_rate_limiter()
+    if hasattr(limiter, "max_hits"):
+        limiter.max_hits = _RATE_LIMIT_MAX
+        limiter.window_seconds = _RATE_LIMIT_WINDOW_S
+    if not await limiter.hit(str(key)):
         return JSONResponse({"detail": "rate limited"}, status_code=429)
-    window.append(now)
-    _hits[key] = window
     return await call_next(request)
 
 
@@ -190,6 +189,7 @@ class SessionBody(BaseModel):
     workspace_uri: str
     workspace_kind: str = "local"
     title: str = "New chat"
+    channel: str | None = None
 
 
 class WorkspaceMkdirBody(BaseModel):
@@ -457,6 +457,9 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
             "created_at": datetime.now(UTC).isoformat(),
         },
     )
+    channel = normalize_channel(body.channel)
+    if channel:
+        ent.jsonld["channel"] = channel
     await get_store().put_entity(ent)
     return {"id": str(uid), "at_id": ent.at_id, "workspace_uri": uri, "title": ent.jsonld["title"]}
 
