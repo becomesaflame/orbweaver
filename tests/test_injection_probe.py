@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+
 from orbweaver.config import settings
 from orbweaver.permissions.injection_probe import probe_tool_output
 
