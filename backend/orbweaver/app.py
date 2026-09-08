@@ -4,13 +4,11 @@ import asyncio
 import ipaddress
 import json
 import os
-import re
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from time import time
 from typing import Any
 from uuid import UUID
 
@@ -21,10 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from orbweaver import __version__
-from orbweaver.agent import TurnCancelled, agent_turn
+from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel
 from orbweaver.auth import mint_token, require_user
 from orbweaver.config import settings
 from orbweaver.memory import remember, rewrite_search_query
+from orbweaver.ratelimit import get_rate_limiter
 from orbweaver.store import (
     SESSION_TYPE,
     Entity,
@@ -85,7 +84,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_hits: dict[str, list[float]] = defaultdict(list)
+
 _RATE_LIMIT_WINDOW_S = 60.0
 _RATE_LIMIT_MAX = 120
 
@@ -145,12 +144,12 @@ async def rate_limit(request: Request, call_next):
     if request.url.path in {"/health", "/"}:
         return await call_next(request)
     key = _rate_limit_key(request)
-    now = time()
-    window = [t for t in _hits[key] if now - t < _RATE_LIMIT_WINDOW_S]
-    if len(window) >= _RATE_LIMIT_MAX:
+    limiter = get_rate_limiter()
+    if hasattr(limiter, "max_hits"):
+        limiter.max_hits = _RATE_LIMIT_MAX
+        limiter.window_seconds = _RATE_LIMIT_WINDOW_S
+    if not await limiter.hit(str(key)):
         return JSONResponse({"detail": "rate limited"}, status_code=429)
-    window.append(now)
-    _hits[key] = window
     return await call_next(request)
 
 
@@ -190,7 +189,7 @@ class SessionBody(BaseModel):
     workspace_uri: str
     workspace_kind: str = "local"
     title: str = "New chat"
-    channel: str = ""
+    channel: str | None = None
 
 
 class WorkspaceMkdirBody(BaseModel):
@@ -242,16 +241,6 @@ class RunningTurn:
 _running_turns: dict[UUID, RunningTurn] = {}
 _ws_subscribers: dict[UUID, set[WebSocket]] = defaultdict(set)
 _GENERIC_TITLES = {"", "web", "session", "New chat", "vscode"}
-_CHANNEL_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
-
-
-def normalize_channel(channel: str | None) -> str:
-    raw = (channel or "").strip().lower()
-    if not raw:
-        return ""
-    if not _CHANNEL_RE.fullmatch(raw):
-        raise HTTPException(400, "invalid channel")
-    return raw
 
 
 def reset_ws_subscribers_for_tests() -> None:
@@ -259,10 +248,7 @@ def reset_ws_subscribers_for_tests() -> None:
 
 
 def _stored_channel(jsonld: dict[str, Any]) -> str:
-    try:
-        return normalize_channel(str(jsonld.get("channel") or ""))
-    except HTTPException:
-        return ""
+    return normalize_channel(str(jsonld.get("channel") or ""))
 
 
 def _broadcast(session_id: UUID, msg: dict[str, Any]) -> None:
@@ -486,11 +472,12 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
             "workspace_uri": uri,
             "workspace_kind": normalize_workspace_kind(body.workspace_kind),
             "title": body.title or "New chat",
-            "channel": channel,
             "status": "active",
             "created_at": datetime.now(UTC).isoformat(),
         },
     )
+    if channel:
+        ent.jsonld["channel"] = channel
     await get_store().put_entity(ent)
     return {
         "id": str(uid),

@@ -49,12 +49,14 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://orbweaver:orbweaver@localhost:5432/orbweaver"
     orbweaver_store: str = "memory"  # memory | postgres
     workspace_root: str = "."
+    orbweaver_data_dir: str = ""  # empty → ~/.orbweaver (file-backed rate limits)
     telegram_bot_token: str = ""
     telegram_allowlist: str = ""
     orbweaver_image_api_key: str = ""
     orbweaver_image_api_url: str = "https://api.openai.com/v1/images/generations"
     orbweaver_image_model: str = "dall-e-3"
     orbweaver_image_size: str = "1024x1024"
+    orbweaver_linter: str = ""  # e.g. ruff check {paths} ; empty uses the Python AST stub
     orbweaver_search_provider: str = ""  # duckduckgo | brave | empty auto
     orbweaver_brave_api_key: str = ""
     brave_search_api_key: str = ""

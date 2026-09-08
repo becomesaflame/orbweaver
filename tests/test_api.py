@@ -152,12 +152,13 @@ async def test_browse_workspaces(tmp_path: Path, monkeypatch, auth_header):
 async def test_session_channel_vscode(auth_header):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        bad = await client.post(
+        alias = await client.post(
             "/v1/sessions",
             json={"workspace_uri": "workspace:default", "channel": "VS CODE"},
             headers=auth_header,
         )
-        assert bad.status_code == 400
+        assert alias.status_code == 200, alias.text
+        assert alias.json()["channel"] == "vscode"
         created = await client.post(
             "/v1/sessions",
             json={

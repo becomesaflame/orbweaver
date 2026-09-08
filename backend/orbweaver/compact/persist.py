@@ -16,6 +16,9 @@ SKIP_PERSIST = frozenset(
         "MemoryRemember",
         "MemoryPin",
         "MemoryForget",
+        "TodoWrite",
+        "Delete",
+        "ReadLints",
     }
 )
 PREVIEW_CHARS = 2000
