@@ -232,6 +232,7 @@ def test_parent_tool_spec_still_includes_spawn():
     assert "SendPhoto" in names
     assert "GenerateImage" in names
     assert "ProposePatch" in names
+    assert "Browser" in names
 
 
 @pytest.mark.asyncio

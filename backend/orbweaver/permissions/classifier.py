@@ -74,6 +74,10 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
         return {"prompt": inp.get("prompt"), "path": inp.get("path")}
     if name == "WebFetch":
         return {"url": inp.get("url")}
+    if name == "Browser":
+        from orbweaver.browser import classifier_payload
+
+        return classifier_payload(inp)
     if name == "WebSearch":
         return {"query": inp.get("query")}
     if name == "SpawnSubagent":

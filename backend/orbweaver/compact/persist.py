@@ -12,6 +12,7 @@ SKIP_PERSIST = frozenset(
         "Read",
         "WebFetch",
         "WebSearch",
+        "Browser",
         "MemorySearch",
         "MemoryRemember",
         "MemoryPin",

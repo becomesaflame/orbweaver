@@ -104,6 +104,10 @@ def _subject(tool: str, inp: dict[str, Any]) -> str:
         return str(inp.get("prompt") or inp.get("path") or "")
     if tool == "WebFetch":
         return str(inp.get("url") or "")
+    if tool == "Browser":
+        from orbweaver.browser import summarize_browser
+
+        return summarize_browser(inp)
     if tool == "WebSearch":
         return str(inp.get("query") or "")
     if tool == "SpawnSubagent":

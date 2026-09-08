@@ -11,7 +11,7 @@ from orbweaver.store import Event
 from orbweaver.tokens import estimate_tokens
 
 BOUNDARY_KINDS = frozenset({"compact_boundary", "compact_summary"})
-COMPACTABLE_TOOLS = frozenset({"Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"})
+COMPACTABLE_TOOLS = frozenset({"Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Browser"})
 PAIR_KINDS = frozenset(
     {
         "tool_call",

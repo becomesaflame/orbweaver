@@ -134,13 +134,47 @@ TOOL_SPEC = [
         "name": "WebFetch",
         "description": (
             "HTTP GET a known URL and return extracted readable text (HTML is stripped). "
-            "Find URLs with WebSearch first. Do not keep fetching nearby docs URLs when the "
-            "result says the page is JavaScript-rendered."
+            "Find URLs with WebSearch first. When the result says the page is "
+            "JavaScript-rendered, use Browser instead of fetching nearby docs URLs."
         ),
         "input_schema": {
             "type": "object",
             "properties": {"url": {"type": "string"}},
             "required": ["url"],
+        },
+    },
+    {
+        "name": "Browser",
+        "description": (
+            "Drive a headless Chromium session to verify UI. Actions: navigate, click, type, "
+            "snapshot (visible text and controls after JavaScript), screenshot (PNG under "
+            "attachments/). Use this when WebFetch reports a JavaScript-rendered page or when "
+            "you changed web/ and need to click through a flow. Requires "
+            'pip install -e ".[browser]" and playwright install chromium. file:// and '
+            "workspace-relative paths must stay in the workspace. Classified like WebFetch "
+            "(not auto-allowed)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["navigate", "click", "type", "snapshot", "screenshot"],
+                },
+                "url": {
+                    "type": "string",
+                    "description": "navigate: http(s) URL, file://, or workspace-relative path",
+                },
+                "selector": {"type": "string", "description": "CSS selector for click/type"},
+                "text": {"type": "string", "description": "Text to type into the selector"},
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "screenshot: workspace PNG path, default attachments/browser-<id>.png"
+                    ),
+                },
+            },
+            "required": ["action"],
         },
     },
     {
@@ -366,7 +400,8 @@ def static_system(channel: str = "") -> str:
         "stay blocked; do not route around them. Call independent tools in parallel in "
         "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
         "Use WebSearch to find sources, then WebFetch a few result URLs; do not guess "
-        "docs paths. Finish with a user-visible answer before the tool-round budget runs out; "
+        "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
+        "Finish with a user-visible answer before the tool-round budget runs out; "
         "spawn a subagent for a long exploration instead of burning parent rounds."
     )
 
@@ -432,6 +467,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         r = httpx.get(inp["url"], timeout=20.0, follow_redirects=True)  # noqa: ASYNC210
         ctype = r.headers.get("content-type") or ""
         return format_webfetch(str(inp.get("url") or ""), r.status_code, ctype, r.text)
+    if name == "Browser":
+        from orbweaver.browser import run_browser
+
+        return await run_browser(inp, ctx)
     if name == "WebSearch":
         from orbweaver.websearch import run_websearch
 

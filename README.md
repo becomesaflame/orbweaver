@@ -52,7 +52,7 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWLIST` (comma-separated user ids). Se
 
 ### Permissions and sandbox
 
-Default mode is **auto**: in-project writes apply immediately; a transcript classifier (Sonnet, `ORBWEAVER_CLASSIFIER_MODEL`) reviews `Bash` with `permissions: ["full_network"]` or `["all"]`, WebFetch, and `SpawnSubagent`. It returns **allow**, **ask**, or **hard-deny**. `WebSearch` talks only to DuckDuckGo or Brave and is allowlisted like Grep; deny/ask rules still apply. Sandbox limits and soft-deny actions check in with the user; hard-deny (secrets, persistence, self-granting power) stays rare. A separate Haiku injection probe (`ORBWEAVER_INJECTION_PROBE_MODEL`) warns on untrusted tool output. Telegram/cron abort on ask or repeated hard denials and **always tell the user why**.
+Default mode is **auto**: in-project writes apply immediately; a transcript classifier (Sonnet, `ORBWEAVER_CLASSIFIER_MODEL`) reviews `Bash` with `permissions: ["full_network"]` or `["all"]`, WebFetch, Browser, and `SpawnSubagent`. It returns **allow**, **ask**, or **hard-deny**. `WebSearch` talks only to DuckDuckGo or Brave and is allowlisted like Grep; deny/ask rules still apply. Sandbox limits and soft-deny actions check in with the user; hard-deny (secrets, persistence, self-granting power) stays rare. A separate Haiku injection probe (`ORBWEAVER_INJECTION_PROBE_MODEL`) warns on untrusted tool output. Telegram/cron abort on ask or repeated hard denials and **always tell the user why**.
 
 Linux Bash for `LocalWorkspace` runs in **bubblewrap**. The sandbox is write confinement, not a hidden host: files are readable, writes stay in the working set (workspace plus extra roots), a private `/dev` is remounted after the host bind so `/dev/null` works, `/run` is hidden except `allowUnixSockets` (the systemd journal sockets are granted by default), and outbound HTTP uses a CONNECT proxy with a package-manager domain allowlist. RFC1918, loopback, and cloud metadata are blocked on that network path. `unsandboxed: true` aliases `permissions: ["all"]` for one minor version.
 
@@ -76,8 +76,20 @@ sudo systemctl reload apparmor
 
 If bubblewrap cannot start, local Bash fails closed (`ORBWEAVER_SANDBOX_FAIL_IF_UNAVAILABLE=true`). Nested bwrap is skipped inside Compose containers.
 
+### Browser tool (optional)
+
+UI verification uses Playwright Chromium (`navigate`, `click`, `type`, `snapshot`, `screenshot`). It is classified like WebFetch, not auto-allowed. CI does not install the extra; wiring and permission tests always run.
+
+```bash
+cd backend
+pip install -e ".[browser]"
+playwright install chromium
+```
+
 ### Tests
 
 ```bash
 python3 -m pytest tests -q
 ```
+
+Playwright integration tests skip unless the `[browser]` extra and Chromium are installed.
