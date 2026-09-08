@@ -104,13 +104,11 @@ async def test_postgres_backend_when_store_is_postgres(tmp_path: Path, monkeypat
 
 @pytest.mark.asyncio
 async def test_http_rate_limit_uses_shared_store(tmp_path: Path, monkeypatch):
+    from orbweaver import app as app_mod
+
     monkeypatch.setattr(settings, "orbweaver_data_dir", str(tmp_path))
     reset_rate_limiter_for_tests(tmp_path)
-    limiter = FileRateLimiter(tmp_path, max_hits=3)
-    from orbweaver import ratelimit as rl
-
-    monkeypatch.setattr(rl, "_LIMITER", limiter)
-    limiter.max_hits = 3
+    monkeypatch.setattr(app_mod, "_RATE_LIMIT_MAX", 3)
 
     transport = ASGITransport(app=app, client=("10.0.0.1", 123))
     async with AsyncClient(transport=transport, base_url="http://test") as client:
