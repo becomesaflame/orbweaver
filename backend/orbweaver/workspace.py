@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
 import shutil
+import signal
 import subprocess
+import threading
+import time
 from pathlib import Path
+from uuid import uuid4
 
 from orbweaver.config import settings
 from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
 from orbweaver.tooltext import normalize_grep_pattern
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
 
+log = logging.getLogger(__name__)
+
+DEFAULT_BASH_TIMEOUT_S = 30
+MAX_BASH_TIMEOUT_S = 600
 GREP_HIT_CAP = 50
 GLOB_HIT_CAP = 200
 GREP_LINE_CAP = 200
@@ -83,6 +94,134 @@ def _bash_permissions(permissions=None, unsandboxed: bool = False) -> frozenset[
     return frozenset(out)
 
 
+def _as_int(value, default: int | None = None) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+
+def resolve_bash_timeout(
+    timeout=None,
+    block_until_ms=None,
+    *,
+    default: int = DEFAULT_BASH_TIMEOUT_S,
+) -> int:
+    """Seconds to wait. Default 30s; cap at 600s (10 minutes)."""
+    seconds = _as_int(timeout)
+    if seconds is None:
+        ms = _as_int(block_until_ms)
+        if ms is None:
+            seconds = default
+        else:
+            seconds = max(1, (ms + 999) // 1000) if ms > 0 else 0
+    return max(0, min(int(seconds), MAX_BASH_TIMEOUT_S))
+
+
+def _decode_captured(data) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return str(data)
+
+
+def _terminate_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except OSError:
+            return
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _timeout_message(timeout: int, output: str) -> str:
+    body = (output or "")[-200_000:]
+    prefix = f"timeout: command exceeded {timeout}s"
+    return f"{prefix}\n{body}" if body else prefix
+
+
+class _BashJob:
+    def __init__(self, job_id: str, command: str, timeout: int, proc: subprocess.Popen, cleanup=None):
+        self.job_id = job_id
+        self.command = command
+        self.timeout = timeout
+        self.proc = proc
+        self.cleanup = cleanup
+        self.started_at = time.monotonic()
+        self.status = "running"
+        self.returncode: int | None = None
+        self.output = ""
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._wait, daemon=True)
+        self._thread.start()
+
+    def _wait(self) -> None:
+        try:
+            try:
+                stdout, stderr = self.proc.communicate(timeout=self.timeout)
+                self.status = "exited"
+                self.returncode = self.proc.returncode
+                self.output = (_decode_captured(stdout) + _decode_captured(stderr))[-200_000:]
+            except subprocess.TimeoutExpired:
+                _terminate_process(self.proc)
+                stdout, stderr = self.proc.communicate(timeout=5)
+                self.status = "timeout"
+                self.returncode = self.proc.returncode
+                self.output = _timeout_message(
+                    self.timeout, _decode_captured(stdout) + _decode_captured(stderr)
+                )
+        except Exception as e:
+            self.status = "error"
+            self.output = str(e)
+        finally:
+            if self.cleanup is not None:
+                try:
+                    self.cleanup()
+                except Exception:
+                    log.exception("failed to clean up background bash job")
+            self._done.set()
+
+    def wait(self, seconds: float) -> bool:
+        return self._done.wait(timeout=max(0.0, seconds))
+
+    def snapshot(self) -> str:
+        payload: dict = {
+            "job_id": self.job_id,
+            "status": self.status,
+            "command": self.command,
+            "timeout": self.timeout,
+        }
+        if self.status == "running":
+            payload["elapsed_s"] = round(time.monotonic() - self.started_at, 3)
+        else:
+            payload["returncode"] = self.returncode
+            payload["output"] = self.output
+        return json.dumps(payload)
+
+
 class LocalWorkspace:
     host_reads = True
 
@@ -96,6 +235,7 @@ class LocalWorkspace:
         self.uri = validate_workspace_uri(workspace_uri)
         self.root = resolve_workspace_uri(self.uri, workspace_root)
         self.host_reads = host_reads
+        self._jobs: dict[str, _BashJob] = {}
 
     def _policy(self):
         return load_sandbox_policy(self.root)
@@ -293,44 +433,101 @@ class LocalWorkspace:
         return hits
 
     def _raw_bash(self, command: str, timeout: int) -> str:
-        proc = subprocess.run(
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            return _timeout_message(timeout, _decode_captured(e.stdout) + _decode_captured(e.stderr))
+        return ((proc.stdout or "") + (proc.stderr or ""))[-200_000:]
+
+    def _spawn_raw(self, command: str) -> subprocess.Popen:
+        return subprocess.Popen(
             command,
             shell=True,
             cwd=self.root,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            check=False,
+            start_new_session=True,
         )
-        return ((proc.stdout or "") + (proc.stderr or ""))[-200_000:]
+
+    def collect_job(self, job_id: str, wait_s: float = 0) -> str:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return json.dumps({"job_id": job_id, "status": "unknown", "error": "no such job"})
+        job.wait(wait_s)
+        return job.snapshot()
+
+    def _start_job(self, command: str, timeout: int, proc: subprocess.Popen, cleanup=None) -> str:
+        job_id = f"bj_{uuid4().hex[:12]}"
+        self._jobs[job_id] = _BashJob(job_id, command, timeout, proc, cleanup=cleanup)
+        return self._jobs[job_id].snapshot()
 
     def bash(
         self,
-        command: str,
-        timeout: int = 30,
+        command: str = "",
+        timeout: int | None = None,
         sandbox: bool = True,
         unsandboxed: bool = False,
         permissions: list[str] | tuple[str, ...] | None = None,
+        background: bool = False,
+        job_id: str | None = None,
+        block_until_ms: int | None = None,
     ) -> str:
+        if job_id:
+            wait_default = 0 if timeout is None and block_until_ms is None else DEFAULT_BASH_TIMEOUT_S
+            wait_s = resolve_bash_timeout(timeout, block_until_ms, default=wait_default)
+            return self.collect_job(str(job_id), wait_s=wait_s)
+        seconds = resolve_bash_timeout(timeout, block_until_ms)
+        cmd = command if isinstance(command, str) else str(command or "")
+        if not cmd.strip():
+            return "error: command is required unless job_id is set"
         perms = _bash_permissions(permissions, unsandboxed)
-        if "all" in perms or not sandbox or not settings.orbweaver_sandbox:
-            return self._raw_bash(command, timeout)
-        from orbweaver.sandbox.bwrap import SandboxUnavailable, is_containerized, run_sandboxed
+        use_raw = "all" in perms or not sandbox or not settings.orbweaver_sandbox
+        if use_raw:
+            if background:
+                return self._start_job(cmd, seconds, self._spawn_raw(cmd))
+            return self._raw_bash(cmd, seconds)
+        from orbweaver.sandbox.bwrap import (
+            SandboxUnavailable,
+            is_containerized,
+            run_sandboxed,
+            spawn_sandboxed,
+        )
 
         if is_containerized():
-            return self._raw_bash(command, timeout)
+            if background:
+                return self._start_job(cmd, seconds, self._spawn_raw(cmd))
+            return self._raw_bash(cmd, seconds)
         try:
+            if background:
+                session = spawn_sandboxed(
+                    cmd,
+                    self.root,
+                    policy=self._policy(),
+                    full_network="full_network" in perms,
+                )
+                return self._start_job(cmd, seconds, session.proc, cleanup=session.close)
             return run_sandboxed(
-                command,
+                cmd,
                 self.root,
-                timeout,
+                seconds,
                 policy=self._policy(),
                 full_network="full_network" in perms,
             )
         except SandboxUnavailable as e:
             if settings.orbweaver_sandbox_fail_if_unavailable:
                 return f"sandbox_unavailable: {e}"
-            return self._raw_bash(command, timeout)
+            if background:
+                return self._start_job(cmd, seconds, self._spawn_raw(cmd))
+            return self._raw_bash(cmd, seconds)
 
     def propose_patch(self, path: str, old: str, new: str) -> dict:
         target = self._resolve(path, write=True)

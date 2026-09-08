@@ -146,6 +146,9 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
     events: list[Event] = ctx.get("events") or []
     mode = (settings.orbweaver_permission_mode or "auto").strip().lower()
 
+    if name == "Bash" and str(inp.get("job_id") or "").strip():
+        return PermissionDecision("allow", "bash job collect", "allowlist")
+
     if name in {"Read", "Write", "ProposePatch", "NotebookEdit", "SendPhoto", "Delete"}:
         path = str(inp.get("path") or "")
         if path_is_always_denied(path):

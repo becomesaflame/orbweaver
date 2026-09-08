@@ -118,6 +118,23 @@ def test_local_bash_fail_closed_without_bwrap(tmp_path: Path, monkeypatch):
     assert "sandbox_unavailable" in out
 
 
+def test_workspace_bash_forwards_timeout_to_sandbox(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(settings, "orbweaver_sandbox", True)
+    monkeypatch.setattr("orbweaver.sandbox.bwrap.is_containerized", lambda: False)
+    seen = {}
+
+    def fake_run(command, root, timeout, **kwargs):
+        seen["timeout"] = timeout
+        seen["command"] = command
+        return "ok"
+
+    monkeypatch.setattr("orbweaver.sandbox.bwrap.run_sandboxed", fake_run)
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    assert ws.bash("sleep 31", timeout=45) == "ok"
+    assert seen["timeout"] == 45
+    assert seen["command"] == "sleep 31"
+
+
 def test_sandbox_available_in_container(monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox", True)
     monkeypatch.setattr("orbweaver.sandbox.bwrap.is_containerized", lambda: True)
