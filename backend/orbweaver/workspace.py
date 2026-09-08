@@ -2,15 +2,72 @@
 
 from __future__ import annotations
 
-import glob as globmod
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 from orbweaver.config import settings
 from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
-from orbweaver.tooltext import grep_regex
+from orbweaver.tooltext import normalize_grep_pattern
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
+
+GREP_HIT_CAP = 50
+GLOB_HIT_CAP = 200
+GREP_LINE_CAP = 200
+RG_TIMEOUT_SEC = 30
+_RG_MISSING = (
+    "ripgrep (rg) is required for Grep and Glob. "
+    "Install ripgrep (Debian/Ubuntu: apt install ripgrep) and ensure rg is on PATH."
+)
+
+
+def ripgrep_path() -> str:
+    path = shutil.which("rg")
+    if not path:
+        raise FileNotFoundError(_RG_MISSING)
+    return path
+
+
+def _is_all_files_glob(spec: str) -> bool:
+    return spec in {"", "**/*", "**", "*"}
+
+
+def _ctx_int(value: object) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _trim_rg_line(line: str, content_cap: int = GREP_LINE_CAP) -> str:
+    parts = line.split(":", 2)
+    if len(parts) == 3 and parts[1].isdigit():
+        return f"{parts[0]}:{parts[1]}:{parts[2][:content_cap]}"
+    if len(line) > content_cap + 80:
+        return line[: content_cap + 80]
+    return line
+
+
+def _cap_grep_lines(lines: list[str], max_hits: int) -> tuple[list[str], bool]:
+    """Keep context, but stop after max_hits match lines (`path:lineno:`)."""
+    out: list[str] = []
+    matches = 0
+    for line in lines:
+        parts = line.split(":", 2)
+        is_match = len(parts) == 3 and parts[1].isdigit()
+        if is_match:
+            matches += 1
+            if matches > max_hits:
+                return out, True
+        out.append(_trim_rg_line(line))
+    return out, matches > max_hits
 
 
 def _bash_permissions(permissions=None, unsandboxed: bool = False) -> frozenset[str]:
@@ -105,39 +162,134 @@ class LocalWorkspace:
     def read_bytes(self, path: str) -> bytes:
         return self._resolve(path).read_bytes()
 
-    def glob(self, pattern: str) -> list[str]:
-        spec = (pattern or "").strip()
-        if spec.startswith(("/", "~")):
-            expanded = str(Path(spec).expanduser())
-            hits = []
-            for match in globmod.glob(expanded, recursive=True):
-                p = Path(match)
-                if p.is_file():
-                    try:
-                        self._resolve(str(p))
-                    except PermissionError:
-                        continue
-                    hits.append(str(p))
-                if len(hits) >= 200:
-                    break
-            return hits
-        return [str(p.relative_to(self.root)) for p in self.root.glob(pattern) if p.is_file()]
+    def _rg_base(self) -> list[str]:
+        return [
+            ripgrep_path(),
+            "--no-config",
+            "--color=never",
+            "--hidden",
+            "--glob",
+            "!.git/**",
+        ]
 
-    def grep(self, pattern: str, glob: str = "**/*") -> list[str]:
-        rx = grep_regex(pattern)
-        if rx is None:
-            return []
+    def _run_rg(self, args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                args,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=RG_TIMEOUT_SEC,
+                check=False,
+            )
+        except FileNotFoundError as e:
+            raise FileNotFoundError(_RG_MISSING) from e
+        except subprocess.TimeoutExpired as e:
+            raise TimeoutError("ripgrep timed out") from e
+
+    def _rg_files(self, search_root: Path, glob: str, *, relative: bool) -> list[str]:
+        cmd = self._rg_base() + ["--files"]
+        if not _is_all_files_glob(glob):
+            cmd.extend(["--glob", glob])
+        proc = self._run_rg(cmd, cwd=search_root)
+        if proc.returncode not in (0, 1):
+            err = (proc.stderr or proc.stdout or "ripgrep failed").strip()
+            raise RuntimeError(err)
         hits: list[str] = []
-        for rel in self.glob(glob):
-            try:
-                text = self.read(rel)
-            except (OSError, UnicodeDecodeError, PermissionError):
+        for raw in (proc.stdout or "").splitlines():
+            if not raw:
                 continue
-            for i, line in enumerate(text.splitlines(), 1):
-                if rx.search(line):
-                    hits.append(f"{rel}:{i}:{line[:200]}")
-                    if len(hits) >= 50:
-                        return hits
+            path = (search_root / raw).resolve() if not Path(raw).is_absolute() else Path(raw)
+            try:
+                self._resolve(str(path))
+            except PermissionError:
+                continue
+            if not path.is_file():
+                continue
+            hits.append(raw if relative else str(path))
+            if len(hits) >= GLOB_HIT_CAP:
+                break
+        return hits
+
+    def _absolute_glob_parts(self, spec: str) -> tuple[Path, str]:
+        expanded = Path(spec).expanduser()
+        acc = Path(expanded.anchor or "/")
+        rest: list[str] = []
+        seen_meta = False
+        for part in expanded.parts[1:]:
+            if seen_meta or any(ch in part for ch in "*?["):
+                seen_meta = True
+                rest.append(part)
+            else:
+                acc = acc / part
+        while not acc.exists() and acc != acc.parent:
+            rest.insert(0, acc.name)
+            acc = acc.parent
+        return acc, "/".join(rest) if rest else "*"
+
+    def glob(self, pattern: str) -> list[str]:
+        spec = (pattern or "").strip() or "**/*"
+        if spec.startswith(("/", "~")):
+            root, gpat = self._absolute_glob_parts(spec)
+            try:
+                self._resolve(str(root))
+            except PermissionError:
+                return []
+            return self._rg_files(root, gpat, relative=False)
+        return self._rg_files(self.root, spec, relative=True)
+
+    def grep(
+        self,
+        pattern: str,
+        glob: str = "**/*",
+        *,
+        file_type: str | None = None,
+        after: int = 0,
+        before: int = 0,
+        context: int = 0,
+        max_hits: int = GREP_HIT_CAP,
+    ) -> list[str]:
+        spec = normalize_grep_pattern(pattern)
+        if not spec:
+            return []
+        cmd = self._rg_base() + [
+            "--no-heading",
+            "--line-number",
+            "--max-columns",
+            str(GREP_LINE_CAP),
+            "--max-columns-preview",
+        ]
+        if not _is_all_files_glob((glob or "").strip()):
+            cmd.extend(["--glob", glob.strip()])
+        rg_type = (file_type or "").strip()
+        if rg_type:
+            cmd.extend(["--type", rg_type])
+        ctx = _ctx_int(context)
+        after_n = _ctx_int(after)
+        before_n = _ctx_int(before)
+        if ctx:
+            cmd.extend(["-C", str(ctx)])
+        else:
+            if after_n:
+                cmd.extend(["-A", str(after_n)])
+            if before_n:
+                cmd.extend(["-B", str(before_n)])
+        try:
+            re.compile(spec)
+        except re.error:
+            cmd.append("--fixed-strings")
+            spec = (pattern or "").strip()
+        cmd.extend(["--", spec, "."])
+        proc = self._run_rg(cmd, cwd=self.root)
+        if proc.returncode == 1:
+            return []
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "ripgrep failed").strip()
+            return [f"error: {err}"]
+        raw_lines = [ln for ln in (proc.stdout or "").splitlines() if ln != ""]
+        hits, truncated = _cap_grep_lines(raw_lines, max_hits)
+        if truncated:
+            hits.append(f"[truncated at {max_hits} hits]")
         return hits
 
     def _raw_bash(self, command: str, timeout: int) -> str:
