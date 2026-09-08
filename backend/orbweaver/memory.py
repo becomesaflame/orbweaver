@@ -56,6 +56,26 @@ def rewrite_search_query(events: list[Any], current: str, n: int = 6) -> str:
     return "\n".join(x for x in bits if x).strip() or current
 
 
+async def expand_chunk_graph(
+    store: Store, hits: list[tuple[Chunk, float]], *, depth: int = 1
+) -> list[dict[str, str]]:
+    """Walk JSON-LD neighbors of entities linked from search hits (same as POST /memory/search)."""
+    graph_hits: list[dict[str, str]] = []
+    seen_edges: set[tuple[str, str, str]] = set()
+    for chunk, _score in hits:
+        for eid in chunk.entity_ids:
+            ent = await store.get_entity(eid)
+            if not ent:
+                continue
+            for s, p, o in await store.graph(ent.at_id, depth=depth):
+                edge = (s, p, o)
+                if edge in seen_edges:
+                    continue
+                seen_edges.add(edge)
+                graph_hits.append({"s": s, "p": p, "o": o})
+    return graph_hits
+
+
 async def remember(
     store: Store, text: str, source: str = "", pinned: bool = False, entity_ids: list[UUID] | None = None
 ) -> Chunk:
