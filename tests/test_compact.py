@@ -3,7 +3,13 @@ from uuid import uuid4
 
 import pytest
 
-from orbweaver.agent import maybe_compact
+from orbweaver.agent import (
+    CONCLUDE_NUDGE,
+    LAST_ROUND_NUDGE,
+    _nudge_user,
+    _prompt_messages,
+    maybe_compact,
+)
 from orbweaver.compact import (
     events_to_messages,
     live_events,
@@ -23,10 +29,12 @@ from orbweaver.config import settings
 from orbweaver.store import (
     SESSION_TYPE,
     Entity,
+    Event,
     new_uuid,
     reset_store_for_tests,
     session_at_id,
 )
+from orbweaver.todos import inject_session_todos
 from orbweaver.workspace import LocalWorkspace
 
 
@@ -461,3 +469,306 @@ def test_events_to_messages_pairs_when_only_the_later_tool_has_a_result():
     assert unpaired_tool_use_ids(messages) == []
     assert "toolu_read" in _tool_result_ids(messages)
     assert "toolu_bash" in _tool_result_ids(messages)
+
+
+def _use(uid: str, name: str = "Read", **inp) -> dict:
+    return {"type": "tool_use", "id": uid, "name": name, "input": inp}
+
+
+def _result(uid: str, content: str = "ok") -> dict:
+    return {"type": "tool_result", "tool_use_id": uid, "content": content}
+
+
+def assert_each_tool_use_followed_by_results(messages: list[dict]) -> None:
+    """Anthropic rule: assistant tool_use ids must appear in the next user message."""
+    for i, msg in enumerate(messages):
+        content = msg.get("content")
+        if msg.get("role") != "assistant" or not isinstance(content, list):
+            continue
+        uses = [
+            str(b.get("id"))
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+        ]
+        if not uses:
+            continue
+        assert i + 1 < len(messages), f"tool_use {uses} has no following message"
+        nxt = messages[i + 1]
+        assert nxt.get("role") == "user", f"tool_use {uses} followed by {nxt.get('role')}"
+        follow = nxt.get("content")
+        have = {
+            str(b.get("tool_use_id"))
+            for b in follow
+            if isinstance(follow, list)
+            and isinstance(b, dict)
+            and b.get("type") == "tool_result"
+        }
+        missing = [uid for uid in uses if uid not in have]
+        assert not missing, f"tool_use {missing} missing tool_result in the next message"
+
+
+def test_ensure_leaves_fully_paired_messages_unchanged():
+    messages = [
+        {"role": "user", "content": "read it"},
+        {"role": "assistant", "content": [_use("toolu_a")]},
+        {"role": "user", "content": [_result("toolu_a", "file body")]},
+        {"role": "assistant", "content": "done"},
+    ]
+    assert unpaired_tool_use_ids(messages) == []
+    assert ensure_tool_use_results(messages) == messages
+    assert_each_tool_use_followed_by_results(messages)
+
+
+def test_ensure_pairs_two_uses_when_following_user_has_both_results():
+    messages = [
+        {
+            "role": "assistant",
+            "content": [_use("toolu_a"), _use("toolu_b", "Bash", command="true")],
+        },
+        {"role": "user", "content": [_result("toolu_a"), _result("toolu_b")]},
+    ]
+    assert unpaired_tool_use_ids(messages) == []
+    assert ensure_tool_use_results(messages) == messages
+    assert_each_tool_use_followed_by_results(messages)
+
+
+def test_ensure_inserts_stub_when_tool_use_is_last_message():
+    messages = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [_use("toolu_end")]},
+    ]
+    assert unpaired_tool_use_ids(messages) == ["toolu_end"]
+    fixed = ensure_tool_use_results(messages)
+    assert_each_tool_use_followed_by_results(fixed)
+    assert fixed[-1]["role"] == "user"
+    assert fixed[-1]["content"][0]["tool_use_id"] == "toolu_end"
+    assert fixed[-1]["content"][0]["is_error"] is True
+
+
+def test_ensure_inserts_stub_between_tool_use_and_following_assistant():
+    messages = [
+        {"role": "assistant", "content": [_use("toolu_a")]},
+        {"role": "assistant", "content": "I will continue"},
+    ]
+    assert unpaired_tool_use_ids(messages) == ["toolu_a"]
+    fixed = ensure_tool_use_results(messages)
+    assert_each_tool_use_followed_by_results(fixed)
+    assert [m["role"] for m in fixed] == ["assistant", "user", "assistant"]
+    assert fixed[1]["content"][0]["tool_use_id"] == "toolu_a"
+
+
+def test_ensure_pairs_mixed_text_and_tool_use_assistant_content():
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "looking"},
+                _use("toolu_a"),
+            ],
+        },
+    ]
+    fixed = ensure_tool_use_results(messages)
+    assert_each_tool_use_followed_by_results(fixed)
+    assert unpaired_tool_use_ids(fixed) == []
+
+
+def test_nudge_on_unpaired_tool_use_then_ensure_pairs():
+    """Last-round / conclude nudge must not leave user text after a bare tool_use."""
+    messages = [
+        {"role": "user", "content": "implement the meter"},
+        {"role": "assistant", "content": [_use("toolu_read", path="web/index.html")]},
+    ]
+    _nudge_user(messages, LAST_ROUND_NUDGE)
+    assert messages[-1]["role"] == "user"
+    assert unpaired_tool_use_ids(messages) == ["toolu_read"]
+    fixed = ensure_tool_use_results(messages)
+    assert_each_tool_use_followed_by_results(fixed)
+    blob = str(fixed[-1]["content"])
+    assert "toolu_read" in blob
+    assert "last tool round" in blob.lower()
+
+
+def test_conclude_nudge_on_user_tool_results_stays_paired():
+    messages = [
+        {"role": "assistant", "content": [_use("toolu_a")]},
+        {"role": "user", "content": [_result("toolu_a")]},
+    ]
+    _nudge_user(messages, CONCLUDE_NUDGE)
+    assert_each_tool_use_followed_by_results(messages)
+    assert ensure_tool_use_results(messages) == messages
+    assert CONCLUDE_NUDGE.split()[0] in str(messages[-1]["content"])
+
+
+def test_events_to_messages_interleaved_call_result_pairs():
+    sid = uuid4()
+    events = [
+        Event(id=uuid4(), session_id=sid, seq=1, kind="user", payload={"text": "look"}),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="tool_call",
+            payload={"id": "toolu_a", "name": "Read", "input": {"path": "a.py"}},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=3,
+            kind="tool_result",
+            payload={"tool_use_id": "toolu_a", "name": "Read", "content": "a"},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=4,
+            kind="tool_call",
+            payload={"id": "toolu_b", "name": "Read", "input": {"path": "b.py"}},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=5,
+            kind="tool_result",
+            payload={"tool_use_id": "toolu_b", "name": "Read", "content": "b"},
+        ),
+        Event(id=uuid4(), session_id=sid, seq=6, kind="assistant", payload={"text": "both files"}),
+    ]
+    messages = events_to_messages(events)
+    assert_each_tool_use_followed_by_results(messages)
+    assert _tool_use_ids(messages) == ["toolu_a", "toolu_b"]
+    assert _tool_result_ids(messages) == ["toolu_a", "toolu_b"]
+
+
+def test_events_to_messages_dangling_tool_call_at_end_is_stubbed():
+    sid = uuid4()
+    events = [
+        Event(id=uuid4(), session_id=sid, seq=1, kind="user", payload={"text": "read"}),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="tool_call",
+            payload={"id": "toolu_open", "name": "Read", "input": {"path": "x"}},
+        ),
+    ]
+    messages = events_to_messages(events)
+    assert_each_tool_use_followed_by_results(messages)
+    assert "toolu_open" in _tool_result_ids(messages)
+
+
+def test_events_to_messages_memory_recall_pairs_like_tool_result():
+    sid = uuid4()
+    events = [
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=1,
+            kind="tool_call",
+            payload={"id": "toolu_mem", "name": "MemorySearch", "input": {"query": "pins"}},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="MemoryRecall",
+            payload={"tool_use_id": "toolu_mem", "name": "MemorySearch", "content": "(no hits)"},
+        ),
+    ]
+    messages = events_to_messages(events)
+    assert_each_tool_use_followed_by_results(messages)
+    assert _tool_result_ids(messages) == ["toolu_mem"]
+
+
+def test_events_to_messages_user_correction_after_open_tool_call():
+    sid = uuid4()
+    events = [
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=1,
+            kind="tool_call",
+            payload={"id": "toolu_x", "name": "Write", "input": {"path": "a.py", "content": "x"}},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="UserCorrection",
+            payload={"text": "do not write that", "path": "a.py"},
+        ),
+    ]
+    messages = events_to_messages(events)
+    assert_each_tool_use_followed_by_results(messages)
+    assert "toolu_x" in _tool_result_ids(messages)
+
+
+def test_prompt_messages_after_stop_mid_read_is_paired(tmp_path):
+    sid = uuid4()
+    events = [
+        Event(id=uuid4(), session_id=sid, seq=1, kind="user", payload={"text": "Try again"}),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="tool_call",
+            payload={
+                "id": "toolu_01H231JbHVcmaosnK14e55WZ",
+                "name": "Read",
+                "input": {"path": "backend/orbweaver/agent.py", "offset": 601},
+            },
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=3,
+            kind="turn_interrupted",
+            payload={"reason": "stop"},
+        ),
+    ]
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    messages = _prompt_messages(events, ws, "Try again")
+    assert_each_tool_use_followed_by_results(messages)
+    assert unpaired_tool_use_ids(messages) == []
+
+
+def test_todo_inject_does_not_unpair_later_tool_use():
+    sid = uuid4()
+    events = [
+        Event(id=uuid4(), session_id=sid, seq=1, kind="user", payload={"text": "work"}),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="todo_state",
+            payload={"todos": [{"id": "1", "content": "ship meter", "status": "in_progress"}]},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=3,
+            kind="tool_call",
+            payload={"id": "toolu_a", "name": "Read", "input": {"path": "web/index.html"}},
+        ),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=4,
+            kind="tool_result",
+            payload={"tool_use_id": "toolu_a", "name": "Read", "content": "<html>"},
+        ),
+    ]
+    messages = events_to_messages(events)
+    messages = inject_session_todos(messages, events)
+    messages = ensure_tool_use_results(messages)
+    assert_each_tool_use_followed_by_results(messages)
+    assert any("ship meter" in str(m.get("content")) for m in messages)
+
+
+def test_ensure_empty_and_text_only_are_noops():
+    assert ensure_tool_use_results([]) == []
+    text_only = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    assert ensure_tool_use_results(text_only) == text_only
+    assert_each_tool_use_followed_by_results(text_only)
