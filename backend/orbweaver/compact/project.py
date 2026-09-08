@@ -22,6 +22,7 @@ PAIR_KINDS = frozenset(
         "injection_warning",
         "patch_proposal",
         "schedule_request",
+        "ask_user",
     }
 )
 

@@ -25,6 +25,7 @@ async def _slow_turn(
     cancel=None,
     turn_state=None,
     resume=False,
+    **_kwargs,
 ):
     if not resume:
         ev = await store.append_event(session_id, "user", {"text": user_text})

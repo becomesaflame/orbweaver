@@ -46,6 +46,10 @@ def texts_for_reply(events) -> str:
         text = (e.payload or {}).get("text")
         if text and e.kind in {"assistant", "turn_aborted"}:
             parts.append(str(text))
+        elif e.kind == "ask_user":
+            question = (e.payload or {}).get("question")
+            if question:
+                parts.append(str(question))
     return "\n".join(parts)[:3500]
 
 
@@ -226,6 +230,7 @@ async def _run_turn(update, context, text: str, images: list[dict[str, str]] | N
         ws,
         workspace_kind=kind,
         headless=True,
+        interactive=True,
         images=images,
         system_extra=TELEGRAM_IMAGE_HINT,
         channel="telegram",
