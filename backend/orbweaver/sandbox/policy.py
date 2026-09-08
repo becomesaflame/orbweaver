@@ -34,8 +34,6 @@ def default_journal_sockets(uid: int | None = None) -> tuple[Path, ...]:
 
 
 PROTECTED_WRITE_REL: tuple[str, ...] = (
-    ".git/hooks",
-    ".git/config",
     ".orbweaver/sandbox.json",
 )
 

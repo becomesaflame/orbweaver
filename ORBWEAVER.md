@@ -57,6 +57,13 @@ on the last green SHA.
 The live host pulls `origin/main`, checks out `main`, and restarts
 `orbweaver.service`. Agents do not deploy.
 
+## Production regressions
+
+When a production failure is diagnosed, add a test that reproduces it
+(same command path, same error class) with the fix. Inspecting argv is
+not enough when the bug is a runtime mount or OpenSSH check: execute
+bubblewrap. CI installs `bubblewrap` so those tests run on the PR.
+
 ## Versioning
 
 Semantic version **MAJOR.MINOR.PATCH** in `backend/orbweaver/__init__.py`

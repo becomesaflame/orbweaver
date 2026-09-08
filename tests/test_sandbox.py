@@ -1,9 +1,13 @@
 from pathlib import Path
 
+import pytest
+
 from orbweaver.config import settings
 from orbweaver.sandbox.bwrap import build_bwrap_argv, sandbox_available
 from orbweaver.sandbox.policy import SandboxPolicy
 from orbweaver.workspace import LocalWorkspace
+
+from sandbox_mounts import assert_ro_bind_dests_creatable
 
 
 def test_bwrap_argv_has_isolation(tmp_path: Path):
@@ -26,12 +30,39 @@ def test_bwrap_argv_has_isolation(tmp_path: Path):
     dev_i = argv.index("--dev")
     assert argv[dev_i + 1] == "/dev"
     assert root_i < dev_i, "host --ro-bind / / must not clobber --dev /dev"
+    assert_ro_bind_dests_creatable(argv)
+
+
+def test_ro_bind_openssh_onto_workspace_tmp_is_rejected():
+    """Reproduce production 0.6.0: stash dest under workspace tmp while / is still RO."""
+    dest = "/home/orbweaver/workspaces/.orbweaver-missing-openssh-stash"
+    assert not Path(dest).exists()
+    argv = [
+        "bwrap",
+        "--unshare-user",
+        "--ro-bind",
+        "/",
+        "/",
+        "--tmpfs",
+        "/tmp",
+        "--ro-bind",
+        "/usr/bin/ssh",
+        dest,
+        "--bind",
+        "/home/orbweaver/workspaces/orbweaver2",
+        "/home/orbweaver/workspaces/orbweaver2",
+        "--",
+        "true",
+    ]
+    with pytest.raises(AssertionError, match="Can't create file"):
+        assert_ro_bind_dests_creatable(argv)
 
 
 def test_bwrap_full_network_skips_unshare_net(tmp_path: Path):
     argv = build_bwrap_argv("echo hi", tmp_path, tmp_path / "tmp", full_network=True)
     assert "--unshare-net" not in argv
     assert "--unshare-user" in argv
+    assert_ro_bind_dests_creatable(argv)
 
 
 def test_bwrap_binds_sockets_and_hides_run(tmp_path: Path):
@@ -92,3 +123,20 @@ def test_sandbox_available_in_container(monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox", True)
     monkeypatch.setattr("orbweaver.sandbox.bwrap.is_containerized", lambda: True)
     assert sandbox_available() is True
+
+
+def test_bwrap_does_not_ro_bind_git_metadata(tmp_path: Path):
+    """Workspace .git is working-set writeable so clone/init/fetch can run."""
+    hooks = tmp_path / ".git" / "hooks"
+    hooks.mkdir(parents=True)
+    config = tmp_path / ".git" / "config"
+    config.write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp")
+    protected = {str(hooks.resolve()), str(config.resolve())}
+    i = 0
+    while i < len(argv):
+        if argv[i] in {"--ro-bind", "--ro-bind-try"} and i + 2 < len(argv):
+            assert argv[i + 2] not in protected
+            i += 3
+            continue
+        i += 1
