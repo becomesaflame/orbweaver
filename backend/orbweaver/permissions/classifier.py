@@ -68,7 +68,7 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
         if perms:
             return {"command": cmd, "permissions": sorted(set(perms))}
         return cmd
-    if name in {"Read", "Write", "ProposePatch", "SendPhoto", "Delete"}:
+    if name in {"Read", "Write", "ProposePatch", "NotebookEdit", "SendPhoto", "Delete"}:
         return {"path": inp.get("path")}
     if name == "ReadLints":
         return {"paths": inp.get("paths") or inp.get("path")}
@@ -85,7 +85,7 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
     if name == "MemoryGraph":
         return {"id": inp.get("id"), "depth": inp.get("depth")}
     if name == "SpawnSubagent":
-        return {"task": inp.get("task")}
+        return {"task": inp.get("task"), "type": inp.get("type") or inp.get("role")}
     if name in {"Glob", "Grep", "AskUser", "TodoWrite"}:
         return ""
     return inp
@@ -221,7 +221,7 @@ async def classify_action(
             ],
             stop_sequences=["</block>"],
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("classifier stage1 failed: %s", e)
         return _classified("ask", f"Classifier error — needs user approval: {e}", "error")
 
@@ -240,7 +240,7 @@ async def classify_action(
                 {"role": "user", "content": STAGE2_SUFFIX},
             ],
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("classifier stage2 failed: %s", e)
         return _classified("ask", f"Classifier error — needs user approval: {e}", "error")
 

@@ -157,7 +157,7 @@ def looks_html(content_type: str, body: str) -> bool:
     if "html" in ctype:
         return True
     head = body.lstrip()[:256].lower()
-    return head.startswith("<!doctype html") or head.startswith("<html")
+    return head.startswith(("<!doctype html", "<html"))
 
 
 def html_to_text(body: str) -> str:

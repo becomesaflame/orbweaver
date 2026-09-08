@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from orbweaver import __version__
@@ -23,12 +23,12 @@ from orbweaver.compact import (
 )
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
+from orbweaver.lints import read_lints
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
-from orbweaver.lints import read_lints
 from orbweaver.todos import inject_session_todos, persist_todos
 from orbweaver.tooltext import format_read, format_webfetch
 
@@ -73,6 +73,31 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
             "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "NotebookEdit",
+        "description": (
+            "Edit one cell in a .ipynb notebook. Do not Write the whole notebook JSON. "
+            "action is replace (default), insert, or delete. replace can set source or "
+            "search-replace with old_string/new_string."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "cell_idx": {"type": "integer", "description": "0-based cell index."},
+                "action": {"type": "string", "enum": ["replace", "insert", "delete"]},
+                "source": {"type": "string", "description": "Full replacement or insert source."},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "cell_type": {
+                    "type": "string",
+                    "enum": ["code", "markdown", "raw"],
+                    "description": "Cell type for insert (default code).",
+                },
+            },
+            "required": ["path", "cell_idx"],
         },
     },
     {
@@ -332,13 +357,25 @@ TOOL_SPEC = [
         "name": "SpawnSubagent",
         "description": (
             "Spawn a nested agent with its own event stream to complete a focused task. "
-            "Shares this workspace and memory. Returns a summary. Nested spawns are not allowed."
+            "Shares this workspace and memory. Returns a summary. Nested spawns are not allowed. "
+            "type/role selects a tool subset: explore (read/search), implement (default, edits), "
+            "or shell (Bash)."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "task": {"type": "string"},
                 "label": {"type": "string", "description": "Short name for the child run."},
+                "type": {
+                    "type": "string",
+                    "enum": ["explore", "implement", "shell"],
+                    "description": "Subagent role. Default implement.",
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["explore", "implement", "shell"],
+                    "description": "Alias for type.",
+                },
             },
             "required": ["task"],
         },
@@ -434,7 +471,7 @@ def resolve_channel(
     if jsonld.get("telegram_user_id") is not None or jsonld.get("telegram_chat_id") is not None:
         return "telegram"
     title = str(jsonld.get("title") or "").strip().lower()
-    if title == "vscode" or title.startswith("vscode:") or title.startswith("vscode/"):
+    if title == "vscode" or title.startswith(("vscode:", "vscode/")):
         return VSCODE_CHANNEL
     return ""
 
@@ -492,6 +529,7 @@ def static_system(channel: str = "") -> str:
         f"{write_line}"
         "In auto mode, in-project Delete applies immediately. TodoWrite keeps the plan "
         "on this session across compaction. After edits, ReadLints for diagnostics. "
+        "Use NotebookEdit for .ipynb cells instead of rewriting the whole JSON. "
         "Use MemorySearch when past decisions might "
         "matter, and MemoryGraph to walk entity neighborhoods. Keep pins small. If the "
         "sandbox cannot run a command, ask the user "
@@ -547,6 +585,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "Write":
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
+    if name == "NotebookEdit":
+        from orbweaver.notebook import apply_notebook_edit
+
+        return apply_notebook_edit(ws, inp)
     if name == "Delete":
         try:
             return ws.delete(inp["path"])
@@ -586,7 +628,7 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         return run_websearch(inp)
     if name == "MemorySearch":
         events = live_events(await store.list_events(session_id))
-        already = set()
+        already: set[str] = set()
         for ev in events:
             if ev.kind == "MemoryRecall":
                 already.update(ev.payload.get("chunk_ids") or [])
@@ -871,9 +913,9 @@ async def agent_turn(
                     client.messages.create(
                         model=settings.orbweaver_model,
                         max_tokens=4096,
-                        system=system,
-                        tools=active_tools,
-                        messages=messages,
+                        system=cast(Any, system),
+                        tools=cast(Any, active_tools),
+                        messages=cast(Any, messages),
                     ),
                     cancel,
                     produced,
@@ -991,9 +1033,9 @@ async def agent_turn(
                     client.messages.create(
                         model=settings.orbweaver_model,
                         max_tokens=4096,
-                        system=system,
+                        system=cast(Any, system),
                         tools=[],
-                        messages=messages,
+                        messages=cast(Any, messages),
                     ),
                     cancel,
                     produced,

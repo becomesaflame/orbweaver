@@ -45,14 +45,12 @@ def assert_ro_bind_dests_creatable(argv: list[str]) -> None:
             continue
         if flag in _ONE:
             dest = argv[i + 1]
-            if flag in {"--tmpfs", "--dev", "--proc"}:
-                writable.append(dest)
-            elif flag == "--dir" and _writable(str(Path(dest).parent), writable):
+            if flag in {"--tmpfs", "--dev", "--proc"} or flag == "--dir" and _writable(str(Path(dest).parent), writable):
                 writable.append(dest)
             i += 2
             continue
         if flag in _TWO:
-            src, dest = argv[i + 1], argv[i + 2]
+            dest = argv[i + 2]
             if flag == "--bind":
                 writable.append(dest)
             elif flag == "--ro-bind":

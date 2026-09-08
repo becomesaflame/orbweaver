@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
 from orbweaver.permissions.rules import in_working_set
+
+log = logging.getLogger(__name__)
 
 BROWSER_ACTIONS = frozenset({"navigate", "click", "type", "snapshot", "screenshot"})
 SNAPSHOT_CHAR_CAP = 24_000
@@ -178,7 +181,7 @@ class _Session:
             try:
                 await getattr(obj, method)()
             except Exception:
-                pass
+                log.debug("browser %s failed during close", method, exc_info=True)
 
     async def run(self, inp: dict[str, Any], workspace) -> str:
         async with self._lock:
