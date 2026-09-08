@@ -43,7 +43,7 @@ def parse_notebook(text: str) -> dict[str, Any]:
     except json.JSONDecodeError as e:
         raise ValueError(f"invalid notebook JSON: {e}") from e
     if not isinstance(nb, dict) or not isinstance(nb.get("cells"), list):
-        raise ValueError("not a Jupyter notebook (missing cells)")
+        raise TypeError("not a Jupyter notebook (missing cells)")
     return nb
 
 
@@ -78,7 +78,7 @@ def edit_notebook_dict(
         return nb
     cell = cells[cell_idx]
     if not isinstance(cell, dict):
-        raise ValueError(f"cell {cell_idx} is not an object")
+        raise TypeError(f"cell {cell_idx} is not an object")
     current = cell_source(cell)
     if old_string:
         if old_string not in current:
@@ -118,7 +118,7 @@ def apply_notebook_edit(workspace: Any, inp: dict[str, Any]) -> str:
             cell_type=inp.get("cell_type"),
         )
         workspace.write(path, dumps_notebook(nb))
-    except ValueError as e:
+    except (TypeError, ValueError) as e:
         return f"error: {e}"
     except (OSError, PermissionError) as e:
         return f"error writing {path}: {e}"

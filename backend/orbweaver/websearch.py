@@ -204,6 +204,6 @@ def run_websearch(inp: dict[str, Any]) -> str:
         hits, provider = search(query, max_results=limit)
     except WebSearchError as e:
         return f"WebSearch failed: {e}"
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return f"WebSearch failed: {e}"
     return format_hits(query, provider, hits)

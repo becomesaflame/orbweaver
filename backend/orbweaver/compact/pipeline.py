@@ -82,7 +82,7 @@ async def maybe_compact(
                 ):
                     summary = notes
                     trigger = "session_notes"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log.warning("session-notes compact failed: %s", e)
             llm_failed = True
 
@@ -90,7 +90,7 @@ async def maybe_compact(
         try:
             summary = await llm_summary(prompt_events(events), client, system)
             trigger = "llm"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log.warning("llm compact failed: %s", e)
             llm_failed = True
 
@@ -118,7 +118,7 @@ async def maybe_compact(
     )
     try:
         await remember(store, summary, source=f"compact:{session_id}")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("compact remember failed: %s", e)
     if trigger in {"llm", "session_notes"}:
         record_compact_success(session_id)

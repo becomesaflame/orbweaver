@@ -12,7 +12,7 @@ from orbweaver.store import SESSION_TYPE, Entity, Event, Store, new_uuid, sessio
 try:
     from orbweaver.permissions.handoff import review_subagent_return
 except ImportError:  # pragma: no cover
-    review_subagent_return = None
+    review_subagent_return = None  # type: ignore[assignment,misc]
 
 CHILD_BLOCKED_TOOLS = frozenset({"SpawnSubagent", "AskUser", "ScheduleTask"})
 SUBAGENT_MAX_ROUNDS = 48
