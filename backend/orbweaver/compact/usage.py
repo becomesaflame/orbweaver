@@ -65,7 +65,12 @@ def event_token_count(events: list[Event]) -> int:
 
 
 def estimate_prompt_tokens(session_id: UUID, events: list[Event]) -> int:
-    """Prefer last API usage plus tokens added after that seq; else payload estimate."""
+    """Prefer last API usage plus tokens added after that seq; else payload estimate.
+
+    ``maybe_compact`` uses this as the over-budget trigger so system+tools,
+    images, and MCP schemas already counted in ``usage.input_tokens`` are not
+    dropped from the decision.
+    """
     anchor = _anchors.get(session_id)
     if anchor is None:
         return event_token_count(events)
