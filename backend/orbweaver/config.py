@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     orbweaver_host: str = "0.0.0.0"
     orbweaver_port: int = 8080
     orbweaver_allow_http_mint: bool = False
+    orbweaver_trust_proxy: bool = False
     embedding_dim: int = 384
     embedding_model: str = "hash://blake2b-384"  # sentence-transformers name when using embed extra
 
