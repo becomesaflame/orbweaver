@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     compact_micro_keep: int = 5
     compact_tool_result_chars: int = 8000
     compact_max_failures: int = 3
+    compact_overflow_retries: int = 4
     compact_rehydrate_files: int = 5
     compact_rehydrate_chars_per_file: int = 20000
     compact_rehydrate_token_budget: int = 50000

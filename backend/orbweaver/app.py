@@ -670,6 +670,10 @@ async def _run_turn(
     except Exception as e:
         import anthropic
 
+        from orbweaver.compact import ContextFullError
+
+        if isinstance(e, ContextFullError):
+            raise HTTPException(status_code=502, detail=e.message) from e
         if isinstance(e, anthropic.APIStatusError):
             raise HTTPException(status_code=502, detail=e.message) from e
         raise
