@@ -222,20 +222,26 @@ async def _session_workspace(update, context):
 
 
 async def _run_turn(update, context, text: str, images: list[dict[str, str]] | None = None) -> None:
-    store, session_id, ws, kind = await _session_workspace(update, context)
-    events = await agent_turn(
-        store,
-        session_id,
-        text,
-        ws,
-        workspace_kind=kind,
-        headless=True,
-        interactive=True,
-        images=images,
-        system_extra=TELEGRAM_IMAGE_HINT,
-        channel="telegram",
-    )
-    await update.message.reply_text(texts_for_reply(events) or "(no assistant text)")
+    try:
+        store, session_id, ws, kind = await _session_workspace(update, context)
+        events = await agent_turn(
+            store,
+            session_id,
+            text,
+            ws,
+            workspace_kind=kind,
+            headless=True,
+            interactive=True,
+            images=images,
+            system_extra=TELEGRAM_IMAGE_HINT,
+            channel="telegram",
+        )
+        reply = texts_for_reply(events) or "(no assistant text)"
+    except Exception as e:
+        log.exception("telegram turn failed")
+        reply = f"Turn failed: {e}"[:3500]
+    if update.message:
+        await update.message.reply_text(reply)
 
 
 async def start_telegram() -> None:
@@ -341,6 +347,14 @@ async def start_telegram() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, on_image_document))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
+
+    async def on_error(update, context) -> None:
+        log.exception("telegram handler error", exc_info=context.error)
+        msg = getattr(update, "effective_message", None) if update is not None else None
+        if msg is not None:
+            await msg.reply_text(f"Turn failed: {context.error}"[:3500])
+
+    app.add_error_handler(on_error)
     await app.initialize()
     await app.start()
     updater = app.updater
