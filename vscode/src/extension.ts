@@ -77,6 +77,7 @@ async function ensureSession(): Promise<string> {
     workspace_uri: workspaceUri(),
     workspace_kind: "local",
     title: vscode.workspace.name || "vscode",
+    channel: "vscode",
   });
   sessionId = created.id;
   return sessionId!;
@@ -161,7 +162,7 @@ window.addEventListener("message", (e) => {
     const bits = [];
     for (const ev of m.events) {
       const text = ev.payload && ev.payload.text;
-      if (ev.kind === "assistant" || ev.kind === "turn_aborted") {
+      if (ev.kind === "assistant" || ev.kind === "turn_aborted" || ev.kind === "cron_result") {
         bits.push((ev.kind === "turn_aborted" ? "aborted: " : "") + (text || JSON.stringify(ev.payload)));
       }
     }

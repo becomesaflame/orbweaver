@@ -22,6 +22,8 @@ SAFE_ALLOWLIST = frozenset(
         "SendPhoto",
         "GenerateImage",
         "WebSearch",
+        "TodoWrite",
+        "ReadLints",
     }
 )
 
@@ -98,8 +100,13 @@ def parse_rules(blob: str) -> list[tuple[str, str | None]]:
 def _subject(tool: str, inp: dict[str, Any]) -> str:
     if tool == "Bash":
         return str(inp.get("command") or "")
-    if tool in {"Read", "Write", "ProposePatch", "SendPhoto"}:
+    if tool in {"Read", "Write", "ProposePatch", "SendPhoto", "Delete"}:
         return str(inp.get("path") or "")
+    if tool == "ReadLints":
+        paths = inp.get("paths") or inp.get("path") or ""
+        if isinstance(paths, list):
+            return " ".join(str(p) for p in paths)
+        return str(paths)
     if tool == "GenerateImage":
         return str(inp.get("prompt") or inp.get("path") or "")
     if tool == "WebFetch":

@@ -46,8 +46,13 @@ class TurnAborted(Exception):
 def summarize_input(name: str, inp: dict[str, Any]) -> str:
     if name == "Bash":
         return str(inp.get("command") or "")[:240]
-    if name in {"Read", "Write", "ProposePatch", "SendPhoto"}:
+    if name in {"Read", "Write", "ProposePatch", "SendPhoto", "Delete"}:
         return str(inp.get("path") or "")[:240]
+    if name == "ReadLints":
+        paths = inp.get("paths") or inp.get("path") or ""
+        if isinstance(paths, list):
+            return " ".join(str(p) for p in paths)[:240]
+        return str(paths)[:240]
     if name == "GenerateImage":
         return str(inp.get("prompt") or "")[:240]
     if name == "WebFetch":
@@ -135,7 +140,7 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
     events: list[Event] = ctx.get("events") or []
     mode = (settings.orbweaver_permission_mode or "auto").strip().lower()
 
-    if name in {"Read", "Write", "ProposePatch", "SendPhoto"}:
+    if name in {"Read", "Write", "ProposePatch", "SendPhoto", "Delete"}:
         path = str(inp.get("path") or "")
         if path_is_always_denied(path):
             return PermissionDecision("deny", f"path denied: {path}", "deny_rule")
@@ -183,6 +188,19 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
         if name == "Read" and workspace and not in_working_set(str(inp.get("path") or ""), workspace):
             if not getattr(workspace, "host_reads", True):
                 return PermissionDecision("deny", f"path denied: {inp.get('path')}", "deny_rule")
+        elif name == "ReadLints":
+            from orbweaver.lints import lint_paths_from_input
+
+            lint_paths = lint_paths_from_input(inp)
+            if any(path_is_always_denied(p) for p in lint_paths):
+                return PermissionDecision("deny", "path denied", "deny_rule")
+            outside = [
+                p for p in lint_paths if workspace and not in_working_set(p, workspace)
+            ]
+            if outside and not getattr(workspace, "host_reads", True):
+                return PermissionDecision("deny", f"path denied: {outside[0]}", "deny_rule")
+            if not outside:
+                return PermissionDecision("allow", "safe tool allowlist", "allowlist")
         elif name in {"Glob", "Grep"}:
             glob_pat = str(inp.get("glob") or inp.get("pattern") or "")
             if (
@@ -196,7 +214,7 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
         else:
             return PermissionDecision("allow", "safe tool allowlist", "allowlist")
 
-    if name in {"Write", "ProposePatch"} and workspace and in_project_path(str(inp.get("path") or ""), workspace):
+    if name in {"Write", "ProposePatch", "Delete"} and workspace and in_project_path(str(inp.get("path") or ""), workspace):
         return PermissionDecision("allow", "in-project file edit", "acceptEdits")
 
     if name == "Bash" and settings.orbweaver_auto_allow_bash_if_sandboxed and bash_sandboxable(inp, workspace_kind):
