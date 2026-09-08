@@ -860,6 +860,54 @@
         $("status").textContent = String(e);
       }
     }
+    function sessionWsUrl(sid) {
+      const origin = $("base").value.trim() || window.location.origin;
+      const u = new URL("/v1/sessions/" + sid + "/ws", origin);
+      u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+      const tok = $("token").value.trim();
+      if (tok) u.searchParams.set("token", tok);
+      return u.toString();
+    }
+    function streamTurn(sid, payload, onEvent) {
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let ws;
+        const finish = (fn, val) => {
+          if (settled) return;
+          settled = true;
+          try { if (ws) ws.close(); } catch (e) {}
+          fn(val);
+        };
+        try { ws = new WebSocket(sessionWsUrl(sid)); }
+        catch (e) { reject(e); return; }
+        ws.onopen = () => {
+          try { ws.send(JSON.stringify(payload)); }
+          catch (e) { finish(reject, e); }
+        };
+        ws.onmessage = (ev) => {
+          let msg;
+          try { msg = JSON.parse(ev.data); }
+          catch (e) { finish(reject, e); return; }
+          if (msg.kind === "error") {
+            const detail = msg.detail;
+            finish(reject, new Error(typeof detail === "string" ? detail : JSON.stringify(detail)));
+            return;
+          }
+          if (msg.kind === "turn_done") {
+            finish(resolve, { status: msg.status || "ok", user_seq: msg.user_seq });
+            return;
+          }
+          if (onEvent) onEvent(msg);
+        };
+        ws.onerror = () => finish(reject, new Error("WebSocket error"));
+        ws.onclose = (ev) => {
+          if (settled) return;
+          if (ev.code === 4401) finish(reject, new Error("unauthorized"));
+          else if (ev.code === 4404) finish(reject, new Error("session not found"));
+          else finish(reject, new Error("WebSocket closed (" + ev.code + ")"));
+        };
+      });
+    }
     async function continueTurn() {
       if (inFlight) return;
       const sid = currentSid();
@@ -875,10 +923,13 @@
       syncComposer();
       $("status").textContent = "working…";
       try {
-        const r = await api("/v1/sessions/" + sid + "/turns/continue", { method:"POST", body: "{}" });
+        const r = await streamTurn(sid, { resume: true }, (ev) => {
+          if (currentSid() !== sid) return;
+          renderEvent(ev);
+          if (workingEl && workingEl.parentNode) $("log").appendChild(workingEl);
+        });
         if (workingEl.parentNode) workingEl.remove();
         if (currentSid() === sid) {
-          for (const ev of r.events || []) renderEvent(ev);
           if (r.status === "stopped") stoppedSids.add(sid);
         }
         await refreshSessions();
@@ -927,21 +978,30 @@
       syncComposer();
       $("status").textContent = "working…";
       try {
-        const r = await api("/v1/sessions/" + sid + "/turns", {
-          method:"POST", body: JSON.stringify({ text })
+        const r = await streamTurn(sid, { text }, (ev) => {
+          if (currentSid() !== sid) return;
+          if (ev.kind === "user") {
+            if (userEl) {
+              userEl.classList.remove("pending");
+              if (ev.seq != null) userEl.dataset.seq = String(ev.seq);
+              attachUserActions(userEl, text, ev.seq, false);
+            }
+            return;
+          }
+          renderEvent(ev);
+          if (workingEl && workingEl.parentNode) $("log").appendChild(workingEl);
         });
         const stillHere = currentSid() === sid;
         if (workingEl.parentNode) workingEl.remove();
         if (userEl) userEl.classList.remove("pending");
         if (r.status === "discarded") {
+          if (r.user_seq != null) dropFromSeq(r.user_seq);
           if (userEl && userEl.parentNode) userEl.remove();
           if (stillHere) ensurePlaceholder();
         } else if (stillHere) {
           if (userEl && r.user_seq != null) userEl.dataset.seq = String(r.user_seq);
           if (userEl) attachUserActions(userEl, text, r.user_seq, false);
-          const events = r.events || [];
           if (r.status === "stopped") stoppedSids.add(sid);
-          for (const ev of events) renderEvent(ev);
         }
         await refreshSessions();
         if (stillHere) {

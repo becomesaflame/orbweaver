@@ -5,7 +5,8 @@ import ipaddress
 import json
 import os
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -261,7 +262,12 @@ async def _revert_autotitle_if_needed(store, sess: Entity, discarded_text: str) 
 
 
 async def _finish_cancelled_turn(
-    store, sess: Entity, state: RunningTurn, produced: list, user_text: str
+    store,
+    sess: Entity,
+    state: RunningTurn,
+    produced: list,
+    user_text: str,
+    emit: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     if state.discard:
         if state.user_seq:
@@ -270,6 +276,8 @@ async def _finish_cancelled_turn(
         return {"events": [], "status": "discarded", "user_seq": state.user_seq}
     marker = await store.append_event(sess.id, "turn_interrupted", {"reason": "stop"})
     produced = list(produced) + [marker]
+    if emit:
+        emit(_event_dict(marker))
     return {
         "events": [_event_dict(e) for e in produced],
         "status": "stopped",
@@ -510,7 +518,13 @@ async def list_events(session_id: UUID, _u: dict = Depends(_user)) -> dict[str, 
 
 
 async def _run_turn(
-    store, sess, session_id: UUID, user_text: str, *, resume: bool = False
+    store,
+    sess,
+    session_id: UUID,
+    user_text: str,
+    *,
+    resume: bool = False,
+    emit: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     if session_id in _running_turns:
         raise HTTPException(409, "turn already running")
@@ -528,19 +542,20 @@ async def _run_turn(
             user_text,
             ws,
             workspace_kind=kind,
+            emit=emit,
             cancel=state.cancel,
             turn_state=state,
             resume=resume,
         )
         if state.cancel.is_set():
-            return await _finish_cancelled_turn(store, sess, state, events, user_text)
+            return await _finish_cancelled_turn(store, sess, state, events, user_text, emit=emit)
         return {
             "events": [_event_dict(e) for e in events],
             "status": "ok",
             "user_seq": state.user_seq,
         }
     except TurnCancelled as e:
-        return await _finish_cancelled_turn(store, sess, state, e.produced, user_text)
+        return await _finish_cancelled_turn(store, sess, state, e.produced, user_text, emit=emit)
     except Exception as e:
         import anthropic
 
@@ -655,19 +670,69 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
     try:
         while True:
             raw = await websocket.receive_text()
-            data = json.loads(raw)
-            text = data.get("text") or ""
-            if not text:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
                 continue
-            ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
-            if changed:
-                await store.put_entity(sess)
+            if not isinstance(data, dict):
+                continue
+            resume = bool(data.get("resume"))
+            text = str(data.get("text") or "")
+            if not resume and not text.strip():
+                continue
+            if resume:
+                existing = await store.list_events(session_id)
+                if not existing:
+                    await websocket.send_json(
+                        {"kind": "error", "detail": "nothing to continue", "status_code": 400}
+                    )
+                    continue
+
+            pending: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
             def emit(msg: dict[str, Any]) -> None:
-                asyncio.get_event_loop().create_task(websocket.send_json(msg))
+                pending.put_nowait(msg)
 
-            await agent_turn(store, session_id, text, ws, workspace_kind=kind, emit=emit)
-            await websocket.send_json({"kind": "turn_done"})
+            async def pump() -> None:
+                while True:
+                    msg = await pending.get()
+                    if msg is None:
+                        return
+                    try:
+                        await websocket.send_json(msg)
+                    except Exception:
+                        return
+
+            pump_task = asyncio.create_task(pump())
+            error: HTTPException | None = None
+            result: dict[str, Any] | None = None
+            try:
+                result = await _run_turn(
+                    store, sess, session_id, text, resume=resume, emit=emit
+                )
+            except HTTPException as e:
+                error = e
+            finally:
+                await pending.put(None)
+                with suppress(Exception):
+                    await pump_task
+            if error is not None:
+                await websocket.send_json(
+                    {
+                        "kind": "error",
+                        "detail": error.detail,
+                        "status_code": error.status_code,
+                    }
+                )
+                continue
+            assert result is not None
+            await websocket.send_json(
+                {
+                    "kind": "turn_done",
+                    "status": result.get("status"),
+                    "user_seq": result.get("user_seq"),
+                }
+            )
     except WebSocketDisconnect:
         return
 
