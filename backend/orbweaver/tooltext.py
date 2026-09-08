@@ -187,7 +187,8 @@ def format_webfetch(
             note = (
                 "No readable article text; this looks like a JavaScript-rendered page. "
                 "Do not keep fetching nearby docs URLs expecting the article. "
-                "Prefer a raw/source URL, or answer from what you already know."
+                "Use the Browser tool to render the page, prefer a raw/source URL, "
+                "or answer from what you already know."
             )
             header = _fetch_header(url, status_code, content_type, extracted=True, truncated=False)
             return f"{header}\n{note}\n"
