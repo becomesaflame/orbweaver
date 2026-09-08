@@ -10,6 +10,7 @@ from pathlib import Path
 
 from orbweaver.sandbox.errors import network_denied
 from orbweaver.sandbox.policy import NetworkPolicy
+from orbweaver.sandbox.ssh import PROXY_PORT
 
 _METADATA_V4 = ipaddress.ip_address("169.254.169.254")
 
@@ -278,7 +279,7 @@ while True:
 """
 
 
-def wrap_command_with_proxy(command: str, unix_sock: str, port: int = 19191) -> str:
+def wrap_command_with_proxy(command: str, unix_sock: str, port: int = PROXY_PORT) -> str:
     import shlex
 
     inner = (
@@ -290,6 +291,8 @@ def wrap_command_with_proxy(command: str, unix_sock: str, port: int = 19191) -> 
         f"export HTTP_PROXY=http://127.0.0.1:{port}\n"
         f"export HTTPS_PROXY=http://127.0.0.1:{port}\n"
         f"export ALL_PROXY=http://127.0.0.1:{port}\n"
+        f"export ORBWEAVER_SSH_PROXY_HOST=127.0.0.1\n"
+        f"export ORBWEAVER_SSH_PROXY_PORT={port}\n"
         "export NO_PROXY=localhost,127.0.0.1,::1\n"
         "export no_proxy=localhost,127.0.0.1,::1\n"
         f"{command}\n"

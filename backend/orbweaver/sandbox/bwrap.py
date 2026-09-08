@@ -15,6 +15,11 @@ from orbweaver.sandbox.policy import (
     SandboxPolicy,
     load_sandbox_policy,
 )
+from orbweaver.sandbox.ssh import (
+    ensure_ssh_sandbox,
+    ssh_config_overlay_args,
+    ssh_identity_bind_args,
+)
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +133,8 @@ def build_bwrap_argv(
         )
     # After the host bind: a private /dev (so /dev/null is writable), /proc, and /tmp.
     argv.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
+    ensure_ssh_sandbox(tmp, proxied=not full_network)
+    argv.extend(ssh_config_overlay_args(tmp))
     argv.extend(["--tmpfs", "/run"])
     if not _is_run_symlink():
         argv.extend(["--tmpfs", "/var/run"])
@@ -142,6 +149,7 @@ def build_bwrap_argv(
         argv.extend(["--ro-bind-try", str(sock_p), str(sock_p)])
     for hidden in pol.deny_read:
         argv.extend(_deny_read_overlay_args(hidden))
+    argv.extend(ssh_identity_bind_args())
     for rw in pol.readwrite_roots(root, tmp):
         argv.extend(["--bind", str(rw), str(rw)])
     for rel in PROTECTED_WRITE_REL:

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from orbweaver.sandbox.domains import DEFAULT_ALLOWED_DOMAINS
+from orbweaver.sandbox.ssh import ssh_agent_socket
 
 HARDCODED_DENY_READ: tuple[str, ...] = (
     "~/.ssh",
@@ -225,7 +226,11 @@ def _filter_sockets(paths: Iterable[Path]) -> tuple[Path, ...]:
     return tuple(_unique_paths(out))
 
 
-def _with_hardcoded_denies(policy: SandboxPolicy, home: Path | None = None) -> SandboxPolicy:
+def _with_hardcoded_denies(
+    policy: SandboxPolicy,
+    home: Path | None = None,
+    environ: dict[str, str] | None = None,
+) -> SandboxPolicy:
     deny = list(policy.deny_read)
     home_dir = (home or Path.home()).resolve()
     for raw in HARDCODED_DENY_READ:
@@ -235,6 +240,7 @@ def _with_hardcoded_denies(policy: SandboxPolicy, home: Path | None = None) -> S
             deny.append(expand_path(raw, relative_to=home_dir))
     socks = list(policy.allow_unix_sockets)
     socks.extend(default_journal_sockets())
+    socks.extend(ssh_agent_socket(environ))
     return replace(
         policy,
         deny_read=tuple(_unique_paths(deny)),
@@ -332,4 +338,4 @@ def load_sandbox_policy(
             deny=tuple(deny_dom),
         ),
     )
-    return _with_hardcoded_denies(policy, home=home_dir)
+    return _with_hardcoded_denies(policy, home=home_dir, environ=env)
