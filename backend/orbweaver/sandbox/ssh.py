@@ -7,6 +7,10 @@ import stat
 from pathlib import Path
 
 PROXY_PORT = 19191
+# Stash the real ssh binary here — sandbox /tmp is tmpfs (writable) after --ro-bind / /.
+# Do not use workspace .orbweaver-tmp: that path is still read-only when overlays run.
+SANDBOX_SSH_DIR = "/tmp/ow-ssh"
+SANDBOX_OPENSSH = "/tmp/ow-ssh/openssh"
 
 SSH_IDENTITY_FILES: tuple[str, ...] = (
     "id_ed25519",
@@ -183,7 +187,7 @@ def ensure_ssh_sandbox(tmp: Path, *, proxied: bool) -> Path:
     """Write wrapper, configs, and CONNECT helper under tmp/ow-ssh."""
     dest = ssh_helper_dir(tmp)
     dest.mkdir(parents=True, exist_ok=True)
-    real = dest / "openssh"
+    real = Path(SANDBOX_OPENSSH)
     config = dest / "config"
     system = dest / "ssh_config.system"
     proxycmd = dest / "proxycmd.py"
@@ -208,7 +212,6 @@ def ssh_config_overlay_args(tmp: Path) -> list[str]:
     dest = ssh_helper_dir(tmp)
     wrapper = dest / "ssh"
     system = dest / "ssh_config.system"
-    real = dest / "openssh"
     args: list[str] = [
         "--ro-bind",
         str(system),
@@ -218,8 +221,18 @@ def ssh_config_overlay_args(tmp: Path) -> list[str]:
     ]
     host_ssh = Path("/usr/bin/ssh")
     if host_ssh.exists() and wrapper.is_file():
-        args.extend(["--ro-bind", str(host_ssh), str(real)])
-        args.extend(["--ro-bind", str(wrapper), "/usr/bin/ssh"])
+        args.extend(
+            [
+                "--dir",
+                SANDBOX_SSH_DIR,
+                "--ro-bind",
+                str(host_ssh),
+                SANDBOX_OPENSSH,
+                "--ro-bind",
+                str(wrapper),
+                "/usr/bin/ssh",
+            ]
+        )
         bin_ssh = Path("/bin/ssh")
         if bin_ssh.exists():
             args.extend(["--ro-bind", str(wrapper), "/bin/ssh"])
