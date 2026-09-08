@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     orbweaver_image_api_url: str = "https://api.openai.com/v1/images/generations"
     orbweaver_image_model: str = "dall-e-3"
     orbweaver_image_size: str = "1024x1024"
+    orbweaver_search_provider: str = ""  # duckduckgo | brave | empty auto
+    orbweaver_brave_api_key: str = ""
+    brave_search_api_key: str = ""
     orbweaver_host: str = "0.0.0.0"
     orbweaver_port: int = 8080
     orbweaver_allow_http_mint: bool = False
@@ -65,6 +68,19 @@ class Settings(BaseSettings):
         if not self.telegram_allowlist.strip():
             return set()
         return {int(x.strip()) for x in self.telegram_allowlist.split(",") if x.strip()}
+
+    @property
+    def brave_api_key(self) -> str:
+        return self.orbweaver_brave_api_key.strip() or self.brave_search_api_key.strip()
+
+    @property
+    def search_provider(self) -> str:
+        spec = self.orbweaver_search_provider.strip().lower()
+        if spec in {"brave", "duckduckgo"}:
+            return spec
+        if self.brave_api_key:
+            return "brave"
+        return "duckduckgo"
 
     event_budget_override: int | None = None
 

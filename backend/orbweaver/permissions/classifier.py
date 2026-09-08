@@ -74,6 +74,8 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
         return {"prompt": inp.get("prompt"), "path": inp.get("path")}
     if name == "WebFetch":
         return {"url": inp.get("url")}
+    if name == "WebSearch":
+        return {"query": inp.get("query")}
     if name == "SpawnSubagent":
         return {"task": inp.get("task")}
     if name in {"Glob", "Grep", "AskUser"}:

@@ -78,6 +78,7 @@ def test_parse_block_and_projection():
         "Bash", {"command": "curl https://example.com", "permissions": ["full_network"]}
     ) == {"command": "curl https://example.com", "permissions": ["full_network"]}
     assert to_classifier_input("Glob", {"pattern": "*"}) == ""
+    assert to_classifier_input("WebSearch", {"query": "max_turns"}) == {"query": "max_turns"}
 
 
 @pytest.mark.asyncio

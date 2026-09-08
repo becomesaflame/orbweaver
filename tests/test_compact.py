@@ -95,6 +95,9 @@ def test_persist_writes_preview_and_file(tmp_path, monkeypatch):
     web, rel3 = persist_tool_result(ws, "toolu_3", "WebFetch", big)
     assert rel3 is None
     assert web == big
+    search, rel4 = persist_tool_result(ws, "toolu_4", "WebSearch", big)
+    assert rel4 is None
+    assert search == big
 
 
 @pytest.mark.asyncio

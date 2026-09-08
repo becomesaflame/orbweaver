@@ -43,6 +43,17 @@ async def test_allowlist_skips_classifier(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_websearch_allowlisted(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    decision = await can_use_tool("WebSearch", {"query": "agent max_turns"}, _ctx(tmp_path))
+    assert decision.behavior == "allow"
+    assert decision.fast_path == "allowlist"
+
+
+@pytest.mark.asyncio
 async def test_send_photo_allowlisted(tmp_path, monkeypatch):
     async def boom(*_a, **_k):
         raise AssertionError("classifier should not run")

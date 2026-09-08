@@ -132,14 +132,33 @@ TOOL_SPEC = [
     {
         "name": "WebFetch",
         "description": (
-            "HTTP GET a URL and return extracted readable text (HTML is stripped). "
-            "Use this for a known URL. Do not keep fetching nearby docs URLs when the "
+            "HTTP GET a known URL and return extracted readable text (HTML is stripped). "
+            "Find URLs with WebSearch first. Do not keep fetching nearby docs URLs when the "
             "result says the page is JavaScript-rendered."
         ),
         "input_schema": {
             "type": "object",
             "properties": {"url": {"type": "string"}},
             "required": ["url"],
+        },
+    },
+    {
+        "name": "WebSearch",
+        "description": (
+            "Search the public web and return titled result URLs with snippets. Use this "
+            "instead of guessing documentation URLs. Then WebFetch one or two promising links. "
+            "Call independent searches in parallel in one round."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {
+                    "type": "integer",
+                    "description": "How many hits to return (default 8, max 10).",
+                },
+            },
+            "required": ["query"],
         },
     },
     {
@@ -293,8 +312,9 @@ def static_system() -> str:
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
         "stay blocked; do not route around them. Call independent tools in parallel in "
         "one round. Prefer Read offset/limit and Grep over Bash for paging files. "
-        "Finish with a user-visible answer before the tool-round budget runs out; spawn a "
-        "subagent for a long exploration instead of burning parent rounds."
+        "Use WebSearch to find sources, then WebFetch a few result URLs; do not guess "
+        "docs paths. Finish with a user-visible answer before the tool-round budget runs out; "
+        "spawn a subagent for a long exploration instead of burning parent rounds."
     )
 
 
@@ -355,6 +375,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         r = httpx.get(inp["url"], timeout=20.0, follow_redirects=True)  # noqa: ASYNC210
         ctype = r.headers.get("content-type") or ""
         return format_webfetch(str(inp.get("url") or ""), r.status_code, ctype, r.text)
+    if name == "WebSearch":
+        from orbweaver.websearch import run_websearch
+
+        return run_websearch(inp)
     if name == "MemorySearch":
         events = live_events(await store.list_events(session_id))
         already = set()
