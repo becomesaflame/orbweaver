@@ -379,6 +379,8 @@
         add("assistant", p.text || "Scheduled task finished.", { seq: ev.seq, extraClass: extra });
       } else if (ev.kind === "turn_interrupted") {
         renderStopped(ev.seq);
+      } else if (ev.kind === "assistant_delta" || ev.kind === "tool_use_progress") {
+        return;
       } else {
         add("tool", ev.kind + " " + JSON.stringify(p).slice(0,400), { seq: ev.seq });
       }

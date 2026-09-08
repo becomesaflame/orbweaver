@@ -3,10 +3,30 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 from uuid import uuid4
 
 from orbweaver.config import settings
+
+log = logging.getLogger(__name__)
+
+# WebSocket progress kinds. Not persisted; the UI may ignore them.
+ASSISTANT_DELTA = "assistant_delta"
+TOOL_USE_PROGRESS = "tool_use_progress"
+
+# Raw Anthropic SSE types. The SDK also yields derived `text` / `input_json`
+# events for the same deltas — ignore those so we do not double-count.
+_STREAM_EVENT_TYPES = frozenset(
+    {
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    }
+)
 
 
 def select_provider() -> str:
@@ -242,3 +262,194 @@ def _from_ollama_message(message: dict[str, Any]) -> _Response:
             )
         )
     return _Response(content)
+
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _event_type(event: Any) -> str:
+    return str(_field(event, "type") or "")
+
+
+def _try_json(raw: str) -> dict[str, Any] | None:
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else {"raw": parsed}
+
+
+class StreamAssembler:
+    """Accumulate Anthropic SSE events into a create-shaped response."""
+
+    def __init__(self) -> None:
+        self._blocks: dict[int, dict[str, Any]] = {}
+        self.usage = _Usage()
+        self.stop_reason: str | None = None
+        self.started = False
+
+    def apply(self, event: Any) -> list[tuple[str, dict[str, Any]]]:
+        typ = _event_type(event)
+        if typ not in _STREAM_EVENT_TYPES:
+            return []
+        self.started = True
+        if typ == "message_start":
+            self._note_usage(_field(_field(event, "message"), "usage"))
+            return []
+        if typ == "content_block_start":
+            return self._start_block(event)
+        if typ == "content_block_delta":
+            return self._delta_block(event)
+        if typ == "content_block_stop":
+            self._stop_block(event)
+            return []
+        if typ == "message_delta":
+            self._note_usage(_field(event, "usage"))
+            delta = _field(event, "delta")
+            reason = _field(delta, "stop_reason")
+            if reason:
+                self.stop_reason = str(reason)
+            return []
+        return []
+
+    def _note_usage(self, usage: Any) -> None:
+        if usage is None:
+            return
+        inp = int(_field(usage, "input_tokens", 0) or 0)
+        if inp:
+            self.usage.input_tokens = inp
+
+    def _index(self, event: Any) -> int:
+        return int(_field(event, "index", 0) or 0)
+
+    def _start_block(self, event: Any) -> list[tuple[str, dict[str, Any]]]:
+        idx = self._index(event)
+        block = _field(event, "content_block")
+        btype = str(_field(block, "type") or "text")
+        if btype == "tool_use":
+            uid = str(_field(block, "id") or uuid4())
+            name = str(_field(block, "name") or "unknown")
+            raw_inp = _field(block, "input") or {}
+            inp = raw_inp if isinstance(raw_inp, dict) else {}
+            self._blocks[idx] = {
+                "type": "tool_use",
+                "id": uid,
+                "name": name,
+                "json_buf": "",
+                "input": inp,
+            }
+            return [(TOOL_USE_PROGRESS, {"id": uid, "name": name, "input": dict(inp)})]
+        text = str(_field(block, "text") or "")
+        self._blocks[idx] = {"type": "text", "text": text}
+        if text:
+            return [(ASSISTANT_DELTA, {"text": text})]
+        return []
+
+    def _delta_block(self, event: Any) -> list[tuple[str, dict[str, Any]]]:
+        idx = self._index(event)
+        delta = _field(event, "delta")
+        dtype = str(_field(delta, "type") or "")
+        if dtype == "text_delta":
+            chunk = str(_field(delta, "text") or "")
+            slot = self._blocks.setdefault(idx, {"type": "text", "text": ""})
+            if slot.get("type") != "text":
+                slot = {"type": "text", "text": ""}
+                self._blocks[idx] = slot
+            slot["text"] = str(slot.get("text") or "") + chunk
+            if chunk:
+                return [(ASSISTANT_DELTA, {"text": chunk})]
+            return []
+        if dtype == "input_json_delta":
+            partial = str(_field(delta, "partial_json") or "")
+            slot = self._blocks.setdefault(
+                idx,
+                {
+                    "type": "tool_use",
+                    "id": str(uuid4()),
+                    "name": "unknown",
+                    "json_buf": "",
+                    "input": {},
+                },
+            )
+            if slot.get("type") != "tool_use":
+                return []
+            slot["json_buf"] = str(slot.get("json_buf") or "") + partial
+            parsed = _try_json(slot["json_buf"])
+            if parsed is not None:
+                slot["input"] = parsed
+            return [
+                (
+                    TOOL_USE_PROGRESS,
+                    {
+                        "id": slot["id"],
+                        "name": slot["name"],
+                        "input": dict(slot.get("input") or {}),
+                    },
+                )
+            ]
+        return []
+
+    def _stop_block(self, event: Any) -> None:
+        idx = self._index(event)
+        slot = self._blocks.get(idx)
+        if not slot or slot.get("type") != "tool_use":
+            return
+        parsed = _try_json(str(slot.get("json_buf") or ""))
+        if parsed is not None:
+            slot["input"] = parsed
+
+    def text(self) -> str:
+        parts = [
+            str(b.get("text") or "")
+            for i, b in sorted(self._blocks.items())
+            if b.get("type") == "text"
+        ]
+        return "\n".join(p for p in parts if p)
+
+    def tool_use_blocks(self) -> list[_ToolUseBlock]:
+        out: list[_ToolUseBlock] = []
+        for _i, b in sorted(self._blocks.items()):
+            if b.get("type") != "tool_use" or not b.get("id"):
+                continue
+            inp = b.get("input")
+            if not isinstance(inp, dict):
+                parsed = _try_json(str(b.get("json_buf") or ""))
+                inp = parsed if isinstance(parsed, dict) else {}
+            out.append(_ToolUseBlock(str(b["id"]), str(b.get("name") or "unknown"), inp))
+        return out
+
+    def response(self) -> _Response:
+        content: list[Any] = []
+        for _i, b in sorted(self._blocks.items()):
+            if b.get("type") == "text":
+                text = str(b.get("text") or "")
+                if text:
+                    content.append(_TextBlock(text))
+            elif b.get("type") == "tool_use" and b.get("id"):
+                inp = b.get("input")
+                if not isinstance(inp, dict):
+                    parsed = _try_json(str(b.get("json_buf") or ""))
+                    inp = parsed if isinstance(parsed, dict) else {}
+                content.append(
+                    _ToolUseBlock(str(b["id"]), str(b.get("name") or "unknown"), inp)
+                )
+        return _Response(content, self.usage)
+
+
+def message_stream(client: Any, **kwargs: Any) -> Any | None:
+    """Return a stream context manager, or None if the client cannot stream."""
+    stream_fn = getattr(getattr(client, "messages", None), "stream", None)
+    if not callable(stream_fn):
+        return None
+    try:
+        return stream_fn(**kwargs)
+    except Exception:
+        log.warning("messages.stream() failed to open", exc_info=True)
+        return None
