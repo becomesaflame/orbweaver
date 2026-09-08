@@ -68,8 +68,10 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
         if perms:
             return {"command": cmd, "permissions": sorted(set(perms))}
         return cmd
-    if name in {"Read", "Write", "ProposePatch", "SendPhoto"}:
+    if name in {"Read", "Write", "ProposePatch", "SendPhoto", "Delete"}:
         return {"path": inp.get("path")}
+    if name == "ReadLints":
+        return {"paths": inp.get("paths") or inp.get("path")}
     if name == "GenerateImage":
         return {"prompt": inp.get("prompt"), "path": inp.get("path")}
     if name == "WebFetch":
@@ -82,7 +84,7 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
         return {"query": inp.get("query")}
     if name == "SpawnSubagent":
         return {"task": inp.get("task")}
-    if name in {"Glob", "Grep", "AskUser"}:
+    if name in {"Glob", "Grep", "AskUser", "TodoWrite"}:
         return ""
     return inp
 

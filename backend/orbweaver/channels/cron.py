@@ -4,6 +4,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from orbweaver.agent import agent_turn
 from orbweaver.config import settings
@@ -13,17 +14,79 @@ from orbweaver.workspace import bind_workspace
 log = logging.getLogger(__name__)
 _scheduler: AsyncIOScheduler | None = None
 
+# Aliases accepted after stripping a leading "every " and a trailing "s".
+_RECURRENCE_ALIASES = {"minute": 60, "hour": 3600, "day": 86400}
 
-def _parse_recurrence(rec: str | None, due: datetime) -> datetime | None:
+
+def _alias_seconds(rec: str) -> int | None:
+    alias = rec.strip().lower().removeprefix("every ").removesuffix("s")
+    return _RECURRENCE_ALIASES.get(alias)
+
+
+def _cron_trigger(rec: str) -> CronTrigger | None:
+    parts = rec.split()
+    if len(parts) != 5:
+        return None
+    try:
+        return CronTrigger.from_crontab(rec, timezone=UTC)
+    except ValueError:
+        return None
+
+
+def _parse_recurrence(rec: str | None, due: datetime, now: datetime | None = None) -> datetime | None:
+    """Next fire after ``due``.
+
+    ``rec`` is ``minute`` / ``hour`` / ``day`` (also ``every hour``) or a 5-field
+    cron expression ``minute hour day-of-month month day-of-week``
+    (names like ``mon`` work; 0 is Monday). One-shots and unknown strings
+    return None. When ``now`` is set, skip occurrences that are already past.
+    """
     if not rec:
         return None
-    rec = rec.strip().lower()
-    rec = rec.removeprefix("every ")
-    rec = rec.removesuffix("s")
-    mapping = {"minute": 60, "hour": 3600, "day": 86400}
-    if rec in mapping:
-        return due + timedelta(seconds=mapping[rec])
-    return None
+    raw = rec.strip()
+    if not raw:
+        return None
+    seconds = _alias_seconds(raw)
+    if seconds is not None:
+        step = timedelta(seconds=seconds)
+        nxt = due + step
+        if now is not None:
+            while nxt <= now:
+                nxt += step
+        return nxt
+    trigger = _cron_trigger(raw)
+    if trigger is None:
+        return None
+    ref = now if now is not None and now > due else due
+    return trigger.get_next_fire_time(None, ref)
+
+
+def _result_text(events, aborted: bool) -> str:
+    from orbweaver.channels.telegram import texts_for_reply
+
+    text = texts_for_reply(events)
+    if text:
+        return text
+    return "Turn aborted." if aborted else "Scheduled task finished."
+
+
+async def _notify_originating_channel(store, sess, session_id, job, events) -> None:
+    from orbweaver.channels.telegram import notify_telegram_chat
+
+    aborted = any(e.kind == "turn_aborted" for e in events)
+    text = _result_text(events, aborted)
+    await store.append_event(
+        session_id,
+        "cron_result",
+        {
+            "job_id": str(job.id),
+            "text": text,
+            "status": "aborted" if aborted else "ok",
+        },
+    )
+    chat_id = sess.jsonld.get("telegram_chat_id")
+    if chat_id:
+        await notify_telegram_chat(int(chat_id), text)
 
 
 async def sweep() -> None:
@@ -48,19 +111,13 @@ async def sweep() -> None:
                     headless=True,
                     channel="cron",
                 )
-                aborted = next((e for e in events if e.kind == "turn_aborted"), None)
-                chat_id = sess.jsonld.get("telegram_chat_id")
-                if aborted and chat_id:
-                    from orbweaver.channels.telegram import notify_telegram_chat, texts_for_reply
-
-                    await notify_telegram_chat(int(chat_id), texts_for_reply(events))
-        nxt = _parse_recurrence(job.recurrence, job.due_at)
+                await _notify_originating_channel(store, sess, session_id, job, events)
+        nxt = _parse_recurrence(job.recurrence, job.due_at, now=now)
         if nxt:
             job.due_at = nxt
             await store.reschedule_job(job)
         else:
-            job.due_at = datetime.now(UTC) + timedelta(days=36500)
-            await store.reschedule_job(job)
+            await store.delete_job(job.id)
 
 
 def start_cron() -> None:

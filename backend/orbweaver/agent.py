@@ -28,6 +28,8 @@ from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
+from orbweaver.lints import read_lints
+from orbweaver.todos import inject_session_todos, persist_todos
 from orbweaver.tooltext import format_read, format_webfetch
 
 DEFAULT_MAX_ROUNDS = 48
@@ -73,6 +75,19 @@ TOOL_SPEC = [
         },
     },
     {
+        "name": "Delete",
+        "description": (
+            "Delete a file or directory in the session working set. Same deny/ask rules as "
+            "Write: always-deny secrets (.env, keys), and paths outside the working set are "
+            "blocked. Prefer this over Bash rm."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
         "name": "ProposePatch",
         "description": "Propose a search-replace patch (also applied as a review overlay in VS Code).",
         "input_schema": {
@@ -104,6 +119,24 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"pattern": {"type": "string"}, "glob": {"type": "string"}},
             "required": ["pattern"],
+        },
+    },
+    {
+        "name": "ReadLints",
+        "description": (
+            "Return diagnostics for files you just edited. Runs ORBWEAVER_LINTER when set "
+            "(use {paths} or trailing paths). Otherwise a Python AST stub reports syntax "
+            "errors. Paths default to recent Write/ProposePatch targets."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Workspace paths to check. Empty uses recently edited files.",
+                }
+            },
         },
     },
     {
@@ -245,6 +278,38 @@ TOOL_SPEC = [
         },
     },
     {
+        "name": "TodoWrite",
+        "description": (
+            "Create or update the session todo list. Persisted on the session so compaction "
+            "does not erase the plan. merge true updates by id; merge false replaces the list."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "content": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed", "cancelled"],
+                            },
+                        },
+                        "required": ["content"],
+                    },
+                },
+                "merge": {
+                    "type": "boolean",
+                    "description": "If true, merge by id into the existing list.",
+                },
+            },
+            "required": ["todos"],
+        },
+    },
+    {
         "name": "SpawnSubagent",
         "description": (
             "Spawn a nested agent with its own event stream to complete a focused task. "
@@ -261,13 +326,24 @@ TOOL_SPEC = [
     },
     {
         "name": "ScheduleTask",
-        "description": "Ask the host to schedule a job (ISO-8601 due_at).",
+        "description": (
+            "Ask the host to schedule a job. due_at is ISO-8601. "
+            "Optional recurrence: minute, hour, or day (also 'every hour'), "
+            "or a 5-field cron expression (minute hour day-of-month month "
+            "day-of-week), e.g. '0 9 * * mon'. Omit recurrence for a one-shot."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "due_at": {"type": "string"},
                 "message": {"type": "string"},
-                "recurrence": {"type": "string"},
+                "recurrence": {
+                    "type": "string",
+                    "description": (
+                        "minute/hour/day, or 5-field cron "
+                        "(minute hour day month weekday)."
+                    ),
+                },
             },
             "required": ["due_at", "message"],
         },
@@ -379,6 +455,7 @@ def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dic
     messages = events_to_messages(prompt_events(events))
     messages = hydrate_workspace_images(messages, workspace)
     messages = rehydrate_messages(messages, events, workspace)
+    messages = inject_session_todos(messages, events)
     if not messages:
         messages = [{"role": "user", "content": user_text}]
     return messages
@@ -394,6 +471,8 @@ def static_system(channel: str = "") -> str:
         "Use tools to read and patch the workspace. Sandboxed Bash can read host files; "
         "do not set permissions [\"all\"] just to inspect logs or journals. "
         f"{write_line}"
+        "In auto mode, in-project Delete applies immediately. TodoWrite keeps the plan "
+        "on this session across compaction. After edits, ReadLints for diagnostics. "
         "Use MemorySearch when past decisions might "
         "matter. Keep pins small. If the sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
@@ -445,6 +524,11 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "Write":
         ws.write(inp["path"], inp["content"])
         return f"wrote {inp['path']}"
+    if name == "Delete":
+        try:
+            return ws.delete(inp["path"])
+        except (OSError, PermissionError) as e:
+            return f"error deleting {inp.get('path')}: {e}"
     if name == "ProposePatch":
         result = ws.propose_patch(inp["path"], inp.get("old_string") or "", inp["new_string"])
         return json.dumps(result)[:200_000]
@@ -452,6 +536,8 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         return "\n".join(ws.glob(inp["pattern"])[:200])
     if name == "Grep":
         return "\n".join(ws.grep(inp["pattern"], inp.get("glob") or "**/*"))
+    if name == "ReadLints":
+        return read_lints(ws, inp, ctx.get("events"))
     if name == "Bash":
         from orbweaver.permissions.pipeline import bash_permissions
 
@@ -516,6 +602,9 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         return "forgotten"
     if name == "AskUser":
         return json.dumps({"ask": inp["question"]})
+    if name == "TodoWrite":
+        todos = await persist_todos(store, session_id, inp)
+        return json.dumps({"todos": todos})
     if name == "SpawnSubagent":
         from orbweaver.subagent import run_subagent
 
@@ -527,11 +616,21 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
                 due = due.replace(tzinfo=UTC)
         except ValueError as e:
             return f"invalid due_at: {e}"
+        rec = inp.get("recurrence")
+        if rec:
+            from orbweaver.channels.cron import _parse_recurrence
+
+            if _parse_recurrence(str(rec), due) is None:
+                return (
+                    "invalid recurrence: use minute, hour, day "
+                    "(or 'every hour'), or a 5-field cron expression "
+                    "like '0 9 * * mon'"
+                )
         job = Job(
             id=new_uuid(),
             due_at=due,
             payload={"message": inp.get("message") or ""},
-            recurrence=inp.get("recurrence"),
+            recurrence=rec,
             session_id=session_id,
         )
         await store.put_job(job)
