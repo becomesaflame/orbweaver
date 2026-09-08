@@ -14,6 +14,8 @@ from uuid import UUID
 
 from orbweaver import __version__
 from orbweaver.compact import (
+    CONTEXT_FULL_MESSAGE,
+    ContextFullError,
     ensure_tool_use_results,
     events_to_messages,
     live_events,
@@ -23,6 +25,11 @@ from orbweaver.compact import (
     record_usage,
     rehydrate_messages,
     usage_input_tokens,
+)
+from orbweaver.compact.overflow import (
+    OVERFLOW_KEEP_ROUNDS,
+    is_context_overflow,
+    overflow_compact_budget,
 )
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
@@ -1057,6 +1064,71 @@ class TurnInjected(Exception):
     """Current LLM call aborted so a mid-turn follow-up can join this query."""
 
 
+async def _create_with_overflow_retry(
+    client: Any,
+    *,
+    store: Store,
+    session_id: UUID,
+    workspace: Any,
+    system: Any,
+    user_text: str,
+    model: str,
+    tools: Any,
+    cancel: asyncio.Event | None,
+    produced: list[Event],
+    inject: asyncio.Event | None,
+    fire: Callable[[Event], None],
+    nudge: str | None = None,
+) -> Any:
+    """Call messages.create; on context overflow, compact and retry."""
+    last_error: BaseException | None = None
+    retries = max(0, int(settings.compact_overflow_retries))
+    for attempt in range(retries + 1):
+        events = await store.list_events(session_id)
+        messages = _prompt_messages(events, workspace, user_text)
+        if nudge:
+            _nudge_user(messages, nudge)
+        messages = ensure_tool_use_results(messages)
+        try:
+            return await _await_or_cancel(
+                client.messages.create(
+                    model=model,
+                    max_tokens=4096,
+                    system=cast(Any, system),
+                    tools=cast(Any, tools),
+                    messages=cast(Any, messages),
+                ),
+                cancel,
+                produced,
+                inject=inject,
+            )
+        except TurnInjected:
+            raise
+        except Exception as e:
+            last_error = e
+            if not is_context_overflow(e):
+                raise
+            if attempt >= retries:
+                break
+            keep = OVERFLOW_KEEP_ROUNDS[min(attempt, len(OVERFLOW_KEEP_ROUNDS) - 1)]
+            ev = await maybe_compact(
+                store,
+                session_id,
+                client=client,
+                workspace=workspace,
+                system=system,
+                source="overflow",
+                force=True,
+                budget=overflow_compact_budget(e),
+                keep_recent_rounds=keep,
+            )
+            if ev is not None:
+                fire(ev)
+            elif keep <= 0:
+                break
+    raise ContextFullError(CONTEXT_FULL_MESSAGE) from last_error
+
+
 def _raise_if_cancelled(
     cancel: asyncio.Event | None, produced: list[Event] | None = None
 ) -> None:
@@ -1248,34 +1320,35 @@ async def agent_turn(
             inj = inject_event()
             if inj is not None:
                 inj.clear()
-            events = await store.list_events(session_id)
-            ctx["events"] = events
-            messages = _prompt_messages(events, workspace, user_text)
+            nudge = None
             if round_i == max_rounds - 1:
-                _nudge_user(
-                    messages,
+                nudge = (
                     GIT_NOT_DONE_LAST_NUDGE
                     if ctx.get("git_not_done")
-                    else LAST_ROUND_NUDGE,
+                    else LAST_ROUND_NUDGE
                 )
             elif ctx.pop("git_not_done_nudge_pending", False):
-                _nudge_user(messages, GIT_NOT_DONE_NUDGE)
-            messages = ensure_tool_use_results(messages)
+                nudge = GIT_NOT_DONE_NUDGE
             try:
-                resp = await _await_or_cancel(
-                    client.messages.create(
-                        model=settings.orbweaver_model,
-                        max_tokens=4096,
-                        system=cast(Any, system),
-                        tools=cast(Any, active_tools),
-                        messages=cast(Any, messages),
-                    ),
-                    cancel,
-                    produced,
+                resp = await _create_with_overflow_retry(
+                    client,
+                    store=store,
+                    session_id=session_id,
+                    workspace=workspace,
+                    system=system,
+                    user_text=user_text,
+                    model=settings.orbweaver_model,
+                    tools=active_tools,
+                    cancel=cancel,
+                    produced=produced,
                     inject=inj,
+                    fire=fire,
+                    nudge=nudge,
                 )
             except TurnInjected:
                 continue
+            events = await store.list_events(session_id)
+            ctx["events"] = events
             last_seq = events[-1].seq if events else 0
             record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
             tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
@@ -1421,28 +1494,29 @@ async def agent_turn(
                 store, session_id, client=client, workspace=workspace, system=system
             )
         else:
-            events = await store.list_events(session_id)
-            messages = _prompt_messages(events, workspace, user_text)
-            _nudge_user(
-                messages,
-                GIT_NOT_DONE_CONCLUDE if ctx.get("git_not_done") else CONCLUDE_NUDGE,
-            )
-            messages = ensure_tool_use_results(messages)
             try:
-                resp = await _await_or_cancel(
-                    client.messages.create(
-                        model=settings.orbweaver_model,
-                        max_tokens=4096,
-                        system=cast(Any, system),
-                        tools=[],
-                        messages=cast(Any, messages),
-                    ),
-                    cancel,
-                    produced,
+                resp = await _create_with_overflow_retry(
+                    client,
+                    store=store,
+                    session_id=session_id,
+                    workspace=workspace,
+                    system=system,
+                    user_text=user_text,
+                    model=settings.orbweaver_model,
+                    tools=[],
+                    cancel=cancel,
+                    produced=produced,
                     inject=inject_event(),
+                    fire=fire,
+                    nudge=(
+                        GIT_NOT_DONE_CONCLUDE
+                        if ctx.get("git_not_done")
+                        else CONCLUDE_NUDGE
+                    ),
                 )
             except TurnInjected:
                 return produced
+            events = await store.list_events(session_id)
             last_seq = events[-1].seq if events else 0
             record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
@@ -1463,6 +1537,9 @@ async def agent_turn(
                         },
                     )
                 )
+        return produced
+    except ContextFullError as e:
+        fire(await store.append_event(session_id, "assistant", {"text": e.message}))
         return produced
     except TurnAborted as e:
         await record_abort(e)

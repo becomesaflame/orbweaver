@@ -514,3 +514,52 @@ def test_events_to_messages_pairs_when_only_the_later_tool_has_a_result():
     assert unpaired_tool_use_ids(messages) == []
     assert "toolu_read" in _tool_result_ids(messages)
     assert "toolu_bash" in _tool_result_ids(messages)
+
+
+@pytest.mark.asyncio
+async def test_overflow_force_compacts_under_budget_without_llm(monkeypatch):
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    sid = new_uuid()
+    await _session(store, sid)
+    for i in range(6):
+        tid = f"t{i}"
+        await store.append_event(sid, "user", {"text": f"round {i}"})
+        await store.append_event(
+            sid, "tool_call", {"id": tid, "name": "Read", "input": {"path": f"{i}.py"}}
+        )
+        await store.append_event(
+            sid,
+            "tool_result",
+            {"tool_use_id": tid, "name": "Read", "content": f"body-{i}"},
+        )
+
+    class Probe:
+        async def create(self, **_k):
+            raise AssertionError("overflow compact must not call the LLM")
+
+        @property
+        def messages(self):
+            return self
+
+    ev = await maybe_compact(
+        store,
+        sid,
+        client=Probe(),
+        system=[{"type": "text", "text": "x"}],
+        source="overflow",
+        force=True,
+        keep_recent_rounds=2,
+    )
+    assert ev is not None
+    assert ev.kind == "compact_boundary"
+    assert ev.payload["trigger"] == "overflow"
+    keep_from = int(ev.payload["keep_from_seq"])
+    stored = await store.list_events(sid)
+    dropped = [e for e in stored if e.kind == "tool_call" and e.seq < keep_from]
+    kept = [e for e in stored if e.kind == "tool_call" and e.seq >= keep_from]
+    assert dropped
+    assert len(kept) == 2
+    live = live_events(stored)
+    assert live[0].kind == "compact_boundary"
+    assert all(e.kind != "tool_result" or e.seq >= keep_from for e in live[1:])

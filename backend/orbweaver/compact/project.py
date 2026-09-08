@@ -88,6 +88,43 @@ def choose_keep_from_seq(live: list[Event], summary: str, budget: int) -> int:
     return body[keep_idx].seq
 
 
+def choose_keep_from_recent_rounds(live: list[Event], n_rounds: int) -> int:
+    """Keep the last n_rounds tool groups (0 = current user turn only)."""
+    if not live:
+        return 1
+    body = [e for e in live if e.kind not in BOUNDARY_KINDS]
+    if not body:
+        return live[-1].seq
+    starts: list[int] = []
+    i = 0
+    while i < len(body):
+        if body[i].kind == "tool_call":
+            starts.append(i)
+            i += 1
+            while i < len(body) and body[i].kind == "tool_call":
+                i += 1
+            while i < len(body) and body[i].kind in PAIR_KINDS and body[i].kind != "tool_call":
+                i += 1
+            continue
+        i += 1
+    if not starts:
+        n = 1 if n_rounds <= 0 else n_rounds
+        keep_idx = max(0, len(body) - n)
+        keep_idx = align_keep_index(body, keep_idx)
+        return body[keep_idx].seq
+    if n_rounds <= 0:
+        keep_idx = len(body) - 1
+        for j in range(len(body) - 1, -1, -1):
+            if body[j].kind == "user":
+                keep_idx = j
+                break
+        keep_idx = align_keep_index(body, keep_idx)
+        return body[keep_idx].seq
+    start = starts[-n_rounds] if n_rounds <= len(starts) else starts[0]
+    keep_idx = align_keep_index(body, start)
+    return body[keep_idx].seq
+
+
 def microcompact_events(events: list[Event]) -> list[Event]:
     """Stub old compactable tool results in a copied list. Store rows stay intact."""
     keep_n = max(1, int(settings.compact_micro_keep))
