@@ -892,6 +892,9 @@
           let msg;
           try { msg = JSON.parse(ev.data); }
           catch (e) { finish(reject, e); return; }
+          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" || msg.kind === "idle") {
+            return;
+          }
           if (msg.kind === "error") {
             const detail = msg.detail;
             finish(reject, new Error(typeof detail === "string" ? detail : JSON.stringify(detail)));
