@@ -8,6 +8,7 @@ import logging
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
@@ -44,6 +45,24 @@ LAST_ROUND_NUDGE = (
 CONCLUDE_NUDGE = (
     "Tool-round budget exhausted. Answer the user now from the tool results you already "
     "have. Do not call tools."
+)
+GIT_NOT_DONE_NUDGE = (
+    "Git ritual says NOT_DONE. The last git commit or push did not finish the rebase "
+    "and did not publish HEAD. Call Bash now with `git rebase --continue` "
+    "(after git add of resolved files) or `git rebase --abort`. "
+    "Do not tell the user the branch or PR was updated."
+)
+GIT_NOT_DONE_LAST_NUDGE = (
+    "This is the last tool round and Git ritual says NOT_DONE. "
+    "If you can, call Bash with git rebase --continue or --abort. "
+    "Otherwise tell the user the rebase is unfinished (detached HEAD / rebase-in-progress) "
+    "and do not claim the PR or branch was updated."
+)
+GIT_NOT_DONE_CONCLUDE = (
+    "Tool-round budget exhausted and Git ritual says NOT_DONE. "
+    "Tell the user the rebase is unfinished (detached HEAD or rebase-in-progress). "
+    "Do not claim the branch or PR was updated. Next step is git rebase --continue "
+    "or --abort."
 )
 
 TOOL_SPEC = [
@@ -218,7 +237,9 @@ TOOL_SPEC = [
             "escalation. If the sandbox blocks the command, ask the user before setting "
             "permissions to [\"full_network\"] (arbitrary internet) or [\"all\"] "
             "(host writes/docker/sudo). Those overrides pause for approval. "
-            "unsandboxed true aliases [\"all\"]."
+            "unsandboxed true aliases [\"all\"]. Git commands get an automatic "
+            "status footer (branch, HEAD, rebase-in-progress); trust that over "
+            "success substrings in the command output."
         ),
         "input_schema": {
             "type": "object",
@@ -667,7 +688,21 @@ def static_system(channel: str = "") -> str:
         "Use WebSearch to find sources, then WebFetch a few result URLs; do not guess "
         "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
         "Configured MCP servers appear as mcp_<server>_<tool> and use the "
-        "same permission pipeline as other tools. Finish with a user-visible answer "
+        "same permission pipeline as other tools. "
+        "Git: after clone, fetch, rebase, merge, commit, or push, read Git's state — "
+        "the Bash footer 'git ritual' (status, branch, HEAD) is authoritative, not a "
+        "success substring like 'Everything up-to-date'. Identify the repo (cd target "
+        "or workspace root); do not rebase a nested shared clone by accident. "
+        "For conflicts, keep current main and re-apply the small feature; do not "
+        "str.replace conflict markers. After resolving, git add those files and "
+        "git rebase --continue (or merge --continue). git commit is not continue. "
+        "While detached or rebase-in-progress, git push origin <branch> updates the "
+        "old branch tip, not HEAD. If the footer says NOT_DONE, the rebase is "
+        "unfinished; next git must be rebase --continue or --abort, not a success "
+        "claim. Do not git add -A if it would stage junk "
+        "(.venv, .orbweaver-tmp). Never force-push main. Never rewrite history "
+        "unless the user asked. "
+        "Finish with a user-visible answer "
         "before the tool-round budget runs out; spawn a subagent for a long exploration "
         "instead of burning parent rounds."
     )
@@ -793,18 +828,27 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "ReadLints":
         return read_lints(ws, inp, ctx.get("events"))
     if name == "Bash":
+        from orbweaver.git_ritual import annotate_bash_output, ritual_says_not_done
         from orbweaver.permissions.pipeline import bash_permissions
 
         perms = sorted(bash_permissions(inp))
-        return ws.bash(
+        background = bool(inp.get("background"))
+        job_id = inp.get("job_id")
+        result = ws.bash(
             inp.get("command") or "",
             timeout=inp.get("timeout"),
             block_until_ms=inp.get("block_until_ms"),
-            background=bool(inp.get("background")),
-            job_id=inp.get("job_id"),
+            background=background,
+            job_id=job_id,
             unsandboxed=bool(inp.get("unsandboxed")),
             permissions=perms,
         )
+        if not background and not job_id:
+            result = annotate_bash_output(
+                Path(ws.root), inp.get("command") or "", result
+            )
+            ctx["git_not_done"] = ritual_says_not_done(result)
+        return result
     if name == "WebFetch":
         import httpx
 
@@ -1192,7 +1236,14 @@ async def agent_turn(
             ctx["events"] = events
             messages = _prompt_messages(events, workspace, user_text)
             if round_i == max_rounds - 1:
-                _nudge_user(messages, LAST_ROUND_NUDGE)
+                _nudge_user(
+                    messages,
+                    GIT_NOT_DONE_LAST_NUDGE
+                    if ctx.get("git_not_done")
+                    else LAST_ROUND_NUDGE,
+                )
+            elif ctx.pop("git_not_done_nudge_pending", False):
+                _nudge_user(messages, GIT_NOT_DONE_NUDGE)
             try:
                 resp = await _await_or_cancel(
                     client.messages.create(
@@ -1217,6 +1268,14 @@ async def agent_turn(
                 fire(ev)
             check()
             if not tool_uses:
+                if (
+                    ctx.get("git_not_done")
+                    and not ctx.get("git_not_done_nudged")
+                    and round_i < max_rounds - 1
+                ):
+                    ctx["git_not_done_nudged"] = True
+                    ctx["git_not_done_nudge_pending"] = True
+                    continue
                 break
             stop_after_ask = False
             waiting_ask = False
@@ -1347,7 +1406,10 @@ async def agent_turn(
         else:
             events = await store.list_events(session_id)
             messages = _prompt_messages(events, workspace, user_text)
-            _nudge_user(messages, CONCLUDE_NUDGE)
+            _nudge_user(
+                messages,
+                GIT_NOT_DONE_CONCLUDE if ctx.get("git_not_done") else CONCLUDE_NUDGE,
+            )
             try:
                 resp = await _await_or_cancel(
                     client.messages.create(
