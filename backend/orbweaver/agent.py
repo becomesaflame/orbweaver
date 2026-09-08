@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -31,6 +32,8 @@ from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.todos import inject_session_todos, persist_todos
 from orbweaver.tooltext import format_read, format_webfetch
+
+log = logging.getLogger(__name__)
 
 DEFAULT_MAX_ROUNDS = 48
 LAST_ROUND_NUDGE = (
@@ -73,6 +76,29 @@ TOOL_SPEC = [
             "type": "object",
             "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
             "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "StrReplace",
+        "description": (
+            "Edit an existing workspace file by replacing old_string with new_string. "
+            "old_string must match exactly once unless replace_all is true. Prefer this "
+            "over Write for existing files and over Bash (python, sed, perl) for source "
+            "edits. To resolve a git conflict, replace the entire hunk including "
+            "<<<<<<< / ======= / >>>>>>> marker lines with the resolved text."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace every match (default false: unique match required).",
+                },
+            },
+            "required": ["path", "old_string", "new_string"],
         },
     },
     {
@@ -166,7 +192,7 @@ TOOL_SPEC = [
         "description": (
             "Return diagnostics for files you just edited. Runs ORBWEAVER_LINTER when set "
             "(use {paths} or trailing paths). Otherwise a Python AST stub reports syntax "
-            "errors. Paths default to recent Write/ProposePatch targets."
+            "errors. Paths default to recent Write/StrReplace/ProposePatch targets."
         ),
         "input_schema": {
             "type": "object",
@@ -315,7 +341,9 @@ TOOL_SPEC = [
         "name": "MemorySearch",
         "description": (
             "Search shared memory (remembered facts), not project source. Use WorkspaceSearch "
-            "to find code. Graph neighbors of hit chunks are included unless expand_graph is false."
+            "to find code. When Hindsight is configured this is recall() (semantic, keyword, "
+            "graph, temporal). Otherwise native vector search; graph neighbors of hit chunks "
+            "are included unless expand_graph is false. Use MemoryReflect to synthesize."
         ),
         "input_schema": {
             "type": "object",
@@ -349,11 +377,32 @@ TOOL_SPEC = [
     },
     {
         "name": "MemoryRemember",
-        "description": "Store a fact in shared memory.",
+        "description": "Store a fact in shared memory (Hindsight retain when configured).",
         "input_schema": {
             "type": "object",
             "properties": {"text": {"type": "string"}, "pinned": {"type": "boolean"}},
             "required": ["text"],
+        },
+    },
+    {
+        "name": "MemoryReflect",
+        "description": (
+            "Synthesize from shared memory: what is currently true, preferences, or a "
+            "judgment across facts. Writes opinions into the bank. Do not use this as the "
+            "user-visible answer for a whole turn — summarize for the user yourself. "
+            "Use MemorySearch for raw facts. Requires Hindsight."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "budget": {
+                    "type": "string",
+                    "enum": ["low", "mid", "high"],
+                    "description": "How thorough the reflect loop is (default low).",
+                },
+            },
+            "required": ["query"],
         },
     },
     {
@@ -609,7 +658,8 @@ def static_system(channel: str = "") -> str:
         "on this session across compaction. After edits, ReadLints for diagnostics. "
         "Use NotebookEdit for .ipynb cells instead of rewriting the whole JSON. "
         "Use WorkspaceSearch to find code in the workspace. Use MemorySearch when past "
-        "decisions or stored facts might matter, and MemoryGraph to walk entity "
+        "decisions or stored facts might matter, MemoryReflect to synthesize what is "
+        "still true or what we prefer, and MemoryGraph to walk native entity "
         "neighborhoods. Keep pins small. If the sandbox cannot run a command, ask the user "
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
         "stay blocked; do not route around them. Call independent tools in parallel in "
@@ -774,6 +824,9 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
 
         return run_workspace_search(ws, inp)
     if name == "MemorySearch":
+        from orbweaver.hindsight import enabled as hindsight_on
+        from orbweaver.hindsight import format_recall
+        from orbweaver.hindsight import recall as hindsight_recall
         from orbweaver.memory import expand_chunk_graph
 
         events = live_events(await store.list_events(session_id))
@@ -782,6 +835,15 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             if ev.kind == "MemoryRecall":
                 already.update(ev.payload.get("chunk_ids") or [])
         q = rewrite_search_query(events, inp.get("query") or "")
+        if hindsight_on():
+            try:
+                payload = format_recall(await hindsight_recall(q))
+            except Exception as e:
+                log.warning("hindsight recall failed, using native: %s", e)
+            else:
+                ids = [i for i in payload["chunk_ids"] if i not in already]
+                payload["chunk_ids"] = ids
+                return json.dumps(payload)
         hits = await store.search_chunks(q, k=8)
         lines = []
         ids = []
@@ -806,15 +868,54 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         neighborhood = await graph_neighborhood(store, str(inp.get("id") or ""), hops)
         return json.dumps(neighborhood)
     if name == "MemoryRemember":
+        from orbweaver.hindsight import enabled as hindsight_on
+        from orbweaver.hindsight import retain as hindsight_retain
         from orbweaver.store import PinBudgetError
 
+        pinned = bool(inp.get("pinned"))
+        text = str(inp.get("text") or "")
+        hs_out: dict[str, Any] | None = None
+        if hindsight_on() and text.strip():
+            try:
+                hs_out = await hindsight_retain(
+                    text,
+                    context="agent",
+                    retain_async=not pinned,
+                )
+            except Exception as e:
+                if not pinned:
+                    return json.dumps({"error": f"hindsight retain failed: {e}"})
+                log.warning("hindsight retain failed: %s", e)
+            else:
+                if not pinned:
+                    return json.dumps({"id": "hindsight", "hindsight": hs_out})
         try:
-            chunk = await remember(
-                store, inp["text"], source="agent", pinned=bool(inp.get("pinned"))
-            )
+            chunk = await remember(store, text, source="agent", pinned=pinned)
         except PinBudgetError as e:
             return f"pin rejected: {e}"
-        return str(chunk.id)
+        body: dict[str, Any] = {"id": str(chunk.id)}
+        if hs_out is not None:
+            body["hindsight"] = hs_out
+        return json.dumps(body) if hs_out is not None else str(chunk.id)
+    if name == "MemoryReflect":
+        from orbweaver.hindsight import enabled as hindsight_on
+        from orbweaver.hindsight import format_reflect
+        from orbweaver.hindsight import reflect as hindsight_reflect
+
+        if not hindsight_on():
+            return json.dumps(
+                {"error": "Hindsight is not configured (set HINDSIGHT_API_URL)."}
+            )
+        budget = str(inp.get("budget") or "low")
+        if budget not in {"low", "mid", "high"}:
+            budget = "low"
+        query = str(inp.get("query") or "").strip()
+        if not query:
+            return json.dumps({"error": "query is required"})
+        try:
+            return json.dumps(format_reflect(await hindsight_reflect(query, budget=budget)))
+        except Exception as e:
+            return json.dumps({"error": str(e)})
     if name == "MemoryPin":
         from orbweaver.store import PinBudgetError
 
@@ -1289,3 +1390,13 @@ async def agent_turn(
     except TurnCancelled as e:
         e.produced = produced
         raise
+    finally:
+        from orbweaver.hindsight import retain_turn
+
+        await retain_turn(
+            session_id,
+            user_text,
+            produced,
+            subagent_depth=subagent_depth,
+            channel=resolved_channel,
+        )

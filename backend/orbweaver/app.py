@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import os
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -50,6 +51,8 @@ from orbweaver.uris import (
     validate_workspace_uri,
 )
 from orbweaver.workspace import bind_workspace, normalize_workspace_kind
+
+log = logging.getLogger(__name__)
 
 
 def _web_dir() -> Path:
@@ -183,6 +186,11 @@ class RememberBody(BaseModel):
     text: str
     source: str = "api"
     pinned: bool = False
+
+
+class ReflectBody(BaseModel):
+    query: str
+    budget: str = "low"
 
 
 class PinBody(BaseModel):
@@ -346,8 +354,14 @@ async def _maybe_autotitle(store, sess: Entity, user_text: str) -> None:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok", "version": __version__}
+async def health() -> dict[str, Any]:
+    from orbweaver.hindsight import enabled as hindsight_on
+
+    return {
+        "status": "ok",
+        "version": __version__,
+        "hindsight": hindsight_on(),
+    }
 
 
 @app.post("/v1/auth/token", include_in_schema=settings.orbweaver_allow_http_mint)
@@ -400,11 +414,26 @@ async def graph(id: str, depth: int = 1, _u: dict = Depends(_user)) -> dict[str,
 
 @app.post("/memory/search")
 async def search(body: SearchBody, _u: dict = Depends(_user)) -> dict[str, Any]:
+    from orbweaver.hindsight import enabled as hindsight_on
+    from orbweaver.hindsight import format_recall
+    from orbweaver.hindsight import recall as hindsight_recall
+
     store = get_store()
     q = body.query
     if body.session_id:
         events = await store.list_events(body.session_id)
         q = rewrite_search_query(events, body.query)
+    if hindsight_on():
+        try:
+            payload = format_recall(await hindsight_recall(q))
+            return {
+                "query_used": q,
+                "hits": payload["hits"],
+                "graph": payload["graph"],
+                "source": "hindsight",
+            }
+        except Exception as e:
+            log.warning("hindsight recall failed, using native: %s", e)
     hits = await store.search_chunks(q, k=body.k)
     graph_hits = await expand_chunk_graph(store, hits)
     return {
@@ -415,12 +444,45 @@ async def search(body: SearchBody, _u: dict = Depends(_user)) -> dict[str, Any]:
 
 
 @app.post("/memory/remember")
-async def remember_api(body: RememberBody, _u: dict = Depends(_user)) -> dict[str, str]:
+async def remember_api(body: RememberBody, _u: dict = Depends(_user)) -> dict[str, Any]:
+    from orbweaver.hindsight import enabled as hindsight_on
+    from orbweaver.hindsight import retain as hindsight_retain
+
+    out: dict[str, Any] = {}
+    if hindsight_on() and body.text.strip():
+        try:
+            out["hindsight"] = await hindsight_retain(
+                body.text, context=body.source or "api", retain_async=not body.pinned
+            )
+        except Exception as e:
+            if not body.pinned:
+                raise HTTPException(502, f"hindsight retain failed: {e}") from e
+    if body.pinned or not hindsight_on():
+        try:
+            chunk = await remember(
+                get_store(), body.text, source=body.source, pinned=body.pinned
+            )
+        except PinBudgetError as e:
+            raise HTTPException(400, str(e)) from e
+        out["id"] = str(chunk.id)
+    elif "hindsight" in out:
+        out["id"] = "hindsight"
+    return out
+
+
+@app.post("/memory/reflect")
+async def reflect_api(body: ReflectBody, _u: dict = Depends(_user)) -> dict[str, Any]:
+    from orbweaver.hindsight import enabled as hindsight_on
+    from orbweaver.hindsight import format_reflect
+    from orbweaver.hindsight import reflect as hindsight_reflect
+
+    if not hindsight_on():
+        raise HTTPException(503, "Hindsight is not configured (set HINDSIGHT_API_URL)")
+    budget = body.budget if body.budget in {"low", "mid", "high"} else "low"
     try:
-        chunk = await remember(get_store(), body.text, source=body.source, pinned=body.pinned)
-    except PinBudgetError as e:
-        raise HTTPException(400, str(e)) from e
-    return {"id": str(chunk.id)}
+        return format_reflect(await hindsight_reflect(body.query, budget=budget))
+    except Exception as e:
+        raise HTTPException(502, str(e)) from e
 
 
 @app.post("/memory/pin")

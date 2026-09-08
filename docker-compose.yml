@@ -27,6 +27,9 @@ services:
       WORKSPACE_ROOT: /workspace
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWLIST: ${TELEGRAM_ALLOWLIST:-}
+      HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-}
+      HINDSIGHT_API_KEY: ${HINDSIGHT_API_KEY:-}
+      HINDSIGHT_BANK_ID: ${HINDSIGHT_BANK_ID:-personal}
     volumes:
       - ${WORKSPACE_BIND:-.}:/workspace
     ports:
@@ -35,5 +38,38 @@ services:
       postgres:
         condition: service_healthy
 
+  hindsight-db:
+    profiles: ["hindsight"]
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: hindsight
+      POSTGRES_PASSWORD: hindsight
+      POSTGRES_DB: hindsight
+    volumes:
+      - hindsight-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hindsight"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  hindsight:
+    profiles: ["hindsight"]
+    image: ghcr.io/vectorize-io/hindsight:latest
+    environment:
+      HINDSIGHT_API_DATABASE_URL: postgresql://hindsight:hindsight@hindsight-db:5432/hindsight
+      HINDSIGHT_API_LLM_PROVIDER: anthropic
+      HINDSIGHT_API_LLM_API_KEY: ${ANTHROPIC_API_KEY:-}
+      HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+      HINDSIGHT_API_TENANT_API_KEY: ${HINDSIGHT_API_KEY:-change-me}
+      HINDSIGHT_API_WORKER_ID: hindsight-prod
+      HINDSIGHT_API_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8888:8888"
+    depends_on:
+      hindsight-db:
+        condition: service_healthy
+
 volumes:
   orbweaver-pg:
+  hindsight-pg:

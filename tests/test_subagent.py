@@ -235,6 +235,7 @@ def test_child_tool_spec_by_type():
     assert CHILD_BLOCKED_TOOLS.isdisjoint(explore | implement | shell)
     assert "Read" in explore
     assert "MemoryGraph" in explore
+    assert "MemoryReflect" in explore
     assert "Write" not in explore
     assert "Bash" not in explore
     assert "NotebookEdit" not in explore

@@ -117,7 +117,10 @@ async def maybe_compact(
         },
     )
     try:
-        await remember(store, summary, source=f"compact:{session_id}")
+        from orbweaver.hindsight import enabled as hindsight_on
+
+        if not hindsight_on():
+            await remember(store, summary, source=f"compact:{session_id}")
     except Exception as e:
         log.warning("compact remember failed: %s", e)
     if trigger in {"llm", "session_notes"}:

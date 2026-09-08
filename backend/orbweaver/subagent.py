@@ -37,6 +37,7 @@ EXPLORE_TOOLS = frozenset(
         "WebSearch",
         "MemorySearch",
         "MemoryGraph",
+        "MemoryReflect",
         "ReadLints",
     }
 )
@@ -50,7 +51,7 @@ SUBAGENT_SYSTEM_EXTRA = (
     "You are an Orbweaver subagent. Complete the assigned task using tools. "
     "Do not ask the user questions. Do not schedule jobs or spawn further subagents. "
     "Report a concise result when done. Search project files with WorkspaceSearch; "
-    "shared memory is available via MemorySearch. Pinned memory is already in this "
+    "shared memory is available via MemorySearch and MemoryReflect. Pinned memory is already in this "
     "system prompt."
 )
 _TYPE_EXTRA = {
@@ -59,8 +60,8 @@ _TYPE_EXTRA = {
         "edit notebooks, or run shell commands."
     ),
     "implement": (
-        "You are an implement subagent. Make the assigned change. Prefer patches. "
-        "Do not spawn further agents."
+        "You are an implement subagent. Make the assigned change. Prefer StrReplace "
+        "for existing files. Do not spawn further agents."
     ),
     "shell": (
         "You are a shell subagent. Run commands for the assigned task. "

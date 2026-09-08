@@ -17,6 +17,7 @@ SKIP_PERSIST = frozenset(
         "WorkspaceSearch",
         "MemoryGraph",
         "MemoryRemember",
+        "MemoryReflect",
         "MemoryPin",
         "MemoryForget",
         "TodoWrite",

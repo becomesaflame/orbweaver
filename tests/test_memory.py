@@ -183,4 +183,5 @@ async def test_memory_graph_tool(store, tmp_path):
     assert any(t["p"] == "about" for t in body["triples"])
     names = {t["name"] for t in TOOL_SPEC}
     assert "MemoryGraph" in names
+    assert "MemoryReflect" in names
     assert "WorkspaceSearch" in names
