@@ -22,7 +22,7 @@ from orbweaver.store import Event
 
 log = logging.getLogger(__name__)
 
-_BLOCK_RE = re.compile(r"<block>\s*(yes|no)\s*</block>", re.IGNORECASE)
+_BLOCK_RE = re.compile(r"<block>\s*(yes|no|ask)\s*</block>", re.IGNORECASE)
 _REASON_RE = re.compile(r"<reason>\s*(.*?)\s*</reason>", re.IGNORECASE | re.DOTALL)
 
 
@@ -54,7 +54,20 @@ def load_project_intent(workspace) -> str:
 
 def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
     if name == "Bash":
-        return str(inp.get("command") or "")
+        cmd = str(inp.get("command") or "")
+        perms: list[str] = []
+        raw = inp.get("permissions") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        for item in raw:
+            val = str(item).strip().lower()
+            if val in {"all", "full_network"}:
+                perms.append(val)
+        if inp.get("unsandboxed") is True or str(inp.get("unsandboxed")).lower() in {"1", "true"}:
+            perms.append("all")
+        if perms:
+            return {"command": cmd, "permissions": sorted(set(perms))}
+        return cmd
     if name in {"Read", "Write", "ProposePatch", "SendPhoto"}:
         return {"path": inp.get("path")}
     if name == "GenerateImage":
@@ -86,11 +99,24 @@ def build_transcript(
     return "\n".join(lines)
 
 
-def parse_block(text: str) -> bool | None:
+def parse_verdict(text: str) -> str | None:
+    """Map <block>yes|no|ask</block> to deny|allow|ask."""
     match = _BLOCK_RE.search(text or "")
     if not match:
         return None
-    return match.group(1).lower() == "yes"
+    raw = match.group(1).lower()
+    if raw == "yes":
+        return "deny"
+    if raw == "no":
+        return "allow"
+    return "ask"
+
+
+def parse_block(text: str) -> bool | None:
+    verdict = parse_verdict(text)
+    if verdict is None:
+        return None
+    return verdict == "deny"
 
 
 def parse_reason(text: str) -> str:
@@ -111,6 +137,16 @@ def build_system_prompt(extra_framing: str = "") -> str:
     )
 
 
+def _classified(verdict: str, reason: str, stage: str) -> dict[str, Any]:
+    return {
+        "verdict": verdict,
+        "should_block": verdict == "deny",
+        "should_ask": verdict == "ask",
+        "reason": reason,
+        "stage": stage,
+    }
+
+
 async def classify_action(
     events: list[Event],
     tool_name: str,
@@ -120,13 +156,9 @@ async def classify_action(
     extra_framing: str = "",
     client=None,
 ) -> dict[str, Any]:
-    """Return {should_block: bool, reason: str, stage: str}."""
+    """Return {verdict: allow|ask|deny, should_block, should_ask, reason, stage}."""
     if not settings.anthropic_api_key:
-        return {
-            "should_block": True,
-            "reason": "Classifier unavailable (no API key) — blocking for safety",
-            "stage": "unavailable",
-        }
+        return _classified("ask", "Classifier unavailable (no API key) — needs user approval", "unavailable")
 
     transcript = build_transcript(events, tool_name, tool_input)
     intent = load_project_intent(workspace) if workspace is not None else ""
@@ -181,15 +213,12 @@ async def classify_action(
         )
     except Exception as e:  # noqa: BLE001
         log.warning("classifier stage1 failed: %s", e)
-        return {"should_block": True, "reason": f"Classifier error — blocking: {e}", "stage": "error"}
+        return _classified("ask", f"Classifier error — needs user approval: {e}", "error")
 
     raw1 = _text_of(stage1) + "</block>"
-    block1 = parse_block(raw1)
-    if block1 is False:
-        return {"should_block": False, "reason": "Allowed by fast classifier", "stage": "fast"}
-    if block1 is None:
-        # Stage 1 unparseable: escalate to stage 2 rather than allow.
-        pass
+    verdict1 = parse_verdict(raw1)
+    if verdict1 == "allow":
+        return _classified("allow", "Allowed by fast classifier", "fast")
 
     try:
         stage2 = await client.messages.create(
@@ -203,16 +232,17 @@ async def classify_action(
         )
     except Exception as e:  # noqa: BLE001
         log.warning("classifier stage2 failed: %s", e)
-        return {"should_block": True, "reason": f"Classifier error — blocking: {e}", "stage": "error"}
+        return _classified("ask", f"Classifier error — needs user approval: {e}", "error")
 
     raw2 = _text_of(stage2)
-    block2 = parse_block(raw2)
-    if block2 is None:
-        return {
-            "should_block": True,
-            "reason": "Classifier stage 2 unparseable - blocking for safety",
-            "stage": "thinking",
-        }
-    if block2:
-        return {"should_block": True, "reason": parse_reason(raw2), "stage": "thinking"}
-    return {"should_block": False, "reason": "Allowed by classifier", "stage": "thinking"}
+    verdict2 = parse_verdict(raw2)
+    if verdict2 is None:
+        return _classified("ask", "Classifier stage 2 unparseable — needs user approval", "thinking")
+    if verdict2 == "deny":
+        return _classified("deny", parse_reason(raw2), "thinking")
+    if verdict2 == "ask":
+        reason = parse_reason(raw2)
+        if reason == "Blocked by classifier":
+            reason = "Needs user approval"
+        return _classified("ask", reason, "thinking")
+    return _classified("allow", "Allowed by classifier", "thinking")

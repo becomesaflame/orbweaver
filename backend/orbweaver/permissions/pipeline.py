@@ -99,6 +99,17 @@ def bash_permissions(inp: dict[str, Any]) -> frozenset[str]:
     return frozenset(out)
 
 
+def _classifier_verdict(result: dict[str, Any]) -> str:
+    verdict = result.get("verdict")
+    if verdict in {"allow", "ask", "deny"}:
+        return verdict
+    if result.get("should_ask"):
+        return "ask"
+    if result.get("should_block"):
+        return "deny"
+    return "allow"
+
+
 def bash_sandboxable(inp: dict[str, Any], workspace_kind: str) -> bool:
     perms = bash_permissions(inp)
     if perms & {"all", "full_network"}:
@@ -208,23 +219,30 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
     state: DenialTrackingState = ctx.get("denial_state") or denial_state_for(
         ctx.get("session_id") or UUID(int=0)
     )
-    if result.get("should_block"):
-        state.record_denial()
-        decision = PermissionDecision(
-            "deny",
-            result.get("reason") or "Blocked by classifier",
-            fast,
-            classifier_reason=result.get("reason"),
-        )
-        if state.should_fallback():
-            if headless:
-                _abort(ctx, "classifier_denial_limit", decision, name, inp)
-            return PermissionDecision(
-                "ask",
-                decision.reason,
-                fast,
-                classifier_reason=decision.classifier_reason,
-            )
+    verdict = _classifier_verdict(result)
+    reason = result.get("reason") or "classifier"
+    if verdict == "allow":
+        state.record_success()
+        return PermissionDecision("allow", reason, fast)
+    if verdict == "ask":
+        decision = PermissionDecision("ask", reason, fast, classifier_reason=reason)
+        if headless:
+            _abort(ctx, "ask_required_headless", decision, name, inp)
         return decision
-    state.record_success()
-    return PermissionDecision("allow", result.get("reason") or "classifier allow", fast)
+    state.record_denial()
+    decision = PermissionDecision(
+        "deny",
+        reason,
+        fast,
+        classifier_reason=reason,
+    )
+    if state.should_fallback():
+        if headless:
+            _abort(ctx, "classifier_denial_limit", decision, name, inp)
+        return PermissionDecision(
+            "ask",
+            decision.reason,
+            fast,
+            classifier_reason=decision.classifier_reason,
+        )
+    return decision

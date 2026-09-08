@@ -295,3 +295,32 @@ def test_in_working_set_relative(tmp_path):
     assert in_working_set("src/a.py", ws)
     assert in_working_set("src/a.py", ws, write=True)
     assert not in_working_set("/etc/passwd", ws, write=True)
+
+
+@pytest.mark.asyncio
+async def test_classifier_ask_is_not_a_deny(tmp_path, monkeypatch):
+    async def ask(*_a, **_k):
+        return {"verdict": "ask", "should_block": False, "should_ask": True, "reason": "confirm override", "stage": "thinking"}
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", ask)
+    monkeypatch.setattr("orbweaver.permissions.pipeline.sandbox_available", lambda: True)
+    decision = await can_use_tool(
+        "Bash",
+        {"command": "git clone git@github.com:becomesaflame/orbweaver.git .", "permissions": ["all"]},
+        _ctx(tmp_path),
+    )
+    assert decision.behavior == "ask"
+    assert "confirm override" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_classifier_ask_headless_aborts(tmp_path, monkeypatch):
+    async def ask(*_a, **_k):
+        return {"verdict": "ask", "should_block": False, "should_ask": True, "reason": "confirm override", "stage": "thinking"}
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", ask)
+    monkeypatch.setattr("orbweaver.permissions.pipeline.sandbox_available", lambda: False)
+    monkeypatch.setattr(settings, "orbweaver_sandbox_fail_if_unavailable", False)
+    with pytest.raises(TurnAborted) as ei:
+        await can_use_tool("WebFetch", {"url": "https://example.com"}, _ctx(tmp_path, headless=True))
+    assert ei.value.payload["reason"] == "ask_required_headless"

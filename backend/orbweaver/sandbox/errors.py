@@ -28,7 +28,7 @@ def network_denied(host: str) -> str:
     return sandbox_denied(
         "network",
         f"{host} not allowed",
-        'Add the domain or retry with permissions ["full_network"]',
+        'Ask the user to approve permissions ["full_network"] before retrying',
     )
 
 
@@ -36,7 +36,7 @@ def unix_socket_denied(path: str) -> str:
     return sandbox_denied(
         "unix_socket",
         path,
-        'Grant allowUnixSockets or retry with permissions ["all"]',
+        'Ask the user to approve permissions ["all"] or an allowUnixSockets grant',
     )
 
 
@@ -44,7 +44,7 @@ def filesystem_denied(detail: str) -> str:
     return sandbox_denied(
         "filesystem",
         detail,
-        'Writes stay in the working set; retry with permissions ["all"] only for host writes',
+        'Ask the user to approve permissions ["all"] before host writes',
     )
 
 
@@ -61,7 +61,7 @@ def label_sandbox_output(out: str) -> str:
             sandbox_denied(
                 "network",
                 "host not reachable from the sandbox allowlist",
-                'Add the domain or retry with permissions ["full_network"]',
+                'Ask the user to approve permissions ["full_network"] before retrying',
             )
             + "\n"
             + text
