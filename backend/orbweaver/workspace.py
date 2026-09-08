@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import glob as globmod
 import json
+import logging
 import os
 import shutil
 import signal
@@ -17,6 +18,8 @@ from orbweaver.config import settings
 from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
 from orbweaver.tooltext import grep_regex
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
+
+log = logging.getLogger(__name__)
 
 DEFAULT_BASH_TIMEOUT_S = 30
 MAX_BASH_TIMEOUT_S = 600
@@ -142,7 +145,7 @@ class _BashJob:
                 try:
                     self.cleanup()
                 except Exception:
-                    pass
+                    log.exception("failed to clean up background bash job")
             self._done.set()
 
     def wait(self, seconds: float) -> bool:
@@ -341,7 +344,12 @@ class LocalWorkspace:
             if background:
                 return self._start_job(cmd, seconds, self._spawn_raw(cmd))
             return self._raw_bash(cmd, seconds)
-        from orbweaver.sandbox.bwrap import SandboxUnavailable, is_containerized, run_sandboxed, spawn_sandboxed
+        from orbweaver.sandbox.bwrap import (
+            SandboxUnavailable,
+            is_containerized,
+            run_sandboxed,
+            spawn_sandboxed,
+        )
 
         if is_containerized():
             if background:

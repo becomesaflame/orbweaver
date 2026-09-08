@@ -215,7 +215,7 @@ class SandboxSession:
             try:
                 self.proxy.close()
             except Exception:
-                pass
+                log.exception("failed to close sandbox proxy")
             self.proxy = None
 
 

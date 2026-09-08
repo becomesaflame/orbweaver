@@ -101,6 +101,10 @@ async def test_headless_ask_abort_persists_events(tmp_path, monkeypatch):
     assistant = [e for e in events if e.kind == "assistant"]
     assert assistant and "Stopped this turn" in assistant[-1].payload["text"]
     assert texts_for_reply(events) != "(no assistant text)"
+    stored = await store.list_events(sid)
+    assert any(
+        e.kind == "tool_result" and e.payload.get("tool_use_id") == "tu1" for e in stored
+    )
 
 
 @pytest.mark.asyncio
