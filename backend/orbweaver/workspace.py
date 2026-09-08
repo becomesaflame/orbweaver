@@ -34,10 +34,16 @@ def _is_all_files_glob(spec: str) -> bool:
 
 
 def _ctx_int(value: object) -> int:
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 0
+    return 0
 
 
 def _trim_rg_line(line: str, content_cap: int = GREP_LINE_CAP) -> str:
