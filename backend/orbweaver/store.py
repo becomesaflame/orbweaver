@@ -44,7 +44,7 @@ def jsonld_triples(entity: Entity) -> list[tuple[str, str, str]]:
     subject = entity.at_id
 
     def _add(pred: str, value: Any) -> None:
-        if isinstance(value, str) and (value.startswith("urn:") or value.startswith("http")):
+        if isinstance(value, str) and value.startswith(("urn:", "http")):
             out.append((subject, pred, value))
         elif isinstance(value, dict):
             nested = value.get("@id")

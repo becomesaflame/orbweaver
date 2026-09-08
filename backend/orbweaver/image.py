@@ -41,8 +41,7 @@ def process_image_bytes(data: bytes) -> tuple[bytes, str]:
         raise ValueError("empty image")
     from PIL import Image
 
-    im = Image.open(io.BytesIO(data))
-    im = im.convert("RGB")
+    im = Image.open(io.BytesIO(data)).convert("RGB")
     im.thumbnail((MAX_DIMENSION, MAX_DIMENSION))
     quality = JPEG_QUALITY
     out = b""

@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from orbweaver import __version__
@@ -438,7 +438,7 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         return run_websearch(inp)
     if name == "MemorySearch":
         events = live_events(await store.list_events(session_id))
-        already = set()
+        already: set[str] = set()
         for ev in events:
             if ev.kind == "MemoryRecall":
                 already.update(ev.payload.get("chunk_ids") or [])
@@ -697,9 +697,9 @@ async def agent_turn(
                     client.messages.create(
                         model=settings.orbweaver_model,
                         max_tokens=4096,
-                        system=system,
-                        tools=active_tools,
-                        messages=messages,
+                        system=cast(Any, system),
+                        tools=cast(Any, active_tools),
+                        messages=cast(Any, messages),
                     ),
                     cancel,
                     produced,
@@ -817,9 +817,9 @@ async def agent_turn(
                     client.messages.create(
                         model=settings.orbweaver_model,
                         max_tokens=4096,
-                        system=system,
+                        system=cast(Any, system),
                         tools=[],
-                        messages=messages,
+                        messages=cast(Any, messages),
                     ),
                     cancel,
                     produced,

@@ -2,7 +2,7 @@ import pytest
 
 from orbweaver.config import settings
 from orbweaver.memory import remember, rewrite_search_query
-from orbweaver.store import Event, PinBudgetError, reset_store_for_tests, new_uuid
+from orbweaver.store import Event, PinBudgetError, new_uuid, reset_store_for_tests
 from orbweaver.tokens import estimate_tokens
 
 

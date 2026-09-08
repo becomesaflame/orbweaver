@@ -13,7 +13,16 @@ from time import time
 from typing import Any
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +50,7 @@ from orbweaver.uris import (
     validate_workspace_uri,
 )
 from orbweaver.workspace import bind_workspace, normalize_workspace_kind
+
 
 def _web_dir() -> Path:
     env = os.environ.get("ORBWEAVER_WEB_DIR")
@@ -339,8 +349,9 @@ async def put_entity(body: EntityBody, _u: dict = Depends(_user)) -> dict[str, s
     ent = Entity(id=uid, at_id=str(at_id), at_type=str(at_type), jsonld=jsonld, pinned=body.pinned)
     try:
         if body.pinned:
-            from orbweaver.store import ensure_pin_budget
             import json as _j
+
+            from orbweaver.store import ensure_pin_budget
 
             await ensure_pin_budget(store, extra_text=_j.dumps(jsonld))
         await store.put_entity(ent)

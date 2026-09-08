@@ -213,7 +213,7 @@ async def classify_action(
             ],
             stop_sequences=["</block>"],
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("classifier stage1 failed: %s", e)
         return _classified("ask", f"Classifier error — needs user approval: {e}", "error")
 
@@ -232,7 +232,7 @@ async def classify_action(
                 {"role": "user", "content": STAGE2_SUFFIX},
             ],
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("classifier stage2 failed: %s", e)
         return _classified("ask", f"Classifier error — needs user approval: {e}", "error")
 

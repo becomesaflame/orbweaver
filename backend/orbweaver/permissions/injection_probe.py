@@ -62,7 +62,7 @@ async def probe_tool_output(name: str, output: str, *, client=None) -> dict[str,
             system=INJECTION_PROBE_SYSTEM,
             messages=[{"role": "user", "content": payload}],
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("injection probe failed open: %s", e)
         return {"flagged": False, "output": output}
     text = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text")

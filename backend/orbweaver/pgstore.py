@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -61,30 +61,29 @@ class PostgresStore:
             if uri:
                 validate_workspace_uri(str(uri))
         pool = self._pool_req()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO entities(id, at_id, at_type, jsonld, pinned)
+                VALUES ($1,$2,$3,$4::jsonb,$5)
+                ON CONFLICT (id) DO UPDATE SET jsonld=EXCLUDED.jsonld, pinned=EXCLUDED.pinned
+                """,
+                entity.id,
+                entity.at_id,
+                entity.at_type,
+                json.dumps(entity.jsonld),
+                entity.pinned,
+            )
+            await conn.execute("DELETE FROM triples WHERE subject=$1", entity.at_id)
+            for s, p, o in jsonld_triples(entity):
                 await conn.execute(
-                    """
-                    INSERT INTO entities(id, at_id, at_type, jsonld, pinned)
-                    VALUES ($1,$2,$3,$4::jsonb,$5)
-                    ON CONFLICT (id) DO UPDATE SET jsonld=EXCLUDED.jsonld, pinned=EXCLUDED.pinned
-                    """,
-                    entity.id,
-                    entity.at_id,
-                    entity.at_type,
-                    json.dumps(entity.jsonld),
-                    entity.pinned,
+                    "INSERT INTO triples(id,subject,predicate,object,graph_id) VALUES ($1,$2,$3,$4,$5)",
+                    new_uuid(),
+                    s,
+                    p,
+                    o,
+                    "",
                 )
-                await conn.execute("DELETE FROM triples WHERE subject=$1", entity.at_id)
-                for s, p, o in jsonld_triples(entity):
-                    await conn.execute(
-                        "INSERT INTO triples(id,subject,predicate,object,graph_id) VALUES ($1,$2,$3,$4,$5)",
-                        new_uuid(),
-                        s,
-                        p,
-                        o,
-                        "",
-                    )
         return entity
 
     async def get_entity(self, uid: uuid.UUID) -> Entity | None:
@@ -263,18 +262,17 @@ class PostgresStore:
 
     async def replace_events(self, session_id: uuid.UUID, events: list[Event]) -> None:
         pool = self._pool_req()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM events WHERE session_id=$1", session_id)
-                for ev in events:
-                    await conn.execute(
-                        "INSERT INTO events(id,session_id,seq,kind,payload) VALUES ($1,$2,$3,$4,$5::jsonb)",
-                        ev.id,
-                        ev.session_id,
-                        ev.seq,
-                        ev.kind,
-                        json.dumps(ev.payload),
-                    )
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM events WHERE session_id=$1", session_id)
+            for ev in events:
+                await conn.execute(
+                    "INSERT INTO events(id,session_id,seq,kind,payload) VALUES ($1,$2,$3,$4,$5::jsonb)",
+                    ev.id,
+                    ev.session_id,
+                    ev.seq,
+                    ev.kind,
+                    json.dumps(ev.payload),
+                )
 
     async def truncate_events(self, session_id: uuid.UUID, from_seq: int) -> None:
         pool = self._pool_req()

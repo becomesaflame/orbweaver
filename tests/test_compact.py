@@ -13,9 +13,19 @@ from orbweaver.compact import (
     rehydrate_messages,
     reset_compact_state,
 )
-from orbweaver.compact.usage import compact_failures, estimate_prompt_tokens, record_compact_failure
+from orbweaver.compact.usage import (
+    compact_failures,
+    estimate_prompt_tokens,
+    record_compact_failure,
+)
 from orbweaver.config import settings
-from orbweaver.store import SESSION_TYPE, Entity, new_uuid, reset_store_for_tests, session_at_id
+from orbweaver.store import (
+    SESSION_TYPE,
+    Entity,
+    new_uuid,
+    reset_store_for_tests,
+    session_at_id,
+)
 from orbweaver.workspace import LocalWorkspace
 
 
