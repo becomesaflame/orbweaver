@@ -107,13 +107,10 @@ def _parse_gitignore(text: str) -> list[tuple[bool, bool, str]]:
         if not line or line.lstrip().startswith("#"):
             continue
         negated = line.startswith("!")
-        if negated:
-            line = line[1:]
+        line = line.removeprefix("!")
         dir_only = line.endswith("/")
-        if dir_only:
-            line = line[:-1]
-        if line.startswith("/"):
-            line = line[1:]
+        line = line.removesuffix("/")
+        line = line.removeprefix("/")
         if line:
             rules.append((negated, dir_only, line))
     return rules

@@ -297,7 +297,11 @@ async def _revert_autotitle_if_needed(store, sess: Entity, discarded_text: str) 
 
 
 async def _finish_cancelled_turn(
-    store, sess: Entity, state: RunningTurn, produced: list, user_text: str
+    store,
+    sess: Entity,
+    state: RunningTurn,
+    produced: list,
+    user_text: str,
 ) -> dict[str, Any]:
     if state.discard:
         if state.user_seq:
@@ -306,6 +310,7 @@ async def _finish_cancelled_turn(
         return {"events": [], "status": "discarded", "user_seq": state.user_seq}
     marker = await store.append_event(sess.id, "turn_interrupted", {"reason": "stop"})
     produced = list(produced) + [marker]
+    _broadcast(sess.id, _event_dict(marker))
     return {
         "events": [_event_dict(e) for e in produced],
         "status": "stopped",
@@ -545,7 +550,12 @@ async def list_events(session_id: UUID, _u: dict = Depends(_user)) -> dict[str, 
 
 
 async def _run_turn(
-    store, sess, session_id: UUID, user_text: str, *, resume: bool = False
+    store,
+    sess,
+    session_id: UUID,
+    user_text: str,
+    *,
+    resume: bool = False,
 ) -> dict[str, Any]:
     if session_id in _running_turns:
         raise HTTPException(409, "turn already running")
@@ -727,7 +737,9 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
                 data = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            typ = str(data.get("type") or data.get("kind") or "")
+            if not isinstance(data, dict):
+                continue
+            typ = str(data.get("type") or "")
             if typ in {"subscribe", "ping"}:
                 if typ == "ping":
                     await websocket.send_json({"kind": "pong"})
@@ -743,14 +755,32 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
                 else:
                     await websocket.send_json({"kind": "idle"})
                 continue
-            text = data.get("text") or ""
-            if not text:
+            resume = bool(data.get("resume"))
+            text = str(data.get("text") or "")
+            if not resume and not text.strip():
                 continue
+            if resume:
+                existing = await store.list_events(session_id)
+                if not existing:
+                    await websocket.send_json(
+                        {
+                            "kind": "error",
+                            "detail": "nothing to continue",
+                            "status": 400,
+                            "status_code": 400,
+                        }
+                    )
+                    continue
             try:
-                await _run_turn(store, sess, session_id, text)
+                await _run_turn(store, sess, session_id, text, resume=resume)
             except HTTPException as e:
                 await websocket.send_json(
-                    {"kind": "error", "status": e.status_code, "detail": e.detail}
+                    {
+                        "kind": "error",
+                        "status": e.status_code,
+                        "status_code": e.status_code,
+                        "detail": e.detail,
+                    }
                 )
     except WebSocketDisconnect:
         return
