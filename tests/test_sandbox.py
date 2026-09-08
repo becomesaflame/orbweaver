@@ -123,3 +123,20 @@ def test_sandbox_available_in_container(monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox", True)
     monkeypatch.setattr("orbweaver.sandbox.bwrap.is_containerized", lambda: True)
     assert sandbox_available() is True
+
+
+def test_bwrap_does_not_ro_bind_git_metadata(tmp_path: Path):
+    """Workspace .git is working-set writeable so clone/init/fetch can run."""
+    hooks = tmp_path / ".git" / "hooks"
+    hooks.mkdir(parents=True)
+    config = tmp_path / ".git" / "config"
+    config.write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp")
+    protected = {str(hooks.resolve()), str(config.resolve())}
+    i = 0
+    while i < len(argv):
+        if argv[i] in {"--ro-bind", "--ro-bind-try"} and i + 2 < len(argv):
+            assert argv[i + 2] not in protected
+            i += 3
+            continue
+        i += 1
