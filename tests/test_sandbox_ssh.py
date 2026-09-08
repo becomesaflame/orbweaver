@@ -15,6 +15,7 @@ from orbweaver.sandbox.ssh import (
     filter_ssh_argv,
     ssh_identity_bind_args,
 )
+from sandbox_mounts import assert_ro_bind_dests_creatable
 
 
 def test_filter_ssh_argv_drops_dash_f():
@@ -63,6 +64,7 @@ def test_bwrap_overlays_ssh_and_hides_config_d(tmp_path: Path):
         assert tmpfs_tmp < argv.index(SANDBOX_SSH_DIR)
         wrapper_text = wrapper.read_text(encoding="utf-8")
         assert SANDBOX_OPENSSH in wrapper_text
+    assert_ro_bind_dests_creatable(argv)
 
 
 def test_bwrap_full_network_skips_proxycommand(tmp_path: Path):

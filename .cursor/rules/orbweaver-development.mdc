@@ -23,6 +23,10 @@ After reviewable work on a **feature branch** (never `main`):
 The user's request to implement or fix something **is** the request to follow
 this pipeline through a PR. Do not stop at "say if you want a commit."
 
+When a production failure is diagnosed, add a test that reproduces it
+(same command path, same error class) with the fix. Prefer executing the
+runtime (bubblewrap, the agent loop) over argv-only checks.
+
 ## Do not
 
 - Commit or push `main`.
