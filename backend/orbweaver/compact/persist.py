@@ -14,6 +14,7 @@ SKIP_PERSIST = frozenset(
         "WebSearch",
         "Browser",
         "MemorySearch",
+        "WorkspaceSearch",
         "MemoryGraph",
         "MemoryRemember",
         "MemoryPin",

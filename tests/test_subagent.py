@@ -295,6 +295,8 @@ def test_parent_tool_spec_still_includes_spawn():
     assert "AskUser" in names
     assert "SendPhoto" in names
     assert "GenerateImage" in names
+    assert "WorkspaceSearch" in names
+    assert "MemorySearch" in names
     assert "Delete" in names
     assert "TodoWrite" in names
     assert "ReadLints" in names
