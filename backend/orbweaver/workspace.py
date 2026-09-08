@@ -6,6 +6,8 @@ import glob as globmod
 import subprocess
 from pathlib import Path
 
+from orbweaver.tooltext import grep_regex
+
 from orbweaver.config import settings
 from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
@@ -108,6 +110,9 @@ class LocalWorkspace:
         return [str(p.relative_to(self.root)) for p in self.root.glob(pattern) if p.is_file()]
 
     def grep(self, pattern: str, glob: str = "**/*") -> list[str]:
+        rx = grep_regex(pattern)
+        if rx is None:
+            return []
         hits: list[str] = []
         for rel in self.glob(glob):
             try:
@@ -115,7 +120,7 @@ class LocalWorkspace:
             except (OSError, UnicodeDecodeError, PermissionError):
                 continue
             for i, line in enumerate(text.splitlines(), 1):
-                if pattern in line:
+                if rx.search(line):
                     hits.append(f"{rel}:{i}:{line[:200]}")
                     if len(hits) >= 50:
                         return hits

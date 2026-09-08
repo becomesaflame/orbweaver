@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover
     review_subagent_return = None
 
 CHILD_BLOCKED_TOOLS = frozenset({"SpawnSubagent", "AskUser", "ScheduleTask"})
-SUBAGENT_MAX_ROUNDS = 24
+SUBAGENT_MAX_ROUNDS = 48
 RESULT_TEXT_CAP = 8000
 SUBAGENT_SYSTEM_EXTRA = (
     "You are an Orbweaver subagent. Complete the assigned task using tools. "

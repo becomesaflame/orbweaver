@@ -65,14 +65,18 @@ class _ToolUse:
         self.input = inp
 
 
-class _FakeAnthropic:
+class _RecordingAnthropic:
     def __init__(self, responses, *a, **k):
         self._responses = list(responses)
+        self.calls = []
         self.messages = self
 
-    async def create(self, **_k):
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
         if not self._responses:
-            return SimpleNamespace(content=[SimpleNamespace(type="text", text="done")])
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="here is what I found")]
+            )
         return self._responses.pop(0)
 
 
@@ -82,7 +86,7 @@ async def test_headless_ask_abort_persists_events(tmp_path, monkeypatch):
     resp = SimpleNamespace(content=[_ToolUse("Bash", {"command": "git push origin main"})])
 
     def factory(*a, **k):
-        return _FakeAnthropic([resp], *a, **k)
+        return _RecordingAnthropic([resp], *a, **k)
 
     monkeypatch.setattr(anthropic, "AsyncAnthropic", factory)
     store = reset_store_for_tests()
@@ -99,12 +103,13 @@ async def test_headless_ask_abort_persists_events(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_round_cap_appends_assistant(tmp_path, monkeypatch):
+async def test_round_cap_asks_for_final_answer(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
     resp = SimpleNamespace(content=[_ToolUse("Glob", {"pattern": "*"})])
+    client = _RecordingAnthropic([resp, resp])
 
     def factory(*a, **k):
-        return _FakeAnthropic([resp, resp], *a, **k)
+        return client
 
     monkeypatch.setattr(anthropic, "AsyncAnthropic", factory)
     store = reset_store_for_tests()
@@ -112,7 +117,41 @@ async def test_round_cap_appends_assistant(tmp_path, monkeypatch):
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     events = await agent_turn(store, sid, "list files", ws, max_rounds=2)
     texts = [e.payload.get("text") for e in events if e.kind == "assistant"]
-    assert any("Stopped after 2 tool rounds" in (t or "") for t in texts)
+    assert any("here is what I found" in (t or "") for t in texts)
+    assert not any("Stopped after 2 tool rounds" in (t or "") for t in texts)
+    assert len(client.calls) == 3
+    assert client.calls[-1]["tools"] == []
+    last_tool_msgs = client.calls[1]["messages"]
+    blob = str(last_tool_msgs[-1]["content"])
+    assert "last tool round" in blob.lower()
+    conclude = str(client.calls[-1]["messages"][-1]["content"])
+    assert "Tool-round budget exhausted" in conclude
+
+
+@pytest.mark.asyncio
+async def test_round_cap_fallback_when_conclude_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    resp = SimpleNamespace(content=[_ToolUse("Glob", {"pattern": "*"})])
+
+    class EmptyConclude(_RecordingAnthropic):
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if not self._responses:
+                return SimpleNamespace(content=[])
+            return self._responses.pop(0)
+
+    client = EmptyConclude([resp])
+
+    def factory(*a, **k):
+        return client
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", factory)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    events = await agent_turn(store, sid, "list files", ws, max_rounds=1)
+    texts = [e.payload.get("text") for e in events if e.kind == "assistant"]
+    assert any("Stopped after 1 tool rounds" in (t or "") for t in texts)
 
 
 @pytest.mark.asyncio
@@ -132,7 +171,7 @@ async def test_denied_spawn_never_reaches_stub(tmp_path, monkeypatch):
     second = SimpleNamespace(content=[SimpleNamespace(type="text", text="blocked, stopping")])
 
     def factory(*a, **k):
-        return _FakeAnthropic([first, second], *a, **k)
+        return _RecordingAnthropic([first, second], *a, **k)
 
     monkeypatch.setattr(anthropic, "AsyncAnthropic", factory)
     store = reset_store_for_tests()

@@ -7,7 +7,9 @@ from typing import Any
 from orbweaver.config import settings
 from orbweaver.redact import redact_secrets
 
-SKIP_PERSIST = frozenset({"Read", "MemorySearch", "MemoryRemember", "MemoryPin", "MemoryForget"})
+SKIP_PERSIST = frozenset(
+    {"Read", "WebFetch", "MemorySearch", "MemoryRemember", "MemoryPin", "MemoryForget"}
+)
 PREVIEW_CHARS = 2000
 
 
@@ -28,7 +30,8 @@ def persist_tool_result(
         workspace.write(rel, text)
     except (OSError, PermissionError, TypeError):
         return text[: max(threshold, PREVIEW_CHARS)], None
-    preview = text[:PREVIEW_CHARS]
+    preview_n = max(PREVIEW_CHARS, threshold)
+    preview = text[:preview_n]
     stored = (
         f"<persisted-output>\n"
         f"Output too large ({len(text)} chars). Saved to: {rel}\n"

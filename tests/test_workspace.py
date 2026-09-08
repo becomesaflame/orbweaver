@@ -10,6 +10,9 @@ def test_local_glob_and_grep(tmp_path: Path):
     assert "src/a.py" in ws.glob("**/*.py")
     hits = ws.grep("airbed")
     assert hits and "src/a.py" in hits[0]
+    alt = ws.grep(r"airbed\|docs")
+    assert any("src/a.py" in h for h in alt)
+    assert any("README.md" in h for h in alt)
 
 
 def test_path_escape_rejected(tmp_path: Path):
