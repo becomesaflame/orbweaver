@@ -313,6 +313,25 @@
     $("settings-toggle").onclick = () => $("settings").classList.toggle("hidden");
     $("search").addEventListener("input", paintSessions);
 
+    // Autoscroll: pauses when the user scrolls up; resumes when they return to the bottom.
+    let _userScrolled = false;
+    function _initAutoscroll() {
+      const log = $("log");
+      log.addEventListener("scroll", () => {
+        const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+        _userScrolled = !atBottom;
+      }, { passive: true });
+    }
+    function _scrollToBottom() {
+      if (_userScrolled) return;
+      const log = $("log");
+      log.scrollTop = log.scrollHeight;
+    }
+    function _resetAutoscroll() {
+      _userScrolled = false;
+      _scrollToBottom();
+    }
+
     function add(kind, text, opts={}) {
       const d = document.createElement("div");
       d.className = "msg " + kind + (opts.extraClass ? " " + opts.extraClass : "");
@@ -322,7 +341,7 @@
       body.textContent = kind + ": " + text;
       d.appendChild(body);
       $("log").appendChild(d);
-      $("log").scrollTop = $("log").scrollHeight;
+      _scrollToBottom();
       return d;
     }
     function attachUserActions(el, text, seq, pending) {
@@ -664,6 +683,7 @@
       if (!sid) {
         $("status").textContent = "disconnected";
         $("log").innerHTML = '<div class="placeholder">Start a new chat or pick one from the left.</div>';
+        _resetAutoscroll();
         return;
       }
       if (!$("token").value.trim()) {
@@ -674,6 +694,7 @@
         const r = await api("/v1/sessions/" + sid + "/events");
         if (inFlight && inFlight.sid === sid) { syncComposer(); return; }
         $("log").replaceChildren();
+        _resetAutoscroll();
         const evs = r.events || [];
         stoppedSids.delete(sid);
         waitingAskSids.delete(sid);
@@ -722,6 +743,7 @@
       sessions = [session, ...sessions.filter((s) => s.id !== session.id)];
       $("log").replaceChildren();
       $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
+      _resetAutoscroll();
       setActive(session, { skipHistory: true });
       $("status").textContent = "";
       $("text").focus();
@@ -1102,6 +1124,7 @@
     };
 
     (async function boot() {
+      _initAutoscroll();
       await refreshSessions();
       if (!currentSid() && sessions.length) {
         setActive(sessions[0], { skipHistory: true });
