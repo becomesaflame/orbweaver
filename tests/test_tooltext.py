@@ -59,6 +59,7 @@ def test_webfetch_js_shell_tells_agent_to_stop():
     )
     assert "JavaScript-rendered" in out
     assert "Do not keep fetching" in out
+    assert "Browser tool" in out
     assert "HTTP 200" in out
 
 

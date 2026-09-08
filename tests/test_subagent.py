@@ -235,6 +235,7 @@ def test_parent_tool_spec_still_includes_spawn():
     assert "TodoWrite" in names
     assert "ReadLints" in names
     assert "ProposePatch" in names
+    assert "Browser" in names
 
 
 @pytest.mark.asyncio
