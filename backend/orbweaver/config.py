@@ -8,6 +8,8 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = ""
     anthropic_workspace_id: str = ""
+    ollama_base_url: str = ""
+    ollama_model: str = ""
     orbweaver_jwt_secret: str = "dev-secret-change-me"
     orbweaver_model: str = "claude-sonnet-4-6"
     orbweaver_classifier_model: str = "claude-sonnet-4-6"

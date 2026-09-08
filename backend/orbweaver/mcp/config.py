@@ -82,6 +82,7 @@ def _parse_server(name: str, raw: Any) -> McpServerSpec | None:
         return None
     command = str(raw.get("command") or "").strip()
     args_raw = raw.get("args") or []
+    args: tuple[str, ...]
     if isinstance(args_raw, str):
         args = (args_raw,)
     elif isinstance(args_raw, list):
