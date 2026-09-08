@@ -1,3 +1,4 @@
+import shutil
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -116,3 +117,17 @@ async def test_run_tools_webfetch_extracts(monkeypatch, tmp_path):
     )
     assert "Comparable tools use 50+ steps." in out
     assert "<h1>" not in out
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep (rg) required")
+@pytest.mark.asyncio
+async def test_run_tools_grep_passes_context_and_glob(tmp_path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("src/a.py", "alpha\nMATCH\nomega\n")
+    ws.write("src/b.md", "MATCH\n")
+    ctx = {"workspace": ws, "store": None, "session_id": uuid4(), "workspace_kind": "local"}
+    out = await run_tools("Grep", {"pattern": "MATCH", "glob": "*.py", "C": 1}, ctx)
+    assert "src/a.py" in out
+    assert "alpha" in out
+    assert "omega" in out
+    assert "b.md" not in out

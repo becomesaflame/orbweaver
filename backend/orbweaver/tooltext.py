@@ -217,13 +217,19 @@ def _fetch_header(
     return " | ".join(bits)
 
 
-def grep_regex(pattern: str) -> re.Pattern[str] | None:
-    """Compile a grep pattern. Models often send `a\\|b` when they mean `a|b`."""
+def normalize_grep_pattern(pattern: str) -> str:
+    """Models often send `a\\|b` when they mean `a|b`."""
     spec = (pattern or "").strip()
-    if not spec:
-        return None
     if r"\|" in spec:
         spec = spec.replace(r"\|", "|")
+    return spec
+
+
+def grep_regex(pattern: str) -> re.Pattern[str] | None:
+    """Compile a grep pattern. Models often send `a\\|b` when they mean `a|b`."""
+    spec = normalize_grep_pattern(pattern)
+    if not spec:
+        return None
     try:
         return re.compile(spec)
     except re.error:
