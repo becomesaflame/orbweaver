@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 from collections import defaultdict
@@ -84,16 +85,68 @@ app.add_middleware(
 )
 
 _hits: dict[str, list[float]] = defaultdict(list)
+_RATE_LIMIT_WINDOW_S = 60.0
+_RATE_LIMIT_MAX = 120
+
+
+def _parse_ip(value: str) -> str | None:
+    host = value.strip()
+    if not host:
+        return None
+    if host.startswith("["):
+        end = host.find("]")
+        if end == -1:
+            return None
+        host = host[1:end]
+    elif host.count(":") == 1:
+        host, _, maybe_port = host.rpartition(":")
+        if not maybe_port.isdigit():
+            return None
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return None
+
+
+def _forwarded_client_ip(request: Request) -> str | None:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        for part in xff.split(","):
+            parsed = _parse_ip(part)
+            if parsed:
+                return parsed
+    xri = request.headers.get("x-real-ip")
+    if xri:
+        for part in xri.split(","):
+            parsed = _parse_ip(part)
+            if parsed:
+                return parsed
+    return None
+
+
+def rate_limit_client_ip(request: Request) -> str:
+    """Socket IP, or the real client IP when ORBWEAVER_TRUST_PROXY is on."""
+    if settings.orbweaver_trust_proxy:
+        forwarded = _forwarded_client_ip(request)
+        if forwarded:
+            return forwarded
+    if request.client:
+        return request.client.host
+    return "anon"
+
+
+def _rate_limit_key(request: Request) -> str:
+    return request.headers.get("authorization") or rate_limit_client_ip(request)
 
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
     if request.url.path in {"/health", "/"}:
         return await call_next(request)
-    key = request.headers.get("authorization") or request.client.host if request.client else "anon"
+    key = _rate_limit_key(request)
     now = time()
-    window = [t for t in _hits[key] if now - t < 60]
-    if len(window) >= 120:
+    window = [t for t in _hits[key] if now - t < _RATE_LIMIT_WINDOW_S]
+    if len(window) >= _RATE_LIMIT_MAX:
         return JSONResponse({"detail": "rate limited"}, status_code=429)
     window.append(now)
     _hits[key] = window
