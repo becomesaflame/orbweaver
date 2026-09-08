@@ -17,6 +17,7 @@ from orbweaver.compact.project import ensure_tool_use_results, unpaired_tool_use
 from orbweaver.compact.usage import (
     compact_failures,
     estimate_prompt_tokens,
+    event_token_count,
     record_compact_failure,
 )
 from orbweaver.config import settings
@@ -209,6 +210,58 @@ def test_usage_anchor_plus_delta():
     total = estimate_prompt_tokens(sid, events)
     assert total > 1000
     assert total < 1000 + 50
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_uses_recorded_usage_not_payload_estimate(monkeypatch):
+    """usage.input_tokens above threshold must compact even when the payload estimate is low.
+
+    Production: system+tools, images, and MCP schemas are in the API usage
+    figure but missing from event_token_count, so a session can hit
+    prompt_too_long without ever compacting.
+    """
+    store = reset_store_for_tests()
+    reset_compact_state()
+    monkeypatch.setattr(settings, "event_budget_override", 80)
+    monkeypatch.setattr(settings, "compact_ratio", 0.5)
+    sid = new_uuid()
+    await _session(store, sid)
+    for i in range(5):
+        await store.append_event(sid, "user", {"text": f"hi {i}"})
+    events = await store.list_events(sid)
+    projected = prompt_events(events)
+    budget = int(settings.event_budget * settings.compact_ratio)
+    assert event_token_count(projected) <= budget
+    record_usage(sid, 100_000, at_seq=events[-1].seq)
+    ev = await maybe_compact(store, sid)
+    assert ev is not None
+    assert ev.kind == "compact_boundary"
+    stored = await store.list_events(sid)
+    assert stored[-1].kind == "compact_boundary"
+    assert [e.kind for e in stored].count("user") == 5
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_skips_when_usage_below_threshold(monkeypatch):
+    """Low recorded usage must not compact even if the payload estimate is high."""
+    store = reset_store_for_tests()
+    reset_compact_state()
+    monkeypatch.setattr(settings, "event_budget_override", 80)
+    monkeypatch.setattr(settings, "compact_ratio", 0.5)
+    sid = new_uuid()
+    await _session(store, sid)
+    for i in range(40):
+        await store.append_event(sid, "user", {"text": "word " * 30 + str(i)})
+    events = await store.list_events(sid)
+    projected = prompt_events(events)
+    budget = int(settings.event_budget * settings.compact_ratio)
+    assert event_token_count(projected) > budget
+    record_usage(sid, 10, at_seq=events[-1].seq)
+    ev = await maybe_compact(store, sid)
+    assert ev is None
+    stored = await store.list_events(sid)
+    assert all(e.kind != "compact_boundary" for e in stored)
+    assert len(stored) == 40
 
 
 def test_rehydrate_injects_recent_read(tmp_path):

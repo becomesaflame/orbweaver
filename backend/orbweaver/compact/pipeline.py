@@ -17,6 +17,7 @@ from orbweaver.compact.project import (
 from orbweaver.compact.usage import (
     clear_usage,
     compact_failures,
+    estimate_prompt_tokens,
     event_token_count,
     record_compact_failure,
     record_compact_success,
@@ -42,6 +43,15 @@ async def maybe_compact(
 ) -> Event | None:
     """Append a compact_boundary if the live prompt window is over budget.
 
+    Trigger from last API ``usage.input_tokens`` plus a local delta
+    (``estimate_prompt_tokens``), not a payload-only estimate. Payload
+    estimates undercount system+tools, images, and MCP schemas, so a
+    session can hit Anthropic ``prompt_too_long`` without compacting.
+
+    Threshold is ``event_budget * compact_ratio`` (~85% of the 200k
+    window after reserves). Claw Code compares cumulative input tokens
+    to 100k (``CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS``).
+
     Never deletes session events. Recursion sources (compact, session_notes) no-op.
     """
     del workspace  # persist/rehydrate happen at ingest / prompt build
@@ -50,8 +60,13 @@ async def maybe_compact(
     events = await store.list_events(session_id)
     projected = prompt_events(events)
     budget = int(settings.event_budget * settings.compact_ratio)
-    if event_token_count(projected) <= budget:
+    prompt_tokens = estimate_prompt_tokens(session_id, projected)
+    if prompt_tokens <= budget:
         return None
+    # Usage includes system/tools/images the payload estimate misses. Reserve
+    # that overhead so choose_keep_from_seq actually drops events.
+    overhead = max(0, prompt_tokens - event_token_count(projected))
+    keep_budget = max(1, budget - overhead)
 
     live = live_events(events)
     live_body = [e for e in live if e.kind not in BOUNDARY_KINDS]
@@ -75,9 +90,9 @@ async def maybe_compact(
         try:
             notes = await update_session_notes(store, session_id, events, client, system)
             if notes:
-                keep_from = choose_keep_from_seq(live, notes, budget)
+                keep_from = choose_keep_from_seq(live, notes, keep_budget)
                 tail = [e for e in live_body if e.seq >= keep_from]
-                if event_token_count(tail) + estimate_tokens(notes) <= budget and any(
+                if event_token_count(tail) + estimate_tokens(notes) <= keep_budget and any(
                     e.seq < keep_from for e in live_body
                 ):
                     summary = notes
@@ -99,11 +114,11 @@ async def maybe_compact(
         summary = session_entity_notes(entity)
         trigger = "session_notes" if summary else "extractive"
         if summary is None:
-            keep_guess = choose_keep_from_seq(live, "placeholder", budget)
+            keep_guess = choose_keep_from_seq(live, "placeholder", keep_budget)
             dropped = [e for e in live_body if e.seq < keep_guess]
             summary = extractive_summary(dropped or live_body[-40:])
 
-    keep_from = choose_keep_from_seq(live, summary, budget)
+    keep_from = choose_keep_from_seq(live, summary, keep_budget)
     if not any(e.seq < keep_from for e in live_body):
         return None
 

@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     context_window: int = 200_000
     output_reserve: int = 16_000
     static_token_estimate: int = 12_000
+    # Compact when estimate_prompt_tokens exceeds this fraction of event_budget
+    # (~85% of the 200k window). Claw Code uses 100k cumulative input tokens.
     compact_ratio: float = 0.85
     orbweaver_compact_model: str = "claude-haiku-4-5"
     compact_micro_keep: int = 5
