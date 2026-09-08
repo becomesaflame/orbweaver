@@ -29,6 +29,27 @@ async def pinned_prompt(store: Store) -> str:
     return "\n".join(lines) if (ents or chunks) else ""
 
 
+GRAPH_MAX_DEPTH = 4
+
+
+async def graph_neighborhood(store: Store, at_id: str, depth: int = 1) -> dict[str, Any]:
+    """Walk triples around an entity @id, matching GET /memory/graph."""
+    node = (at_id or "").strip()
+    if not node:
+        return {"error": "id is required", "triples": []}
+    try:
+        hops = int(depth)
+    except (TypeError, ValueError):
+        hops = 1
+    hops = max(1, min(hops, GRAPH_MAX_DEPTH))
+    triples = await store.graph(node, depth=hops)
+    return {
+        "id": node,
+        "depth": hops,
+        "triples": [{"s": s, "p": p, "o": o} for s, p, o in triples],
+    }
+
+
 def rewrite_search_query(events: list[Any], current: str, n: int = 6) -> str:
     recent = events[-n:] if events else []
     bits = []

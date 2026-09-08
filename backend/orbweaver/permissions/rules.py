@@ -16,6 +16,7 @@ SAFE_ALLOWLIST = frozenset(
         "Grep",
         "AskUser",
         "MemorySearch",
+        "MemoryGraph",
         "MemoryRemember",
         "MemoryPin",
         "MemoryForget",
