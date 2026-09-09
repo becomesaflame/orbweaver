@@ -41,7 +41,7 @@ The agent loop speaks Anthropic Messages internally. For open-weight models it m
 | `gpt-oss-120b` | Strongest of the three; 128K context |
 | `deepseek-v4-flash-0731` | Reasoning enforced; 262K context |
 
-Get a key from [earthruntime.com](https://earthruntime.com). Classifier, injection probe, and compaction stay on Anthropic when `ANTHROPIC_API_KEY` is set.
+Get a key from [earthruntime.com](https://earthruntime.com). The same catalog names work on `ORBWEAVER_CLASSIFIER_MODEL`, `ORBWEAVER_INJECTION_PROBE_MODEL`, and `ORBWEAVER_COMPACT_MODEL`: Claude ids stay on Anthropic, catalog names use Earth Runtime.
 
 For a VPS, bind `ORBWEAVER_HOST=127.0.0.1` and publish the UI on your Tailscale interface (`tailscale serve http://127.0.0.1:8080`) instead of `0.0.0.0`.
 

@@ -24,16 +24,32 @@ def openrouter_configured() -> bool:
 
 
 def select_provider(model: str | None = None) -> str:
-    """Route the agent model. Open catalog names use Earth Runtime even if Claude is set."""
+    """Claude names → Anthropic; catalog names → Earth Runtime; else Anthropic / Ollama."""
     model = (model or settings.orbweaver_model).strip()
-    if openrouter_configured() and not is_claude_model(model):
-        return "openrouter"
+    if is_open_model(model):
+        return "openrouter" if openrouter_configured() else "none"
+    if is_claude_model(model):
+        if settings.anthropic_api_key.strip():
+            return "anthropic"
+        if _ollama_configured():
+            return "ollama"
+        return "none"
     if settings.anthropic_api_key.strip():
         return "anthropic"
     if openrouter_configured():
         return "openrouter"
     if _ollama_configured():
         return "ollama"
+    return "none"
+
+
+def hosted_provider(model: str | None = None) -> str:
+    """Anthropic or Earth Runtime only (classifier, probe, compact). No Ollama."""
+    model = (model or "").strip()
+    if is_open_model(model):
+        return "openrouter" if openrouter_configured() else "none"
+    if settings.anthropic_api_key.strip():
+        return "anthropic"
     return "none"
 
 
@@ -67,9 +83,9 @@ def make_anthropic_client() -> Any | None:
     )
 
 
-def make_agent_client(*, http: Any | None = None) -> Any | None:
+def make_agent_client(*, http: Any | None = None, model: str | None = None) -> Any | None:
     """Anthropic for Claude; Earth Runtime for open models; Ollama as last resort."""
-    provider = select_provider()
+    provider = select_provider(model)
     if provider == "anthropic":
         return make_anthropic_client()
     if provider == "openrouter":
@@ -87,13 +103,33 @@ def make_agent_client(*, http: Any | None = None) -> Any | None:
     return None
 
 
-def compact_llm_client(agent_client: Any | None) -> Any | None:
-    """Keep compact/summarize on Anthropic when both providers are configured."""
-    if isinstance(agent_client, OpenAICompatClient) and settings.anthropic_api_key.strip():
-        anth = make_anthropic_client()
-        if anth is not None:
-            return anth
-    return agent_client
+def make_hosted_client(model: str, *, http: Any | None = None) -> Any | None:
+    """Client for classifier / probe / compact: Claude → Anthropic, catalog → Earth Runtime."""
+    provider = hosted_provider(model)
+    if provider == "anthropic":
+        return make_anthropic_client()
+    if provider == "openrouter":
+        return OpenAICompatClient(
+            settings.openrouter_base_url.strip() or DEFAULT_OPENROUTER_BASE,
+            settings.openrouter_key,
+            http=http,
+        )
+    return None
+
+
+def compact_llm_client(agent_client: Any | None, *, http: Any | None = None) -> Any | None:
+    """Client that can serve ORBWEAVER_COMPACT_MODEL (Claude or catalog)."""
+    model = settings.orbweaver_compact_model.strip()
+    provider = hosted_provider(model)
+    if provider == "none":
+        return None
+    if provider == "openrouter":
+        if isinstance(agent_client, OpenAICompatClient):
+            return agent_client
+        return make_hosted_client(model, http=http)
+    if isinstance(agent_client, OpenAICompatClient):
+        return make_anthropic_client()
+    return agent_client if agent_client is not None else make_anthropic_client()
 
 
 class _TextBlock:
@@ -339,6 +375,9 @@ class OpenAICompatClient:
         }
         if tools:
             payload["tools"] = [_to_ollama_tool(t) for t in tools]
+        stops = _kw.get("stop_sequences")
+        if stops:
+            payload["stop"] = stops
         data = await self._post(payload)
         return _from_openai_completion(data)
 

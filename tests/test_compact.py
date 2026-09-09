@@ -167,6 +167,33 @@ async def test_llm_failure_falls_back_extractive(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_catalog_compact_without_openrouter_is_extractive(monkeypatch):
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "event_budget_override", 80)
+    monkeypatch.setattr(settings, "compact_ratio", 0.5)
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    monkeypatch.setattr(settings, "openrouter_api_key", "")
+    monkeypatch.setattr(settings, "earthruntime_api_key", "")
+    monkeypatch.setattr(settings, "orbweaver_compact_model", "gpt-oss-120b")
+    sid = new_uuid()
+    await _session(store, sid)
+    for i in range(40):
+        await store.append_event(sid, "user", {"text": "word " * 30 + str(i)})
+
+    class Probe:
+        async def create(self, **_k):
+            raise AssertionError("catalog compact must not call Anthropic")
+
+        @property
+        def messages(self):
+            return self
+
+    ev = await maybe_compact(store, sid, client=Probe(), system=[{"type": "text", "text": "x"}])
+    assert ev is not None
+    assert ev.payload["trigger"] == "extractive"
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_skips_llm_after_failures(monkeypatch):
     store = reset_store_for_tests()
     monkeypatch.setattr(settings, "event_budget_override", 80)

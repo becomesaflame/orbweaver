@@ -133,10 +133,61 @@ async def test_classify_unavailable_asks_not_denies(monkeypatch):
     from orbweaver.permissions.classifier import classify_action
 
     monkeypatch.setattr(settings, "anthropic_api_key", "")
+    monkeypatch.setattr(settings, "openrouter_api_key", "")
+    monkeypatch.setattr(settings, "earthruntime_api_key", "")
+    monkeypatch.setattr(settings, "orbweaver_classifier_model", "claude-sonnet-4-6")
     result = await classify_action([], "Bash", {"command": "docker ps", "permissions": ["all"]})
     assert result["verdict"] == "ask"
     assert result["should_ask"] is True
     assert result["should_block"] is False
+    assert result["stage"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_classify_catalog_without_openrouter_is_unavailable(monkeypatch):
+    from orbweaver.config import settings
+    from orbweaver.permissions.classifier import classify_action
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    monkeypatch.setattr(settings, "openrouter_api_key", "")
+    monkeypatch.setattr(settings, "earthruntime_api_key", "")
+    monkeypatch.setattr(settings, "orbweaver_classifier_model", "gpt-oss-120b")
+    result = await classify_action([], "Bash", {"command": "docker ps", "permissions": ["all"]})
+    assert result["verdict"] == "ask"
+    assert result["stage"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_classify_catalog_model_uses_passed_client(monkeypatch):
+    from types import SimpleNamespace
+
+    from orbweaver.config import settings
+    from orbweaver.permissions.classifier import classify_action
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+    monkeypatch.setattr(settings, "openrouter_api_key", "pk-prov-test")
+    monkeypatch.setattr(settings, "orbweaver_classifier_model", "gpt-oss-120b")
+
+    class Client:
+        def __init__(self):
+            self.messages = self
+            self.models = []
+
+        async def create(self, **kwargs):
+            self.models.append(kwargs.get("model"))
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="<block>no</block>")]
+            )
+
+    client = Client()
+    result = await classify_action(
+        [],
+        "Bash",
+        {"command": "git fetch --all && git pull", "unsandboxed": True},
+        client=client,
+    )
+    assert result["verdict"] == "allow"
+    assert client.models == ["gpt-oss-120b"]
 
 
 @pytest.mark.asyncio

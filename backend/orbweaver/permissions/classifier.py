@@ -167,9 +167,6 @@ async def classify_action(
     client=None,
 ) -> dict[str, Any]:
     """Return {verdict: allow|ask|deny, should_block, should_ask, reason, stage}."""
-    if not settings.anthropic_api_key:
-        return _classified("ask", "Classifier unavailable (no API key) — needs user approval", "unavailable")
-
     transcript = build_transcript(events, tool_name, tool_input)
     intent = load_project_intent(workspace) if workspace is not None else ""
     user_content = transcript
@@ -181,18 +178,19 @@ async def classify_action(
             + user_content
         )
 
-    import anthropic
-
+    model = settings.orbweaver_classifier_model
     if client is None:
-        headers = {}
-        if settings.anthropic_workspace_id.strip():
-            headers["anthropic-workspace-id"] = settings.anthropic_workspace_id.strip()
-        client = anthropic.AsyncAnthropic(
-            api_key=settings.anthropic_api_key, default_headers=headers or None
+        from orbweaver.llm import make_hosted_client
+
+        client = make_hosted_client(model)
+    if client is None:
+        return _classified(
+            "ask",
+            f"Classifier unavailable (no provider for {model}) — needs user approval",
+            "unavailable",
         )
 
     system = build_system_prompt(extra_framing)
-    model = settings.orbweaver_classifier_model
     prefix = [
         {
             "role": "user",

@@ -9,6 +9,7 @@ from uuid import UUID
 
 from orbweaver.compact.project import events_to_messages, live_events
 from orbweaver.config import settings
+from orbweaver.llm import hosted_provider
 from orbweaver.store import Entity, Event, Store
 
 log = logging.getLogger(__name__)
@@ -91,7 +92,7 @@ async def update_session_notes(
     previous = ""
     if entity is not None:
         previous = str(entity.jsonld.get("session_notes") or "")
-    if client is None or not settings.anthropic_api_key:
+    if client is None or hosted_provider(settings.orbweaver_compact_model) == "none":
         return previous if notes_are_usable(previous) else None
     digest_events = live_events(events)
     messages = events_to_messages(digest_events[-80:])

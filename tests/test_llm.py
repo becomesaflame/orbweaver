@@ -10,7 +10,9 @@ from orbweaver.llm import (
     OpenAICompatClient,
     OpenAICompatError,
     compact_llm_client,
+    hosted_provider,
     make_agent_client,
+    make_hosted_client,
     no_llm_echo,
     select_provider,
 )
@@ -84,6 +86,23 @@ def test_open_model_without_key_echoes(monkeypatch):
     assert select_provider() == "none"
     assert "OPENROUTER_API_KEY" in no_llm_echo("hello")
     assert "qwen3.6-35b" in no_llm_echo("hello")
+
+
+def test_catalog_name_does_not_fall_through_to_anthropic(monkeypatch):
+    _clear_providers(monkeypatch, anthropic="sk-ant-test")
+    monkeypatch.setattr(settings, "orbweaver_model", "gpt-oss-120b")
+    assert select_provider() == "none"
+    assert make_agent_client() is None
+    assert hosted_provider("gpt-oss-120b") == "none"
+    assert hosted_provider("claude-haiku-4-5") == "anthropic"
+
+
+def test_hosted_provider_routes_classifier_models(monkeypatch):
+    _clear_providers(monkeypatch, anthropic="sk-ant-test", openrouter="pk-prov-test")
+    assert hosted_provider("claude-sonnet-4-6") == "anthropic"
+    assert hosted_provider("gpt-oss-120b") == "openrouter"
+    assert isinstance(make_hosted_client("gpt-oss-120b"), OpenAICompatClient)
+    assert make_hosted_client("gpt-oss-120b") is not None
 
 
 def test_gpt_oss_context_window_shrinks_event_budget(monkeypatch):
@@ -242,12 +261,28 @@ async def test_openrouter_error_payload_raises(monkeypatch):
 
 
 
-def test_compact_client_prefers_anthropic_when_agent_is_openrouter(monkeypatch):
+def test_compact_client_prefers_anthropic_when_compact_is_claude(monkeypatch):
     _clear_providers(monkeypatch, anthropic="sk-ant-test", openrouter="pk-prov-test")
+    monkeypatch.setattr(settings, "orbweaver_compact_model", "claude-haiku-4-5")
     agent = OpenAICompatClient("https://api.earthruntime.com/v1", "pk-prov-test")
     sentinel = object()
     monkeypatch.setattr("orbweaver.llm.make_anthropic_client", lambda: sentinel)
     assert compact_llm_client(agent) is sentinel
+
+
+def test_compact_client_uses_earthruntime_when_compact_is_catalog(monkeypatch):
+    _clear_providers(monkeypatch, anthropic="sk-ant-test", openrouter="pk-prov-test")
+    monkeypatch.setattr(settings, "orbweaver_compact_model", "gpt-oss-120b")
+    agent = object()
+    client = compact_llm_client(agent)
+    assert isinstance(client, OpenAICompatClient)
+
+
+def test_compact_client_reuses_openrouter_agent_for_catalog_compact(monkeypatch):
+    _clear_providers(monkeypatch, anthropic="sk-ant-test", openrouter="pk-prov-test")
+    monkeypatch.setattr(settings, "orbweaver_compact_model", "qwen3.6-35b")
+    agent = OpenAICompatClient("https://api.earthruntime.com/v1", "pk-prov-test")
+    assert compact_llm_client(agent) is agent
 
 
 @pytest.mark.asyncio

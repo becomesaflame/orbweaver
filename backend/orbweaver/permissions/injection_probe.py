@@ -44,22 +44,17 @@ async def probe_tool_output(name: str, output: str, *, client=None) -> dict[str,
     body = output or ""
     if len(body.strip()) < MIN_CHARS:
         return {"flagged": False, "output": output}
-    if not settings.anthropic_api_key:
-        return {"flagged": False, "output": output}
-
-    import anthropic
-
+    model = settings.orbweaver_injection_probe_model
     if client is None:
-        headers = {}
-        if settings.anthropic_workspace_id.strip():
-            headers["anthropic-workspace-id"] = settings.anthropic_workspace_id.strip()
-        client = anthropic.AsyncAnthropic(
-            api_key=settings.anthropic_api_key, default_headers=headers or None
-        )
+        from orbweaver.llm import make_hosted_client
+
+        client = make_hosted_client(model)
+    if client is None:
+        return {"flagged": False, "output": output}
     payload = f"tool={name}\n\n{truncate_for_probe(body)}"
     try:
         resp = await client.messages.create(
-            model=settings.orbweaver_injection_probe_model,
+            model=model,
             max_tokens=32,
             system=INJECTION_PROBE_SYSTEM,
             messages=[{"role": "user", "content": payload}],
