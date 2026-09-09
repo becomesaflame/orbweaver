@@ -267,7 +267,10 @@
       try {
         const r = await fetch($("base").value.replace(/\/$/, "") + "/health");
         const j = await r.json();
-        $("app-ver").textContent = j.version ? "v" + j.version : "";
+        const bits = [];
+        if (j.version) bits.push("v" + j.version);
+        if (j.llm && j.llm.model) bits.push(j.llm.model);
+        $("app-ver").textContent = bits.join(" · ");
       } catch {
         $("app-ver").textContent = "";
       }

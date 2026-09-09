@@ -23,6 +23,9 @@ services:
       ORBWEAVER_STORE: postgres
       DATABASE_URL: postgresql://orbweaver:orbweaver@postgres:5432/orbweaver
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://api.earthruntime.com/v1}
+      ORBWEAVER_MODEL: ${ORBWEAVER_MODEL:-claude-sonnet-4-6}
       ORBWEAVER_JWT_SECRET: ${ORBWEAVER_JWT_SECRET:-dev-secret-change-me}
       WORKSPACE_ROOT: /workspace
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}

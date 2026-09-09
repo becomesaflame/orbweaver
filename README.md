@@ -14,7 +14,11 @@ Memory API, Anthropic agent loop, web chat, VS Code extension, Telegram + cron. 
 cd backend
 pip install -e ".[dev]"
 export ORBWEAVER_STORE=memory   # default; use postgres with compose
-export ANTHROPIC_API_KEY=...    # optional; without it the loop echoes
+export ANTHROPIC_API_KEY=...    # optional; without a provider the loop echoes
+# Open models via Earth Runtime (https://earthruntime.com):
+# export OPENROUTER_API_KEY=pk-prov-...
+# export OPENROUTER_BASE_URL=https://api.earthruntime.com/v1
+# export ORBWEAVER_MODEL=gpt-oss-120b   # or qwen3.6-35b, qwen3.8-27b, deepseek-v4-flash-0731
 python3 -m orbweaver.cli serve
 ```
 
@@ -25,6 +29,19 @@ python3 -m orbweaver.cli mint
 ```
 
 Open the web UI, paste the token, create a session (`workspace:default` or `file:./rel`), send a turn. HTTP minting is off unless `ORBWEAVER_ALLOW_HTTP_MINT=true`.
+
+### Open models (Earth Runtime)
+
+The agent loop speaks Anthropic Messages internally. For open-weight models it maps that to OpenAI-compatible `chat/completions` at Earth Runtime (the same env names OpenCode uses):
+
+| `ORBWEAVER_MODEL` | Notes |
+| --- | --- |
+| `qwen3.6-35b` | Fastest; 262K context |
+| `qwen3.8-27b` | Dense 27B; 262K context |
+| `gpt-oss-120b` | Strongest of the three; 128K context |
+| `deepseek-v4-flash-0731` | Reasoning enforced; 262K context |
+
+Get a key from [earthruntime.com](https://earthruntime.com). Classifier, injection probe, and compaction stay on Anthropic when `ANTHROPIC_API_KEY` is set.
 
 For a VPS, bind `ORBWEAVER_HOST=127.0.0.1` and publish the UI on your Tailscale interface (`tailscale serve http://127.0.0.1:8080`) instead of `0.0.0.0`.
 

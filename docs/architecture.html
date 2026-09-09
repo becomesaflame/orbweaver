@@ -158,7 +158,7 @@
       <h2 id="decisions">Locked decisions</h2>
       <div class="cards">
         <div class="card"><dl><dt>Languages</dt><dd>Python 3.12 backend. TypeScript VS Code extension.</dd></dl></div>
-        <div class="card"><dl><dt>LLM</dt><dd>Anthropic Messages API. <code>ANTHROPIC_API_KEY</code> on the gateway only. Agent model: <code>ORBWEAVER_MODEL</code> (default Sonnet). Transcript classifier: <code>ORBWEAVER_CLASSIFIER_MODEL</code> (default Sonnet, independent). Injection probe: <code>ORBWEAVER_INJECTION_PROBE_MODEL</code> (default Haiku). Compaction summarizer: <code>ORBWEAVER_COMPACT_MODEL</code> (default Haiku). Ollama is an optional fallback when <code>ANTHROPIC_API_KEY</code> is unset and <code>OLLAMA_BASE_URL</code> plus <code>OLLAMA_MODEL</code> are set. Classifier, injection probe, and compaction stay Anthropic-only.</dd></dl></div>
+        <div class="card"><dl><dt>LLM</dt><dd>Anthropic Messages API by default. <code>ANTHROPIC_API_KEY</code> on the gateway only. Agent model: <code>ORBWEAVER_MODEL</code> (default Sonnet). Open-weight models (<code>qwen3.6-35b</code>, <code>qwen3.8-27b</code>, <code>gpt-oss-120b</code>, <code>deepseek-v4-flash-0731</code>) use Earth Runtime via the OpenAI-compatible chat API (<code>OPENROUTER_API_KEY</code>, optional <code>OPENROUTER_BASE_URL</code> default <code>https://api.earthruntime.com/v1</code>). Catalog names route to Earth Runtime even when the Anthropic key is also set. Transcript classifier: <code>ORBWEAVER_CLASSIFIER_MODEL</code> (default Sonnet, independent). Injection probe: <code>ORBWEAVER_INJECTION_PROBE_MODEL</code> (default Haiku). Compaction summarizer: <code>ORBWEAVER_COMPACT_MODEL</code> (default Haiku). Ollama is an optional fallback when neither Anthropic nor Earth Runtime is configured and <code>OLLAMA_BASE_URL</code> plus <code>OLLAMA_MODEL</code> are set. Classifier, injection probe, and compaction stay Anthropic-only.</dd></dl></div>
         <div class="card"><dl><dt>Memory</dt><dd>Session events, pins, and JSON-LD stay in Orbweaver Postgres. Long-term facts optionally go to Hindsight (<code>HINDSIGHT_API_URL</code>): retain / recall / reflect. Native chunks remain the default when that URL is empty.</dd></dl></div>
         <div class="card"><dl><dt>Retention</dt><dd>Store decay off in the first pass (<code>λ = 0</code>). Forget is explicit only. Pinning is first-class with a 4k token cap. Automatic eviction is phase 6.</dd></dl></div>
         <div class="card"><dl><dt>Workspaces</dt><dd>Same tools, different place. <code>LocalWorkspace</code> (bubblewrap write confinement) for VS Code, web, Telegram, and cron. A real containerized agent is not in this pass.</dd></dl></div>
@@ -198,7 +198,7 @@ flowchart TB
   subgraph exec [Workspaces]
     LocalWS["LocalWorkspace"]
   end
-  LLM["Anthropic Claude API"]
+  LLM["Anthropic or Earth Runtime"]
   VSCode --> Gateway
   WebChat --> Gateway
   Telegram --> Channels
@@ -225,7 +225,7 @@ sequenceDiagram
   participant Host as "FastAPI host"
   participant Agent as "Agent loop"
   participant Mem as "Memory API"
-  participant LLM as "Anthropic"
+  participant LLM as "LLM"
   participant WS as "Workspace"
   Client->>Host: "Normalized user message"
   Host->>Agent: "Append to session event stream"
@@ -254,7 +254,7 @@ sequenceDiagram
       channels/     # vscode, telegram, web, cron
       agents/       # loop, tools, permissions, subagents
       memory/       # JSON-LD graph + vector store
-      llm/          # Anthropic client + provider interface
+      llm/          # Anthropic + Earth Runtime (OpenAI-compat) + Ollama
       workspace/    # LocalWorkspace
       snapshot/     # export/import; CLI in phase 6
       stt/          # faster-whisper
@@ -341,7 +341,7 @@ flowchart LR
       <div class="diagram">
         <pre class="mermaid">
 flowchart TD
-  Build["Build prompt: system plus pins plus workspace skills plus events"] --> Call["Claude tool_use"]
+  Build["Build prompt: system plus pins plus workspace skills plus events"] --> Call["Model tool_use"]
   Call --> Deny{"deny or ask rule?"}
   Deny -->|deny| Block["tool_result blocked"]
   Deny -->|ask interactive| Ask["AskUser"]
@@ -409,7 +409,7 @@ flowchart LR
         <tbody>
           <tr>
             <td>entities, triples, chunks+vectors, events, jobs, agent definitions, sessions (same UUIDs), plan files, non-secret channel bindings, workspace locators</td>
-            <td><code>ANTHROPIC_API_KEY</code>, JWT signing keys, Telegram bot tokens, host paths, TLS, Compose <code>.env</code>, target Postgres password, MCP <code>mcp.json</code> and server <code>env</code> tokens</td>
+            <td><code>ANTHROPIC_API_KEY</code>, <code>OPENROUTER_API_KEY</code>, JWT signing keys, Telegram bot tokens, host paths, TLS, Compose <code>.env</code>, target Postgres password, MCP <code>mcp.json</code> and server <code>env</code> tokens</td>
           </tr>
         </tbody>
       </table>
@@ -452,7 +452,7 @@ flowchart LR
   Gw --> PG["postgres"]
   Gw --> Wh["whisper"]
   Gw --> Files["Workspace bind mount"]
-  Gw --> Anth["Anthropic API"]
+  Gw --> Anth["Anthropic or Earth Runtime"]
         </pre>
       </div>
       <p>Phase 6 adds a <code>backup</code> service: <code>orbweaver snapshot export</code> plus rclone to B2/S3. Kubernetes is not in the first pass; <code>deploy/k8s/</code> can stay stubs.</p>

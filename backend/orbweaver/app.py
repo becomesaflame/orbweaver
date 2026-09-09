@@ -356,11 +356,16 @@ async def _maybe_autotitle(store, sess: Entity, user_text: str) -> None:
 @app.get("/health")
 async def health() -> dict[str, Any]:
     from orbweaver.hindsight import enabled as hindsight_on
+    from orbweaver.llm import select_provider
 
     return {
         "status": "ok",
         "version": __version__,
         "hindsight": hindsight_on(),
+        "llm": {
+            "provider": select_provider(),
+            "model": settings.orbweaver_model,
+        },
     }
 
 
@@ -671,10 +676,13 @@ async def _run_turn(
         import anthropic
 
         from orbweaver.compact import ContextFullError
+        from orbweaver.llm import OpenAICompatError
 
         if isinstance(e, ContextFullError):
             raise HTTPException(status_code=502, detail=e.message) from e
         if isinstance(e, anthropic.APIStatusError):
+            raise HTTPException(status_code=502, detail=e.message) from e
+        if isinstance(e, OpenAICompatError):
             raise HTTPException(status_code=502, detail=e.message) from e
         raise
     finally:
