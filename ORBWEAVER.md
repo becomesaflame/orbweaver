@@ -85,6 +85,12 @@ Do not ship two merges with the same version. Do not bump on the live clone.
 The agent prompt version is not this working copy until production has
 deployed.
 
+Do **not** put the version in the PR title (or the squash-merge commit title
+template). Parallel PRs each bump against the same `origin/main` base, so the
+number in the title goes stale as soon as another PR merges first. The
+authoritative version is `__version__` on the branch at merge time; retitle
+only if needed after rebasing onto current `main`.
+
 ## Trust and permissions
 
 Pushing the feature branch, opening a PR into `main`, and enabling squash
