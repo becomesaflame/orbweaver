@@ -44,7 +44,20 @@ class Settings(BaseSettings):
     # (~85% of the 200k window). Claw Code uses 100k cumulative input tokens.
     compact_ratio: float = 0.85
     orbweaver_compact_model: str = "claude-haiku-4-5"
+    # Microcompact (stub old tool results in the prompt) runs only under pressure:
+    # when the payload estimate of the live window exceeds compact_micro_pressure
+    # of event_budget it clears the oldest large results, in chunks of
+    # (pressure - release) * event_budget, until the window is back under the
+    # pressure line. Chunking keeps the message prefix byte-identical between
+    # consecutive rounds so Anthropic prompt caching keeps hitting.
+    compact_micro_pressure: float = 0.6
+    compact_micro_release: float = 0.4
+    # Floor: the newest N compactable results are never stubbed.
     compact_micro_keep: int = 5
+    # Independent of pressure: a result older than this many tool rounds *and*
+    # larger than this many chars is stubbed (0 rounds disables the age rule).
+    compact_micro_stale_rounds: int = 24
+    compact_micro_stale_chars: int = 20000
     compact_tool_result_chars: int = 8000
     compact_max_failures: int = 3
     compact_overflow_retries: int = 4
