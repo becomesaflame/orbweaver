@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     orbweaver_sandbox_denied_domains: str = ""
     orbweaver_sandbox_network_default: str = ""
     orbweaver_sandbox_include_default_domains: str = ""
+    # One long-lived bwrap shell per session (cwd/env persist, background jobs share
+    # the network namespace). 0 falls back to one-shot bwrap per Bash call.
+    orbweaver_persistent_shell: bool = True
+    orbweaver_shell_idle_timeout_s: int = 1800
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
     context_window: int = 200_000

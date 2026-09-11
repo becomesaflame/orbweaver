@@ -86,6 +86,9 @@ async def _lifespan(_app: FastAPI):
 
         asyncio.create_task(start_telegram())
     yield
+    from orbweaver.sandbox.shell import close_all_session_shells
+
+    await asyncio.to_thread(close_all_session_shells)
 
 
 app = FastAPI(title="Orbweaver", lifespan=_lifespan)
@@ -311,6 +314,11 @@ async def _finish_cancelled_turn(
     produced: list,
     user_text: str,
 ) -> dict[str, Any]:
+    from orbweaver.sandbox.shell import close_session_shell
+
+    # Stop kills the session sandbox: the foreground command and any background
+    # servers it started die with it. The next Bash call starts a fresh shell.
+    await asyncio.to_thread(close_session_shell, str(sess.id))
     if state.discard:
         if state.user_seq:
             await store.truncate_events(sess.id, state.user_seq)
@@ -623,7 +631,9 @@ async def _run_turn(
         raise HTTPException(409, "turn already running")
     if not resume:
         await _maybe_autotitle(store, sess, user_text)
-    ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
+    ws, kind, changed = bind_workspace(
+        sess.jsonld, settings.workspace_root, session_key=str(session_id)
+    )
     if changed:
         await store.put_entity(sess)
     state = RunningTurn(cancel=asyncio.Event())

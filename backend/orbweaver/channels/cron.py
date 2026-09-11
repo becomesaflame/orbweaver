@@ -98,7 +98,9 @@ async def sweep() -> None:
         if session_id:
             sess = await store.get_entity(session_id)
             if sess:
-                ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
+                ws, kind, changed = bind_workspace(
+                    sess.jsonld, settings.workspace_root, session_key=str(session_id)
+                )
                 if changed:
                     await store.put_entity(sess)
                 await store.append_event(session_id, "cron", {"job_id": str(job.id)})

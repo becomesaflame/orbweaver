@@ -89,24 +89,36 @@ def git_toplevel(cwd: Path) -> Path | None:
     return Path(top) if top else None
 
 
-def repo_for_command(workspace_root: Path, command: str) -> Path | None:
+def repo_for_command(
+    workspace_root: Path, command: str, cwd: Path | str | None = None
+) -> Path | None:
+    """Repo the command ran in. ``cwd`` is the persisted session cwd it started from."""
     root = Path(workspace_root).resolve()
+    base = root
+    if cwd:
+        try:
+            candidate = Path(cwd).expanduser().resolve()
+            if candidate.is_dir():
+                base = candidate
+        except OSError:
+            pass
     candidates: list[Path] = []
     for raw in cd_targets(command):
         path = Path(raw).expanduser()
         if not path.is_absolute():
-            path = (root / path)
+            path = (base / path)
         try:
             candidates.append(path.resolve())
         except OSError:
             continue
+    candidates.append(base)
     candidates.append(root)
     seen: set[Path] = set()
-    for cwd in candidates:
-        if cwd in seen:
+    for candidate in candidates:
+        if candidate in seen:
             continue
-        seen.add(cwd)
-        top = git_toplevel(cwd)
+        seen.add(candidate)
+        top = git_toplevel(candidate)
         if top is not None:
             return top
     return None
@@ -169,10 +181,12 @@ def git_snapshot(repo: Path) -> tuple[str, bool, bool, str]:
     return "\n".join(lines), rebase, detached, status_text
 
 
-def annotate_bash_output(workspace_root: Path, command: str, output: str) -> str:
+def annotate_bash_output(
+    workspace_root: Path, command: str, output: str, *, cwd: Path | str | None = None
+) -> str:
     if not command_uses_git(command):
         return output
-    repo = repo_for_command(workspace_root, command)
+    repo = repo_for_command(workspace_root, command, cwd=cwd)
     if repo is None:
         return output
     try:

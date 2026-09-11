@@ -15,3 +15,12 @@ def _isolated_rate_limiter(tmp_path_factory):
     reset_rate_limiter_for_tests(data)
     yield
     reset_rate_limiter_for_tests(data)
+
+
+@pytest.fixture(autouse=True)
+def _reap_session_shells():
+    """Persistent sandbox shells started by a test must not outlive it."""
+    yield
+    from orbweaver.sandbox.shell import close_all_session_shells
+
+    close_all_session_shells()

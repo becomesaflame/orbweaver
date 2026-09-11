@@ -194,7 +194,7 @@ def test_write_and_read_bytes(tmp_path: Path):
 
 def test_resolve_bash_timeout_default_and_cap():
     assert resolve_bash_timeout() == DEFAULT_BASH_TIMEOUT_S
-    assert resolve_bash_timeout(None, None) == 30
+    assert resolve_bash_timeout(None, None) == 120
     assert resolve_bash_timeout(45) == 45
     assert resolve_bash_timeout(block_until_ms=90_000) == 90
     assert resolve_bash_timeout(9999) == MAX_BASH_TIMEOUT_S
@@ -276,7 +276,7 @@ def test_bash_tool_schema_documents_timeout_and_background():
     assert "background" in props
     assert "job_id" in props
     desc = bash["description"]
-    assert "30" in desc
+    assert "120" in desc
     assert "600" in desc
     assert "background" in desc.lower()
     assert "job_id" in desc
