@@ -39,9 +39,10 @@ EXPLORE_TOOLS = frozenset(
         "MemoryGraph",
         "MemoryReflect",
         "ReadLints",
+        "Skill",
     }
 )
-SHELL_TOOLS = frozenset({"Bash", "Read", "Glob", "Grep", "ReadLints"})
+SHELL_TOOLS = frozenset({"Bash", "Read", "Glob", "Grep", "ReadLints", "Skill"})
 _TYPE_TOOLS: dict[str, frozenset[str] | None] = {
     "explore": EXPLORE_TOOLS,
     "implement": None,

@@ -15,6 +15,9 @@ from orbweaver.tokens import estimate_tokens
 log = logging.getLogger(__name__)
 
 BOUNDARY_KINDS = frozenset({"compact_boundary", "compact_summary"})
+# Nested AGENTS.md / CLAUDE.md / .cursor/rules discovered mid-turn; rendered on the user
+# side after the tool results of the round that touched the directory.
+PROJECT_INSTRUCTIONS_KIND = "project_instructions"
 COMPACTABLE_TOOLS = frozenset({"Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Browser"})
 PAIR_KINDS = frozenset(
     {
@@ -359,6 +362,11 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
             )
         elif k in STOP_KINDS:
             _flush_pending_tools(messages, pending_tool, stub_results=True)
+        elif k == PROJECT_INSTRUCTIONS_KIND:
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
+            text = str(p.get("text") or "")
+            if text:
+                _append_user_content(messages, text)
         elif k == "UserCorrection":
             _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append(
