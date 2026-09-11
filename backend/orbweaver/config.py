@@ -35,6 +35,13 @@ class Settings(BaseSettings):
     orbweaver_sandbox_denied_domains: str = ""
     orbweaver_sandbox_network_default: str = ""
     orbweaver_sandbox_include_default_domains: str = ""
+    # bwrap hardening (issue #114). Limits apply to the sandboxed bash and its
+    # children via ulimit; 0 disables a limit. seccomp: auto | on | off.
+    orbweaver_sandbox_max_procs: int = 512
+    orbweaver_sandbox_max_mem_mb: int = 2048
+    orbweaver_sandbox_max_open_files: int = 4096
+    orbweaver_sandbox_seccomp: str = "auto"
+    orbweaver_sandbox_hide_sys: bool = True
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
     context_window: int = 200_000
