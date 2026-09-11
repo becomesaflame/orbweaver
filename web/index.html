@@ -913,9 +913,14 @@
       const origin = $("base").value.trim() || window.location.origin;
       const u = new URL("/v1/sessions/" + sid + "/ws", origin);
       u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-      const tok = $("token").value.trim();
-      if (tok) u.searchParams.set("token", tok);
       return u.toString();
+    }
+    function openSessionWs(sid) {
+      // The JWT rides in Sec-WebSocket-Protocol ("bearer, <jwt>") rather than
+      // the URL so it never lands in access logs; the gateway echoes "bearer".
+      const tok = $("token").value.trim();
+      const protocols = tok ? ["bearer", tok] : [];
+      return new WebSocket(sessionWsUrl(sid), protocols);
     }
     function streamTurn(sid, payload, onEvent) {
       return new Promise((resolve, reject) => {
@@ -927,7 +932,7 @@
           try { if (ws) ws.close(); } catch (e) {}
           fn(val);
         };
-        try { ws = new WebSocket(sessionWsUrl(sid)); }
+        try { ws = openSessionWs(sid); }
         catch (e) { reject(e); return; }
         ws.onopen = () => {
           try { ws.send(JSON.stringify(payload)); }

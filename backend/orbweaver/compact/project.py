@@ -355,11 +355,13 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                 if content:
                     blocks.append({"type": "text", "text": str(content)})
                 content = blocks or content
-            block = {
+            block: dict[str, Any] = {
                 "type": "tool_result",
                 "tool_use_id": p.get("tool_use_id") or p.get("id") or "unknown",
                 "content": content,
             }
+            if p.get("is_error"):
+                block["is_error"] = True
             # A parallel round records tool_call, tool_call, result, result: all
             # results for one assistant message belong in one user message.
             if _is_tool_result_message(messages[-1] if messages else None):

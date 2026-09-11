@@ -17,8 +17,6 @@ from orbweaver.config import settings
 from orbweaver.mcp import tools as mcp_tools
 from orbweaver.store import Event, reset_store_for_tests
 from orbweaver.tools import (
-    BLOCKING_SAFE_TOOLS,
-    CONCURRENCY_SAFE_TOOLS,
     is_concurrency_safe,
     is_read_only,
     partition_tool_calls,
@@ -139,7 +137,6 @@ def test_tool_metadata_marks_read_only_tools_safe():
     ):
         assert not is_read_only(name), name
         assert not is_concurrency_safe(name), name
-    assert BLOCKING_SAFE_TOOLS <= CONCURRENCY_SAFE_TOOLS
 
 
 def test_mcp_tools_are_unsafe_unless_read_only_hint(monkeypatch):

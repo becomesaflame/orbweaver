@@ -39,13 +39,6 @@ READ_ONLY_TOOLS = frozenset(
 )
 CONCURRENCY_SAFE_TOOLS = READ_ONLY_TOOLS
 
-# Concurrency-safe tools whose implementation is still synchronous I/O (file
-# reads, ripgrep, httpx). A gather of these on one event loop would serialize;
-# the agent loop moves them to a worker thread until #98 makes them async.
-BLOCKING_SAFE_TOOLS = frozenset(
-    {"Read", "Glob", "Grep", "WorkspaceSearch", "WebSearch", "WebFetch", "ReadLints"}
-)
-
 _SAFE_META = ToolMeta(read_only=True, concurrency_safe=True)
 _UNSAFE_META = ToolMeta()
 
