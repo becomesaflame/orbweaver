@@ -8,9 +8,14 @@ _ZERO = {
     "--unshare-user",
     "--unshare-pid",
     "--unshare-net",
+    "--unshare-ipc",
+    "--unshare-uts",
+    "--unshare-cgroup-try",
+    "--new-session",
     "--die-with-parent",
+    "--clearenv",
 }
-_ONE = {"--tmpfs", "--dir", "--dev", "--proc", "--chdir"}
+_ONE = {"--tmpfs", "--dir", "--dev", "--proc", "--chdir", "--cap-drop", "--seccomp"}
 _TWO = {"--ro-bind", "--ro-bind-try", "--bind", "--setenv"}
 
 
