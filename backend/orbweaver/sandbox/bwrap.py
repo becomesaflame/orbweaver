@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import resource
 import shutil
 import signal
 import subprocess
 from collections.abc import Mapping
+from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,6 +21,11 @@ from orbweaver.sandbox.policy import (
     PROTECTED_WRITE_REL,
     SandboxPolicy,
     load_sandbox_policy,
+)
+from orbweaver.sandbox.seccomp import (
+    open_seccomp_fd,
+    resolve_seccomp_mode,
+    seccomp_filter_for_host,
 )
 from orbweaver.sandbox.ssh import (
     ensure_ssh_sandbox,
@@ -104,6 +112,101 @@ def sandbox_available() -> bool:
     if is_containerized():
         return True
     return bwrap_path() is not None
+
+
+# Isolation flags beyond the baseline user/pid/net namespaces. Each is passed
+# only when this bwrap advertises it (see bwrap_supported_flags), so an older
+# bubblewrap degrades to the baseline instead of failing to start.
+HARDENING_FLAGS: tuple[tuple[str, ...], ...] = (
+    ("--unshare-ipc",),
+    ("--unshare-uts",),
+    ("--unshare-cgroup-try",),
+    ("--new-session",),
+    ("--cap-drop", "ALL"),
+)
+
+
+@lru_cache(maxsize=4)
+def _bwrap_help_flags(exe: str) -> frozenset[str] | None:
+    """Flags listed by `bwrap --help`, or None when help cannot be read."""
+    try:
+        proc = subprocess.run(
+            [exe, "--help"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (proc.stdout or "") + (proc.stderr or "")
+    flags = frozenset(re.findall(r"--[a-z][a-z0-9-]*", text))
+    return flags or None
+
+
+def bwrap_supported_flags(exe: str | None = None) -> frozenset[str] | None:
+    return _bwrap_help_flags(exe or bwrap_path() or "bwrap")
+
+
+def bwrap_supports(flag: str, exe: str | None = None) -> bool:
+    """True when the flag is advertised, or when `--help` could not be parsed."""
+    flags = bwrap_supported_flags(exe)
+    return True if flags is None else flag in flags
+
+
+def hardening_args(exe: str | None = None) -> list[str]:
+    out: list[str] = []
+    for group in HARDENING_FLAGS:
+        if bwrap_supports(group[0], exe):
+            out.extend(group)
+    return out
+
+
+def _clamp_to_hard_limit(requested: int, which: int) -> int:
+    """ulimit cannot raise a hard limit; never ask for more than the gateway has."""
+    try:
+        _soft, hard = resource.getrlimit(which)
+    except (OSError, ValueError):
+        return requested
+    if hard == resource.RLIM_INFINITY or hard <= 0:
+        return requested
+    return min(requested, int(hard))
+
+
+def resource_limits() -> dict[str, int]:
+    """Effective limits from settings (0 = disabled), clamped to the host's hard limits."""
+    out: dict[str, int] = {}
+    procs = int(getattr(settings, "orbweaver_sandbox_max_procs", 0) or 0)
+    if procs > 0:
+        out["nproc"] = _clamp_to_hard_limit(procs, resource.RLIMIT_NPROC)
+    mem_mb = int(getattr(settings, "orbweaver_sandbox_max_mem_mb", 0) or 0)
+    if mem_mb > 0:
+        out["as_kb"] = _clamp_to_hard_limit(mem_mb * 1024, resource.RLIMIT_AS)
+    files = int(getattr(settings, "orbweaver_sandbox_max_open_files", 0) or 0)
+    if files > 0:
+        out["nofile"] = _clamp_to_hard_limit(files, resource.RLIMIT_NOFILE)
+    return out
+
+
+def rlimit_prologue(limits: dict[str, int] | None = None) -> str:
+    """bash lines that lower soft+hard rlimits before the user command runs.
+
+    `ulimit` is a bash builtin, so this works wherever `bash -lc` does and the
+    limits are inherited by every child (node, rg, the proxy relay). Each limit
+    is set separately so an unsupported one does not stop the others.
+    """
+    lim = resource_limits() if limits is None else limits
+    parts: list[str] = []
+    if lim.get("nproc"):
+        parts.append(f"ulimit -u {int(lim['nproc'])} 2>/dev/null")
+    if lim.get("as_kb"):
+        parts.append(f"ulimit -v {int(lim['as_kb'])} 2>/dev/null")
+    if lim.get("nofile"):
+        parts.append(f"ulimit -n {int(lim['nofile'])} 2>/dev/null")
+    if not parts:
+        return ""
+    return "; ".join(parts) + "\n"
+
+
+def seccomp_enabled(exe: str | None = None) -> bool:
+    setting = str(getattr(settings, "orbweaver_sandbox_seccomp", "auto") or "auto")
+    return resolve_seccomp_mode(setting, bwrap_has_flag=bwrap_supports("--seccomp", exe))
 
 
 def _deny_read_overlay_args(hidden: Path) -> list[str]:
@@ -236,8 +339,17 @@ def build_bwrap_argv(
     policy: SandboxPolicy | None = None,
     full_network: bool = False,
     host_root: bool = True,
+    seccomp_fd: int | None = None,
+    limits: dict[str, int] | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> list[str]:
+    """Argv for one sandboxed `bash -lc command`.
+
+    `seccomp_fd` is a readable fd holding a raw BPF program (see
+    `orbweaver.sandbox.seccomp`); the caller must keep it open and pass it to
+    Popen via `pass_fds`. `limits` overrides the settings-derived rlimits
+    (`resource_limits()`); pass `{}` for none.
+    """
     exe = bwrap_path() or "bwrap"
     root = workspace_root.resolve()
     tmp = tmp_dir.resolve()
@@ -248,10 +360,16 @@ def build_bwrap_argv(
         "--unshare-pid",
         "--die-with-parent",
     ]
+    argv.extend(hardening_args(exe))
     if not full_network:
         argv.extend(["--unshare-net"])
+    if seccomp_fd is not None:
+        argv.extend(["--seccomp", str(int(seccomp_fd))])
     if host_root:
         argv.extend(["--ro-bind", "/", "/"])
+        if settings.orbweaver_sandbox_hide_sys:
+            # Host hardware, firmware, and cgroup layout stay hidden.
+            argv.extend(["--tmpfs", "/sys"])
     else:
         for mount in FALLBACK_RO_BINDS:
             argv.extend(["--ro-bind-try", mount, mount])
@@ -310,7 +428,8 @@ def build_bwrap_argv(
     )
     env["TMPDIR"] = str(tmp)
     argv.extend(setenv_args(env))
-    argv.extend(["--chdir", str(root), "--", "bash", "-lc", command])
+    script = rlimit_prologue(limits) + command
+    argv.extend(["--chdir", str(root), "--", "bash", "-lc", script])
     return argv
 
 
@@ -354,25 +473,39 @@ def spawn_sandboxed(
         proxy = DomainProxy(sock, pol.network)
         proxy.start()
         inner = wrap_command_with_proxy(command, str(sock))
-    argv = build_bwrap_argv(
-        inner, workspace_root, tmp, policy=pol, full_network=full_network
-    )
+    seccomp_fd: int | None = None
     try:
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
+        if seccomp_enabled(exe):
+            program = seccomp_filter_for_host()
+            if program is None:
+                raise SandboxUnavailable(
+                    "sandbox seccomp is forced on but no syscall table exists for this architecture"
+                )
+            seccomp_fd = open_seccomp_fd(program)
+        argv = build_bwrap_argv(
+            inner, workspace_root, tmp, policy=pol, full_network=full_network, seccomp_fd=seccomp_fd
         )
-    except FileNotFoundError as e:
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                pass_fds=(seccomp_fd,) if seccomp_fd is not None else (),
+            )
+        except FileNotFoundError as e:
+            raise SandboxUnavailable(f"bwrap not found: {e}") from e
+        except OSError as e:
+            raise SandboxUnavailable(f"bwrap failed to start: {e}") from e
+    except Exception:
         if proxy is not None:
             proxy.close()
-        raise SandboxUnavailable(f"bwrap not found: {e}") from e
-    except OSError as e:
-        if proxy is not None:
-            proxy.close()
-        raise SandboxUnavailable(f"bwrap failed to start: {e}") from e
+        raise
+    finally:
+        # bwrap inherited its own copy; the program is fully read before exec.
+        if seccomp_fd is not None:
+            os.close(seccomp_fd)
     return SandboxSession(proc, proxy)
 
 

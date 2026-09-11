@@ -17,7 +17,8 @@ def test_bwrap_argv_has_isolation(tmp_path: Path):
     assert "--die-with-parent" in argv
     joined = " ".join(argv)
     assert str(tmp_path.resolve()) in joined
-    assert argv[-3:] == ["bash", "-lc", "echo hi"]
+    assert argv[-3:-1] == ["bash", "-lc"]
+    assert argv[-1].endswith("echo hi")
     assert "--ro-bind" in argv and "/" in argv
     assert argv[argv.index("--tmpfs") + 1] == "/tmp" or "/run" in argv
     assert "--tmpfs" in argv and "/run" in argv

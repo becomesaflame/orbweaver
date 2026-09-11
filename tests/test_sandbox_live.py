@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
+import time
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +15,7 @@ from orbweaver.sandbox.bwrap import (
     is_containerized,
     run_sandboxed,
     sandbox_available,
+    seccomp_enabled,
 )
 from orbweaver.workspace import LocalWorkspace
 
@@ -27,6 +31,21 @@ def _loopback_blocked(text: object) -> bool:
     return "rtm_newaddr" in lowered or "loopback:" in lowered
 
 
+def _proc_status_field(name: str) -> str:
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith(name + ":"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _nested_in_seccomp_sandbox() -> bool:
+    """pytest itself is under a seccomp filter (e.g. inside an Orbweaver sandbox): unshare is EPERM."""
+    return _proc_status_field("Seccomp") == "2"
+
+
 @pytest.fixture
 def live_root(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox", True)
@@ -38,6 +57,8 @@ def live_root(tmp_path, monkeypatch):
     except SandboxUnavailable as e:
         if _loopback_blocked(e):
             pytest.skip(f"bwrap netns loopback not permitted: {e}")
+        if _nested_in_seccomp_sandbox() and "not permitted" in str(e).lower():
+            pytest.skip(f"nested bwrap blocked by the outer seccomp filter: {e}")
         raise
     if _loopback_blocked(out):
         pytest.skip(out[-200:])
@@ -282,3 +303,146 @@ def test_sandboxed_bash_background_start_and_collect(live_root):
     finished = json.loads(ws.collect_job(started["job_id"], wait_s=10))
     assert finished["status"] == "exited"
     assert "sandbox-job-done" in finished["output"]
+
+
+# --- issue #114 hardening: run bubblewrap and look at the sandboxed process itself ---
+
+
+def _status_lines(out: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in out.splitlines():
+        if ":" in line:
+            key, _, value = line.partition(":")
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def test_hardened_sandbox_has_no_capabilities_and_no_new_privs(live_root):
+    out = run_sandboxed("grep -E '^(CapEff|CapBnd|NoNewPrivs|Seccomp)' /proc/self/status", live_root, timeout=15)
+    fields = _status_lines(out)
+    assert fields.get("CapEff") == "0000000000000000", out
+    assert fields.get("CapBnd") == "0000000000000000", out
+    assert fields.get("NoNewPrivs") == "1", out
+
+
+def test_hardened_sandbox_seccomp_filter_mode(live_root):
+    if not seccomp_enabled():
+        pytest.skip("seccomp resolved to off on this host")
+    out = run_sandboxed("grep -E '^(NoNewPrivs|Seccomp)' /proc/self/status", live_root, timeout=15)
+    fields = _status_lines(out)
+    assert fields.get("Seccomp") == "2", out
+    assert fields.get("NoNewPrivs") == "1", out
+
+
+def test_hardened_sandbox_seccomp_denies_unshare_with_eperm(live_root):
+    """The filter returns EPERM (not SIGSYS) so probing tools keep running."""
+    if not seccomp_enabled():
+        pytest.skip("seccomp resolved to off on this host")
+    probe = (
+        "python3 -c \"import ctypes, os; libc = ctypes.CDLL(None, use_errno=True); "
+        "r = libc.unshare(0x10000000); print('unshare', r, os.strerror(ctypes.get_errno()))\""
+    )
+    out = run_sandboxed(probe, live_root, timeout=15)
+    assert "unshare -1 Operation not permitted" in out, out
+    assert "sandbox_denied: syscall" in out
+
+
+def test_hardened_sandbox_seccomp_blocks_ptrace(live_root):
+    if not seccomp_enabled():
+        pytest.skip("seccomp resolved to off on this host")
+    if shutil.which("strace") is None:
+        pytest.skip("strace not installed")
+    out = run_sandboxed("strace -o /dev/null true; echo rc=$?", live_root, timeout=15)
+    assert "Operation not permitted" in out, out
+    assert "rc=0" not in out
+
+
+def test_hardened_sandbox_seccomp_off_setting_disables_filter(live_root, monkeypatch):
+    monkeypatch.setattr(settings, "orbweaver_sandbox_seccomp", "off")
+    out = run_sandboxed("grep -E '^Seccomp:' /proc/self/status", live_root, timeout=15)
+    assert _status_lines(out).get("Seccomp") == "0", out
+
+
+def test_hardened_sandbox_ulimits_are_bounded(live_root, monkeypatch):
+    monkeypatch.setattr(settings, "orbweaver_sandbox_max_procs", 300)
+    monkeypatch.setattr(settings, "orbweaver_sandbox_max_mem_mb", 1536)
+    monkeypatch.setattr(settings, "orbweaver_sandbox_max_open_files", 1024)
+    out = run_sandboxed(
+        "echo nproc=$(ulimit -u) nproc_hard=$(ulimit -Hu) as=$(ulimit -v) nofile=$(ulimit -n); "
+        "ulimit -u 100000 2>/dev/null && echo RAISED",
+        live_root,
+        timeout=15,
+    )
+    assert "nproc=300 nproc_hard=300" in out, out
+    assert "as=1572864" in out, out
+    assert "nofile=1024" in out, out
+    assert "RAISED" not in out, "hard limit must not be raisable inside the sandbox"
+
+
+def test_hardened_sandbox_zero_disables_memory_limit(live_root, monkeypatch):
+    monkeypatch.setattr(settings, "orbweaver_sandbox_max_mem_mb", 0)
+    out = run_sandboxed("ulimit -v", live_root, timeout=15)
+    assert "unlimited" in out, out
+
+
+def test_hardened_sandbox_hides_sys(live_root):
+    out = run_sandboxed("echo sys=[$(ls /sys/class 2>/dev/null)] top=[$(ls /sys 2>/dev/null)]", live_root, timeout=15)
+    assert "sys=[] top=[]" in out, out
+
+
+def test_hardened_sandbox_common_tools_still_run_under_limits(live_root):
+    if shutil.which("rg") is None:
+        pytest.skip("ripgrep not installed on the host")
+    out = run_sandboxed(
+        "echo ok; rg --version | head -1; python3 -c \"import json, hashlib, ssl; print('py', json.dumps([1]))\"",
+        live_root,
+        timeout=20,
+    )
+    assert "sandbox_denied" not in out, out
+    assert "\nok\n" in "\n" + out
+    assert "ripgrep" in out, out
+    assert "py [1]" in out, out
+
+
+def test_hardened_sandbox_proxy_relay_survives_new_session(live_root):
+    """The in-sandbox relay (background python job) must still answer through the domain proxy."""
+    out = run_sandboxed(
+        'python3 -c "import urllib.request, urllib.error\n'
+        "try:\n"
+        "    urllib.request.urlopen('http://denied.example.invalid/', timeout=10)\n"
+        "except urllib.error.HTTPError as e:\n"
+        "    print('relay', e.code, e.read().decode())\n"
+        '"',
+        live_root,
+        timeout=20,
+    )
+    assert "relay 403" in out, out
+    assert "denied.example.invalid" in out
+
+
+def test_hardened_sandbox_background_job_runs_with_hardening(live_root):
+    import json
+
+    ws = LocalWorkspace("workspace:default", str(live_root))
+    started = json.loads(
+        ws.bash("grep -E '^NoNewPrivs' /proc/self/status; echo hardened-job-done", background=True, timeout=15)
+    )
+    assert started["status"] == "running"
+    finished = json.loads(ws.collect_job(started["job_id"], wait_s=10))
+    assert finished["status"] == "exited"
+    assert "hardened-job-done" in finished["output"]
+    assert "NoNewPrivs:\t1" in finished["output"]
+
+
+@pytest.mark.skipif(os.environ.get("ORBWEAVER_TEST_FORKBOMB") != "1", reason="set ORBWEAVER_TEST_FORKBOMB=1")
+def test_hardened_sandbox_contains_fork_bomb(live_root, monkeypatch):
+    monkeypatch.setattr(settings, "orbweaver_sandbox_max_procs", 64)
+    before = len(os.listdir("/proc"))
+    t0 = time.monotonic()
+    out = run_sandboxed(":(){ :|:& };:; wait", live_root, timeout=5)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 20, f"fork bomb was not contained in time: {elapsed:.1f}s"
+    assert "Resource temporarily unavailable" in out or "timeout: command exceeded" in out, out[-500:]
+    time.sleep(1)
+    after = len(os.listdir("/proc"))
+    assert after < before + 20, "sandboxed processes leaked past the timeout"
