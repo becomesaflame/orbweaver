@@ -52,6 +52,11 @@
           "type": "string",
           "default": "workspace:default",
           "description": "Portable workspace locator sent at session start (file:./rel, workspace:name, or git+https://…)."
+        },
+        "orbweaver.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model for new chats (a Claude id or an Earth Runtime catalog name; see GET /v1/models). Empty uses the gateway's ORBWEAVER_VSCODE_MODEL / ORBWEAVER_MODEL default. The chat view's picker overrides this per session."
         }
       }
     }

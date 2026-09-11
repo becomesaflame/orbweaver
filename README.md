@@ -46,6 +46,19 @@ The agent loop speaks Anthropic Messages internally. For open-weight models it m
 
 Get a key from [earthruntime.com](https://earthruntime.com). The same catalog names work on `ORBWEAVER_CLASSIFIER_MODEL`, `ORBWEAVER_INJECTION_PROBE_MODEL`, and `ORBWEAVER_COMPACT_MODEL`: Claude ids stay on Anthropic, catalog names use Earth Runtime.
 
+### Per-channel models and the picker
+
+Each client channel has its own default; unset ones fall back to `ORBWEAVER_MODEL`, which cron jobs and subagents always use:
+
+| Env | Channel |
+| --- | --- |
+| `ORBWEAVER_WEB_MODEL` | web chat |
+| `ORBWEAVER_VSCODE_MODEL` | VS Code extension |
+| `ORBWEAVER_TELEGRAM_MODEL` | Telegram (no picker; env only) |
+| `ORBWEAVER_MODEL` | fallback for the above, cron, subagents |
+
+The web composer and the VS Code chat view have a model `<select>` fed by `GET /v1/models` (supported ids, whether a key is configured for each, and the channel defaults). Picking one stores it on the session (`model` on the session JSON-LD; also accepted on `POST /v1/sessions`, `PATCH /v1/sessions/{id}`, `POST …/turns` and the WebSocket `text` frame), so every later turn of that chat, from any client, uses it. "default" clears the override. A turn resolves its model as: turn `model` → session `model` → channel env → `ORBWEAVER_MODEL`; the context window and compaction budget follow the resolved model. `orbweaver.model` in VS Code settings seeds new chats when no picker choice was made. `/health` reports the web default.
+
 For a VPS, bind `ORBWEAVER_HOST=127.0.0.1` and publish the UI on your Tailscale interface (`tailscale serve http://127.0.0.1:8080`) instead of `0.0.0.0`.
 
 ### Postgres

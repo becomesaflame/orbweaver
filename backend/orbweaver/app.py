@@ -55,6 +55,7 @@ from orbweaver.checkpoints import (
 )
 from orbweaver.config import settings
 from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
+from orbweaver.model_routing import is_supported_model, model_defaults, supported_models
 from orbweaver.ratelimit import FileRateLimiter, get_rate_limiter
 from orbweaver.store import (
     SESSION_TYPE,
@@ -252,6 +253,8 @@ class SessionBody(BaseModel):
     workspace_kind: str = "local"
     title: str = "New chat"
     channel: str | None = None
+    # Optional per-session model override; see GET /v1/models.
+    model: str | None = None
 
 
 class WorkspaceMkdirBody(BaseModel):
@@ -261,10 +264,14 @@ class WorkspaceMkdirBody(BaseModel):
 
 class SessionPatch(BaseModel):
     title: str | None = None
+    # "" clears the override so the channel default applies again.
+    model: str | None = None
 
 
 class TurnBody(BaseModel):
     text: str
+    # Model for this and later turns of the session (persisted on the session).
+    model: str | None = None
 
 
 class CancelTurnBody(BaseModel):
@@ -457,15 +464,53 @@ async def health() -> dict[str, Any]:
     from orbweaver.hindsight import enabled as hindsight_on
     from orbweaver.llm import select_provider
 
+    defaults = model_defaults()
     return {
         "status": "ok",
         "version": __version__,
         "hindsight": hindsight_on(),
         "llm": {
-            "provider": select_provider(),
-            "model": settings.orbweaver_model,
+            # Unauthenticated header in the web UI: show the web default (#137).
+            "provider": select_provider(defaults["web"]),
+            "model": defaults["web"],
+            "defaults": defaults,
         },
     }
+
+
+@app.get("/v1/models")
+async def list_models(_u: dict = Depends(_user)) -> dict[str, Any]:
+    """Models a client may pick per session or per turn, plus channel defaults."""
+    return {"models": supported_models(), "defaults": model_defaults()}
+
+
+def _validated_model(raw: str | None) -> str | None:
+    """None: not supplied. "": clear the session override. Else a supported id."""
+    if raw is None:
+        return None
+    model = raw.strip()
+    if not model:
+        return ""
+    if not is_supported_model(model):
+        raise HTTPException(
+            400, f"unsupported model {model!r}; GET /v1/models lists the supported ids"
+        )
+    return model
+
+
+async def _store_session_model(store, sess, model: str | None) -> None:
+    """Persist a per-session model override (empty string removes it)."""
+    if model is None:
+        return
+    if model:
+        if sess.jsonld.get("model") == model:
+            return
+        sess.jsonld["model"] = model
+    elif "model" in sess.jsonld:
+        del sess.jsonld["model"]
+    else:
+        return
+    await store.put_entity(sess)
 
 
 @app.post("/v1/auth/token", include_in_schema=settings.orbweaver_allow_http_mint)
@@ -631,6 +676,7 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
     except WorkspaceURIError as e:
         raise HTTPException(400, str(e)) from e
     channel = normalize_channel(body.channel)
+    model = _validated_model(body.model) or ""
     uid = new_uuid()
     ent = Entity(
         id=uid,
@@ -648,6 +694,8 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
     )
     if channel:
         ent.jsonld["channel"] = channel
+    if model:
+        ent.jsonld["model"] = model
     await get_store().put_entity(ent)
     return {
         "id": str(uid),
@@ -655,6 +703,7 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
         "workspace_uri": uri,
         "title": ent.jsonld["title"],
         "channel": channel,
+        "model": model,
     }
 
 
@@ -676,6 +725,7 @@ async def list_sessions(_u: dict = Depends(_user)) -> dict[str, Any]:
                 "workspace_kind": normalize_workspace_kind(ent.jsonld.get("workspace_kind")),
                 "status": str(ent.jsonld.get("status") or "active"),
                 "channel": _stored_channel(ent.jsonld),
+                "model": str(ent.jsonld.get("model") or ""),
                 "created_at": str(ent.jsonld.get("created_at") or ""),
                 "last_event_at": last_at,
                 "event_count": len(events),
@@ -692,11 +742,17 @@ async def patch_session(session_id: UUID, body: SessionPatch, _u: dict = Depends
     sess = await store.get_entity(session_id)
     if not sess or sess.at_type != SESSION_TYPE:
         raise HTTPException(404, "session not found")
+    model = _validated_model(body.model)
     if body.title is not None:
         title = body.title.strip()[:80] or "New chat"
         sess.jsonld["title"] = title
         await store.put_entity(sess)
-    return {"id": str(sess.id), "title": _display_title(sess.jsonld)}
+    await _store_session_model(store, sess, model)
+    return {
+        "id": str(sess.id),
+        "title": _display_title(sess.jsonld),
+        "model": str(sess.jsonld.get("model") or ""),
+    }
 
 
 @app.get("/v1/sessions/{session_id}/events")
@@ -722,6 +778,7 @@ async def _run_turn(
     user_text: str,
     *,
     resume: bool = False,
+    model: str | None = None,
 ) -> dict[str, Any]:
     state = acquire_turn(session_id, channel=_stored_channel(sess.jsonld) or "web")
     if state is None:
@@ -748,6 +805,7 @@ async def _run_turn(
             turn_state=state,
             resume=resume,
             interactive=True,
+            model=model or None,
         )
         if state.cancel.is_set():
             result = await _finish_cancelled_turn(store, sess, state, events, user_text)
@@ -808,7 +866,9 @@ async def turn(session_id: UUID, body: TurnBody, _u: dict = Depends(_user)) -> d
     sess = await store.get_entity(session_id)
     if not sess:
         raise HTTPException(404, "session not found")
-    return await _run_turn(store, sess, session_id, body.text)
+    model = _validated_model(body.model)
+    await _store_session_model(store, sess, model)
+    return await _run_turn(store, sess, session_id, body.text, model=model)
 
 
 @app.post("/v1/sessions/{session_id}/turns/inject")
@@ -1110,11 +1170,20 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
             if turn_task is not None and not turn_task.done():
                 error(409, "turn already running")
                 continue
+            raw_model = data.get("model")
+            try:
+                model = _validated_model(
+                    str(raw_model) if raw_model is not None else None
+                )
+            except HTTPException as e:
+                error(e.status_code, e.detail)
+                continue
+            await _store_session_model(store, sess, model)
             # Run the turn as its own task so this loop keeps reading frames:
             # cancel / ping / inject / subscribe work while the agent is busy,
             # and the turn survives this socket closing.
             turn_task = asyncio.create_task(
-                _ws_turn(sub, store, sess, session_id, text, resume=resume)
+                _ws_turn(sub, store, sess, session_id, text, resume=resume, model=model)
             )
             _detached_turns.add(turn_task)
             turn_task.add_done_callback(_detached_turns.discard)
@@ -1133,9 +1202,10 @@ async def _ws_turn(
     text: str,
     *,
     resume: bool,
+    model: str | None = None,
 ) -> None:
     try:
-        await _run_turn(store, sess, session_id, text, resume=resume)
+        await _run_turn(store, sess, session_id, text, resume=resume, model=model)
     except HTTPException as e:
         sub.send(
             {
