@@ -10,7 +10,14 @@ class Settings(BaseSettings):
     anthropic_workspace_id: str = ""
     ollama_base_url: str = ""
     ollama_model: str = ""
+    # Required in production: >= 32 bytes, not the default. `serve` refuses to
+    # start otherwise unless ORBWEAVER_DEV_INSECURE=1.
     orbweaver_jwt_secret: str = "dev-secret-change-me"
+    orbweaver_dev_insecure: bool = False
+    # Comma-separated browser origins allowed for credentialed cross-origin
+    # calls. Empty (default) means same-origin only; the bundled web UI is
+    # served from the gateway itself and needs nothing here.
+    orbweaver_cors_origins: str = ""
     orbweaver_model: str = "claude-sonnet-4-6"
     orbweaver_classifier_model: str = "claude-sonnet-4-6"
     orbweaver_injection_probe_model: str = "claude-haiku-4-5"
@@ -27,14 +34,28 @@ class Settings(BaseSettings):
     orbweaver_auto_allow_bash_if_sandboxed: bool = True
     orbweaver_sandbox_config: str = ""
     orbweaver_mcp_config: str = ""
+    # Concurrency-safe tool calls from one assistant round that may run at once.
+    orbweaver_max_parallel_tools: int = 8
     orbweaver_sandbox_additional_readonly: str = ""
     orbweaver_sandbox_additional_readwrite: str = ""
     orbweaver_sandbox_deny_read: str = ""
+    orbweaver_sandbox_allow_read: str = ""
+    orbweaver_sandbox_ssh_identities: str = ""
+    orbweaver_sandbox_ssh_bind_identities: str = ""
     orbweaver_sandbox_unix_sockets: str = ""
     orbweaver_sandbox_allowed_domains: str = ""
     orbweaver_sandbox_denied_domains: str = ""
     orbweaver_sandbox_network_default: str = ""
+    orbweaver_sandbox_web_network_default: str = ""
     orbweaver_sandbox_include_default_domains: str = ""
+    # bwrap hardening (issue #114). Limits apply to the sandboxed bash and its
+    # children via ulimit; 0 disables a limit. seccomp: auto | on | off.
+    orbweaver_sandbox_max_procs: int = 512
+    orbweaver_sandbox_max_mem_mb: int = 2048
+    orbweaver_sandbox_max_open_files: int = 4096
+    orbweaver_sandbox_seccomp: str = "auto"
+    orbweaver_sandbox_hide_sys: bool = True
+    orbweaver_sandbox_env_allow: str = ""  # extra env names/globs passed into sandboxed Bash
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
     context_window: int = 200_000
@@ -81,6 +102,10 @@ class Settings(BaseSettings):
         if not self.telegram_allowlist.strip():
             return set()
         return {int(x.strip()) for x in self.telegram_allowlist.split(",") if x.strip()}
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [o.strip() for o in self.orbweaver_cors_origins.split(",") if o.strip()]
 
     @property
     def brave_api_key(self) -> str:
