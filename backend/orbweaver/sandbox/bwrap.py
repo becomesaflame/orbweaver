@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -12,9 +13,17 @@ import subprocess
 from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from orbweaver.config import settings
+from orbweaver.procs import (
+    STATUS_INTERRUPTED,
+    STATUS_TIMEOUT,
+    BashInterrupted,
+    communicate_async,
+    start_shell,
+)
 from orbweaver.sandbox.environment import build_sandbox_env, setenv_args
 from orbweaver.sandbox.errors import label_sandbox_output
 from orbweaver.sandbox.policy import (
@@ -449,13 +458,32 @@ class SandboxSession:
             self.proxy = None
 
 
-def spawn_sandboxed(
+class AsyncSandboxSession:
+    """A running bwrap asyncio process plus its domain proxy."""
+
+    def __init__(self, proc: asyncio.subprocess.Process, proxy) -> None:
+        self.proc = proc
+        self.proxy = proxy
+
+    def close(self) -> None:
+        if self.proxy is not None:
+            try:
+                self.proxy.close()
+            except Exception:
+                log.exception("failed to close sandbox proxy")
+            self.proxy = None
+
+
+def _prepare_sandbox(
     command: str,
     workspace_root: Path,
     *,
-    policy: SandboxPolicy | None = None,
-    full_network: bool = False,
-) -> SandboxSession:
+    policy: SandboxPolicy | None,
+    full_network: bool,
+) -> tuple[list[str], Any, int | None]:
+    """Start the domain proxy, open the seccomp fd, and build the bwrap argv.
+
+    Returns (argv, proxy, seccomp_fd); the caller must pass the fd to the child and close it."""
     if is_containerized():
         raise SandboxUnavailable("containerized hosts use unsandboxed bash")
     exe = bwrap_path()
@@ -485,28 +513,80 @@ def spawn_sandboxed(
         argv = build_bwrap_argv(
             inner, workspace_root, tmp, policy=pol, full_network=full_network, seccomp_fd=seccomp_fd
         )
-        try:
-            proc = subprocess.Popen(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-                pass_fds=(seccomp_fd,) if seccomp_fd is not None else (),
-            )
-        except FileNotFoundError as e:
-            raise SandboxUnavailable(f"bwrap not found: {e}") from e
-        except OSError as e:
-            raise SandboxUnavailable(f"bwrap failed to start: {e}") from e
     except Exception:
         if proxy is not None:
             proxy.close()
+        if seccomp_fd is not None:
+            os.close(seccomp_fd)
         raise
+    return argv, proxy, seccomp_fd
+
+
+def spawn_sandboxed(
+    command: str,
+    workspace_root: Path,
+    *,
+    policy: SandboxPolicy | None = None,
+    full_network: bool = False,
+) -> SandboxSession:
+    argv, proxy, seccomp_fd = _prepare_sandbox(
+        command, workspace_root, policy=policy, full_network=full_network
+    )
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            pass_fds=(seccomp_fd,) if seccomp_fd is not None else (),
+        )
+    except FileNotFoundError as e:
+        if proxy is not None:
+            proxy.close()
+        raise SandboxUnavailable(f"bwrap not found: {e}") from e
+    except OSError as e:
+        if proxy is not None:
+            proxy.close()
+        raise SandboxUnavailable(f"bwrap failed to start: {e}") from e
     finally:
         # bwrap inherited its own copy; the program is fully read before exec.
         if seccomp_fd is not None:
             os.close(seccomp_fd)
     return SandboxSession(proc, proxy)
+
+
+async def spawn_sandboxed_async(
+    command: str,
+    workspace_root: Path,
+    *,
+    policy: SandboxPolicy | None = None,
+    full_network: bool = False,
+) -> AsyncSandboxSession:
+    """spawn_sandboxed for the event loop: the process is an asyncio subprocess."""
+    argv, proxy, seccomp_fd = await asyncio.to_thread(
+        _prepare_sandbox, command, workspace_root, policy=policy, full_network=full_network
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            pass_fds=(seccomp_fd,) if seccomp_fd is not None else (),
+        )
+    except FileNotFoundError as e:
+        if proxy is not None:
+            proxy.close()
+        raise SandboxUnavailable(f"bwrap not found: {e}") from e
+    except OSError as e:
+        if proxy is not None:
+            proxy.close()
+        raise SandboxUnavailable(f"bwrap failed to start: {e}") from e
+    finally:
+        if seccomp_fd is not None:
+            os.close(seccomp_fd)
+    return AsyncSandboxSession(proc, proxy)
 
 
 def run_sandboxed(
@@ -531,10 +611,61 @@ def run_sandboxed(
     finally:
         session.close()
     out = (stdout or "") + (stderr or "")
-    if session.proc.returncode != 0 and "operation not permitted" in out.lower() and "bwrap" in out.lower():
+    _raise_if_bwrap_eperm(session.proc.returncode, out)
+    return label_sandbox_output(out[-200_000:])
+
+
+def _raise_if_bwrap_eperm(returncode: int | None, out: str) -> None:
+    if returncode != 0 and "operation not permitted" in out.lower() and "bwrap" in out.lower():
         log.warning("bwrap operation not permitted: %s", out[-500:])
         raise SandboxUnavailable(out[-800:])
+
+
+async def run_sandboxed_async(
+    command: str,
+    workspace_root: Path,
+    timeout: int = 30,
+    *,
+    policy: SandboxPolicy | None = None,
+    full_network: bool = False,
+    cancel: asyncio.Event | None = None,
+) -> str:
+    """run_sandboxed without blocking the event loop.
+
+    ``cancel`` (the turn's stop event) kills the process group and raises
+    BashInterrupted so the caller can record an error tool_result.
+    """
+    if is_containerized():
+        return await _raw_async(command, workspace_root, timeout, cancel=cancel)
+    session = await spawn_sandboxed_async(
+        command, workspace_root, policy=policy, full_network=full_network
+    )
+    try:
+        out, status = await communicate_async(session.proc, timeout, cancel=cancel)
+    finally:
+        session.close()
+    if status == STATUS_INTERRUPTED:
+        raise BashInterrupted(label_sandbox_output(out[-200_000:]))
+    if status == STATUS_TIMEOUT:
+        return _timeout_message(timeout, label_sandbox_output(out[-200_000:]))
+    _raise_if_bwrap_eperm(session.proc.returncode, out)
     return label_sandbox_output(out[-200_000:])
+
+
+async def _raw_async(
+    command: str,
+    workspace_root: Path,
+    timeout: int,
+    *,
+    cancel: asyncio.Event | None = None,
+) -> str:
+    proc = await start_shell(command, workspace_root)
+    out, status = await communicate_async(proc, timeout, cancel=cancel)
+    if status == STATUS_INTERRUPTED:
+        raise BashInterrupted(out[-200_000:])
+    if status == STATUS_TIMEOUT:
+        return _timeout_message(timeout, out)
+    return out[-200_000:]
 
 
 def _raw(command: str, workspace_root: Path, timeout: int) -> str:
