@@ -26,6 +26,16 @@ from orbweaver.uris import validate_workspace_uri
 
 _SCHEMA = (Path(__file__).parent / "schema.sql").read_text()
 
+# Per-session transaction-scoped advisory lock taken before appending an event.
+APPEND_EVENT_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1))"
+# seq is computed and inserted in one statement so no writer sees a stale MAX(seq).
+APPEND_EVENT_SQL = """
+INSERT INTO events(id, session_id, seq, kind, payload)
+SELECT $1, $2, COALESCE(MAX(seq), 0) + 1, $3, $4::jsonb
+FROM events WHERE session_id = $2
+RETURNING seq
+"""
+
 
 class PostgresStore:
     def __init__(self) -> None:
@@ -225,22 +235,15 @@ class PostgresStore:
 
     async def append_event(self, session_id: uuid.UUID, kind: str, payload: dict[str, Any]) -> Event:
         pool = self._pool_req()
-        async with pool.acquire() as conn:
+        ev_id = new_uuid()
+        async with pool.acquire() as conn, conn.transaction():
+            # Serialize writers per session: two concurrent appends (web turn + subagent,
+            # or a cron_result landing mid-turn) must not both compute the same MAX(seq).
+            await conn.execute(APPEND_EVENT_LOCK_SQL, str(session_id))
             seq = await conn.fetchval(
-                "SELECT COALESCE(MAX(seq),0)+1 FROM events WHERE session_id=$1", session_id
+                APPEND_EVENT_SQL, ev_id, session_id, kind, json.dumps(payload)
             )
-            ev = Event(
-                id=new_uuid(), session_id=session_id, seq=int(seq), kind=kind, payload=payload
-            )
-            await conn.execute(
-                "INSERT INTO events(id,session_id,seq,kind,payload) VALUES ($1,$2,$3,$4,$5::jsonb)",
-                ev.id,
-                ev.session_id,
-                ev.seq,
-                ev.kind,
-                json.dumps(payload),
-            )
-        return ev
+        return Event(id=ev_id, session_id=session_id, seq=int(seq), kind=kind, payload=payload)
 
     async def list_events(self, session_id: uuid.UUID) -> list[Event]:
         pool = self._pool_req()

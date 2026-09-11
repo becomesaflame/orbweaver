@@ -21,6 +21,7 @@ from orbweaver.permissions.rules import (
     is_protected_git_push,
     matching_rule,
     path_is_always_denied,
+    write_is_always_denied,
 )
 from orbweaver.permissions.session_rules import matching_session_rule
 from orbweaver.sandbox.bwrap import sandbox_available
@@ -155,6 +156,8 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
     if name in {"Read", "Write", "StrReplace", "ProposePatch", "NotebookEdit", "SendPhoto", "Delete"}:
         path = str(inp.get("path") or "")
         if path_is_always_denied(path):
+            return PermissionDecision("deny", f"path denied: {path}", "deny_rule")
+        if name in {"Write", "StrReplace", "NotebookEdit", "Delete"} and write_is_always_denied(path):
             return PermissionDecision("deny", f"path denied: {path}", "deny_rule")
         if name != "Read" and workspace and not in_project_path(path, workspace):
             return PermissionDecision("deny", f"path denied: {path}", "deny_rule")

@@ -23,6 +23,7 @@ SKIP_PERSIST = frozenset(
         "TodoWrite",
         "Delete",
         "ReadLints",
+        "SubagentWait",
     }
 )
 PREVIEW_CHARS = 2000
