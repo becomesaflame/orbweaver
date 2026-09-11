@@ -23,7 +23,7 @@ services:
       ORBWEAVER_STORE: postgres
       DATABASE_URL: postgresql://orbweaver:orbweaver@postgres:5432/orbweaver
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      ORBWEAVER_JWT_SECRET: ${ORBWEAVER_JWT_SECRET:-dev-secret-change-me}
+      ORBWEAVER_JWT_SECRET: ${ORBWEAVER_JWT_SECRET:?set ORBWEAVER_JWT_SECRET (>= 32 random bytes)}
       WORKSPACE_ROOT: /workspace
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWLIST: ${TELEGRAM_ALLOWLIST:-}

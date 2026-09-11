@@ -20,6 +20,7 @@ from uuid import UUID
 
 from orbweaver.config import settings
 from orbweaver.store import SESSION_TYPE, Entity, Event, Store, new_uuid, session_at_id
+from orbweaver.turns import running_turn
 
 try:
     from orbweaver.permissions.handoff import review_subagent_return
@@ -335,7 +336,9 @@ async def _run_child(
     status = "ok"
     error = ""
     try:
-        async with subagent_semaphore():
+        # The child is a fresh session, but registering it keeps web/Telegram/cron
+        # from starting a second turn on it while the subagent runs (#100).
+        async with subagent_semaphore(), running_turn(run.child_id, channel="subagent"):
             tools = child_tool_spec(await session_tools(ctx["workspace"], parent_channel), kind)
             await asyncio.wait_for(
                 agent_turn(

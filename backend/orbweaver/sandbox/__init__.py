@@ -3,6 +3,7 @@ from orbweaver.sandbox.bwrap import (
     build_bwrap_argv,
     is_containerized,
     run_sandboxed,
+    run_sandboxed_async,
     sandbox_available,
 )
 from orbweaver.sandbox.policy import SandboxPolicy, load_sandbox_policy
@@ -14,5 +15,6 @@ __all__ = [
     "is_containerized",
     "load_sandbox_policy",
     "run_sandboxed",
+    "run_sandboxed_async",
     "sandbox_available",
 ]

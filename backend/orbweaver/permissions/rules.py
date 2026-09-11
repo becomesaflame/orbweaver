@@ -85,6 +85,22 @@ ALWAYS_DENY_NAMES = {
     "id_dsa",
 }
 
+# Filenames that let a hostile file reconfigure git or a shell into running an
+# arbitrary host command (sandbox-runtime's DANGEROUS_FILES, issue #94). The
+# editor tools (Write/StrReplace/Delete/NotebookEdit) may never target these;
+# legitimate changes go through a `git`/shell command, not a raw file write.
+WRITE_DENY_NAMES = {
+    ".gitconfig",
+    ".gitmodules",
+    ".bashrc",
+    ".bash_profile",
+    ".zshrc",
+    ".zprofile",
+    ".profile",
+    ".ripgreprc",
+    ".mcp.json",
+}
+
 
 def parse_rules(blob: str) -> list[tuple[str, str | None]]:
     """Parse 'Tool' or 'Tool(pattern)' lines into (tool, pattern|None)."""
@@ -225,7 +241,28 @@ def path_is_always_denied(rel: str) -> bool:
         return True
     if ".ssh" in lowered or ".gnupg" in lowered:
         return True
-    return str(rel).startswith("/etc") or "/etc/" in str(rel)
+    if str(rel).startswith("/etc") or "/etc/" in str(rel):
+        return True
+    # Same credential list the bubblewrap deny overlays use, so Read/Grep/Glob and Bash agree.
+    from orbweaver.sandbox.policy import is_default_denied_read
+
+    return is_default_denied_read(str(rel))
+
+
+def write_is_always_denied(rel: str) -> bool:
+    """Deny raw edits (Write/StrReplace/Delete/NotebookEdit) to git-execution and
+    shell-startup files. Reads are unaffected; git state is changed via `git`.
+
+    Everything under any `.git/` directory is refused because those tools never
+    run git — `.git/config` and `.git/hooks/*` execute host commands, and the
+    rest of `.git` should only change through git itself (issue #94).
+    """
+    if path_is_always_denied(rel):
+        return True
+    lowered = [p.lower() for p in Path(rel).parts]
+    if ".git" in lowered:
+        return True
+    return Path(rel).name.lower() in WRITE_DENY_NAMES
 
 
 def _workspace_root(workspace) -> Path | None:

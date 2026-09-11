@@ -7,6 +7,7 @@ import json
 import logging
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -35,16 +36,24 @@ from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
 from orbweaver.lints import read_lints
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
-from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
+from orbweaver.permissions import (
+    PermissionDecision,
+    TurnAborted,
+    can_use_tool,
+    denial_state_for,
+)
 from orbweaver.permissions.injection_probe import probe_tool_output
+from orbweaver.procs import BashInterrupted
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.todos import inject_session_todos, persist_todos
-from orbweaver.tooltext import format_read, format_webfetch
+from orbweaver.tools import partition_tool_calls
+from orbweaver.tooltext import format_read
 
 log = logging.getLogger(__name__)
 
 DEFAULT_MAX_ROUNDS = 48
+INTERRUPTED_BY_USER = "interrupted by user"
 LAST_ROUND_NUDGE = (
     "This is the last tool round of this turn. After these tool results, answer the user "
     "with what you have. Do not start new exploration. Spawn a subagent only if a narrower "
@@ -829,25 +838,49 @@ def _ask_user_headless_abort(question: str) -> TurnAborted:
     )
 
 
+class ToolInterrupted(Exception):
+    """A running tool was killed because the user stopped the turn."""
+
+    def __init__(self, message: str = INTERRUPTED_BY_USER) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+async def _bash_call(ws: Any, cancel: asyncio.Event | None, **kwargs: Any) -> str:
+    """ws.bash without blocking the loop; cancel-aware when the workspace supports it."""
+    run_async = getattr(ws, "bash_async", None)
+    if run_async is not None:
+        return await run_async(cancel=cancel, **kwargs)
+    return await asyncio.to_thread(ws.bash, **kwargs)
+
+
 async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """Execute one tool call. Blocking work runs off the event loop.
+
+    Everything that touches the filesystem, spawns a process, or makes a
+    synchronous HTTP request goes through ``asyncio.to_thread`` or an async
+    client, so one session's 10-minute ``pytest`` does not stall the gateway.
+    Foreground Bash honours ``ctx["cancel"]`` and raises ToolInterrupted.
+    """
     ws = ctx["workspace"]
     store: Store = ctx["store"]
     session_id: UUID = ctx["session_id"]
     if name == "Read":
         path = str(inp.get("path") or "")
         if is_image_path(path):
-            return format_image_read(ws, path)
+            return await asyncio.to_thread(format_image_read, ws, path)
         try:
-            raw = ws.read(path)
+            raw = await asyncio.to_thread(ws.read, path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
         return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
-        ws.write(inp["path"], inp["content"])
+        await asyncio.to_thread(ws.write, inp["path"], inp["content"])
         return f"wrote {inp['path']}"
     if name == "StrReplace":
         try:
-            return ws.str_replace(
+            return await asyncio.to_thread(
+                ws.str_replace,
                 str(inp.get("path") or ""),
                 str(inp.get("old_string") or ""),
                 str(inp.get("new_string") if inp.get("new_string") is not None else ""),
@@ -858,38 +891,41 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "NotebookEdit":
         from orbweaver.notebook import apply_notebook_edit
 
-        return apply_notebook_edit(ws, inp)
+        return await asyncio.to_thread(apply_notebook_edit, ws, inp)
     if name == "Delete":
         try:
-            return ws.delete(inp["path"])
+            return await asyncio.to_thread(ws.delete, inp["path"])
         except (OSError, PermissionError) as e:
             return f"error deleting {inp.get('path')}: {e}"
     if name == "ProposePatch":
-        result = ws.propose_patch(inp["path"], inp.get("old_string") or "", inp["new_string"])
+        result = await asyncio.to_thread(
+            ws.propose_patch, inp["path"], inp.get("old_string") or "", inp["new_string"]
+        )
         return json.dumps(result)[:200_000]
     if name == "Glob":
         try:
-            return "\n".join(ws.glob(inp["pattern"])[:200])
+            hits = await asyncio.to_thread(ws.glob, inp["pattern"])
+            return "\n".join(hits[:200])
         except (FileNotFoundError, RuntimeError, TimeoutError) as e:
             return str(e)
     if name == "Grep":
         from orbweaver.workspace import _ctx_int
 
         try:
-            return "\n".join(
-                ws.grep(
-                    inp["pattern"],
-                    inp.get("glob") or "**/*",
-                    file_type=inp.get("type") or None,
-                    after=_ctx_int(inp.get("A")),
-                    before=_ctx_int(inp.get("B")),
-                    context=_ctx_int(inp.get("C")),
-                )
+            hits = await asyncio.to_thread(
+                ws.grep,
+                inp["pattern"],
+                inp.get("glob") or "**/*",
+                file_type=inp.get("type") or None,
+                after=_ctx_int(inp.get("A")),
+                before=_ctx_int(inp.get("B")),
+                context=_ctx_int(inp.get("C")),
             )
+            return "\n".join(hits)
         except (FileNotFoundError, TimeoutError) as e:
             return str(e)
     if name == "ReadLints":
-        return read_lints(ws, inp, ctx.get("events"))
+        return await asyncio.to_thread(read_lints, ws, inp, ctx.get("events"))
     if name == "Bash":
         from orbweaver.git_ritual import annotate_bash_output, ritual_says_not_done
         from orbweaver.permissions.pipeline import bash_permissions
@@ -897,27 +933,31 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         perms = sorted(bash_permissions(inp))
         background = bool(inp.get("background"))
         job_id = inp.get("job_id")
-        result = ws.bash(
-            inp.get("command") or "",
-            timeout=inp.get("timeout"),
-            block_until_ms=inp.get("block_until_ms"),
-            background=background,
-            job_id=job_id,
-            unsandboxed=bool(inp.get("unsandboxed")),
-            permissions=perms,
-        )
+        command = inp.get("command") or ""
+        try:
+            result = await _bash_call(
+                ws,
+                ctx.get("cancel"),
+                command=command,
+                timeout=inp.get("timeout"),
+                block_until_ms=inp.get("block_until_ms"),
+                background=background,
+                job_id=job_id,
+                unsandboxed=bool(inp.get("unsandboxed")),
+                permissions=perms,
+            )
+        except BashInterrupted as e:
+            raise ToolInterrupted() from e
         if not background and not job_id:
-            result = annotate_bash_output(
-                Path(ws.root), inp.get("command") or "", result
+            result = await asyncio.to_thread(
+                annotate_bash_output, Path(ws.root), command, result
             )
             ctx["git_not_done"] = ritual_says_not_done(result)
         return result
     if name == "WebFetch":
-        import httpx
+        from orbweaver.webfetch import run_webfetch
 
-        r = httpx.get(inp["url"], timeout=20.0, follow_redirects=True)  # noqa: ASYNC210
-        ctype = r.headers.get("content-type") or ""
-        return format_webfetch(str(inp.get("url") or ""), r.status_code, ctype, r.text)
+        return await run_webfetch(inp, ctx)
     if name == "Browser":
         from orbweaver.browser import run_browser
 
@@ -925,11 +965,11 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "WebSearch":
         from orbweaver.websearch import run_websearch
 
-        return run_websearch(inp)
+        return await asyncio.to_thread(run_websearch, inp)
     if name == "WorkspaceSearch":
         from orbweaver.codesearch import run_workspace_search
 
-        return run_workspace_search(ws, inp)
+        return await asyncio.to_thread(run_workspace_search, ws, inp)
     if name == "MemorySearch":
         from orbweaver.hindsight import enabled as hindsight_on
         from orbweaver.hindsight import format_recall
@@ -1094,6 +1134,13 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
 
         return await call_mcp_tool(name, inp, ws)
     return f"unknown tool {name}"
+
+
+@dataclass(frozen=True)
+class _ToolOutcome:
+    content: str
+    persisted_path: str | None = None
+    flagged: bool = False
 
 
 class TurnCancelled(Exception):
@@ -1348,6 +1395,21 @@ async def agent_turn(
 
         for body in collect_finished(ctx):
             fire(await store.append_event(session_id, "subagent_result", body))
+    tool_slots = asyncio.Semaphore(max(1, int(settings.orbweaver_max_parallel_tools)))
+
+    async def execute_tool(block: Any, decision: PermissionDecision) -> _ToolOutcome:
+        """Run one permitted tool_use and probe its output; blocked calls get the gate text."""
+        if decision.behavior != "allow":
+            return _ToolOutcome(_blocked_tool_result(decision))
+        if block.name == "AskUser":
+            # Waiting for the user is handled in the round loop; only an empty
+            # question reaches here.
+            return _ToolOutcome("error: question is required")
+        async with tool_slots:
+            raw = await run_tools(block.name, dict(block.input), ctx)
+        text, persisted_path = persist_tool_result(workspace, str(block.id), block.name, raw)
+        probed = await probe_tool_output(block.name, text)
+        return _ToolOutcome(probed["output"], persisted_path, bool(probed.get("flagged")))
 
     pins = await pinned_prompt(store)
     system = build_agent_system(
@@ -1425,57 +1487,65 @@ async def agent_turn(
                 break
             stop_after_ask = False
             waiting_ask = False
-            for block in tool_uses:
+            # #99: consecutive concurrency-safe calls (Read, Grep, ...) form one
+            # batch and run together; every unsafe call is a batch of one and a
+            # barrier. tool_call events for a batch are recorded up front and
+            # tool_result events in the original tool_use order.
+            for run in partition_tool_calls([b.name for b in tool_uses]):
+                batch = [tool_uses[i] for i in run]
                 check()
-                call_ev = await store.append_event(
-                    session_id,
-                    "tool_call",
-                    {"id": block.id, "name": block.name, "input": block.input},
-                )
-                fire(call_ev)
+                for block in batch:
+                    call_ev = await store.append_event(
+                        session_id,
+                        "tool_call",
+                        {"id": block.id, "name": block.name, "input": block.input},
+                    )
+                    fire(call_ev)
                 ctx["events"] = await store.list_events(session_id)
-                try:
-                    decision = await can_use_tool(block.name, dict(block.input), ctx)
-                except TurnAborted as e:
+                verdicts = await asyncio.gather(
+                    *(can_use_tool(b.name, dict(b.input), ctx) for b in batch),
+                    return_exceptions=True,
+                )
+                decisions: list[PermissionDecision] = []
+                for block, verdict in zip(batch, verdicts, strict=True):
+                    if isinstance(verdict, TurnAborted):
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "tool_result",
+                                {
+                                    "tool_use_id": block.id,
+                                    "name": block.name,
+                                    "content": verdict.message,
+                                },
+                            )
+                        )
+                        await record_abort(verdict)
+                        return produced
+                    if isinstance(verdict, BaseException):
+                        raise verdict
+                    decisions.append(verdict)
                     fire(
                         await store.append_event(
                             session_id,
-                            "tool_result",
+                            "permission_decision",
                             {
                                 "tool_use_id": block.id,
                                 "name": block.name,
-                                "content": e.message,
+                                "behavior": verdict.behavior,
+                                "reason": verdict.reason,
+                                "fast_path": verdict.fast_path,
                             },
                         )
                     )
-                    await record_abort(e)
-                    return produced
-                fire(
-                    await store.append_event(
-                        session_id,
-                        "permission_decision",
-                        {
-                            "tool_use_id": block.id,
-                            "name": block.name,
-                            "behavior": decision.behavior,
-                            "reason": decision.reason,
-                            "fast_path": decision.fast_path,
-                        },
-                    )
-                )
-                persisted_path = None
-                if decision.behavior != "allow":
-                    result = _blocked_tool_result(decision)
-                    if decision.behavior == "ask":
-                        stop_after_ask = True
-                elif block.name == "AskUser":
+                # AskUser is never concurrency-safe, so it is always a batch of one.
+                if len(batch) == 1 and batch[0].name == "AskUser" and decisions[0].behavior == "allow":
+                    block = batch[0]
                     question = str(dict(block.input).get("question") or "").strip()
-                    if not question:
-                        result = "error: question is required"
-                    elif not can_wait_for_user(ctx):
+                    if question and not can_wait_for_user(ctx):
                         await record_abort(_ask_user_headless_abort(question))
                         return produced
-                    else:
+                    if question:
                         fire(
                             await store.append_event(
                                 session_id,
@@ -1489,14 +1559,30 @@ async def agent_turn(
                         )
                         waiting_ask = True
                         break
-                else:
-                    result = await run_tools(block.name, dict(block.input), ctx)
-                    result, persisted_path = persist_tool_result(
-                        workspace, str(block.id), block.name, result
-                    )
-                    probed = await probe_tool_output(block.name, result)
-                    result = probed["output"]
-                    if probed.get("flagged"):
+                outcomes = await asyncio.gather(
+                    *(execute_tool(b, d) for b, d in zip(batch, decisions, strict=True)),
+                    return_exceptions=True,
+                )
+                for block, outcome in zip(batch, outcomes, strict=True):
+                    if isinstance(outcome, ToolInterrupted):
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "tool_result",
+                                {
+                                    "tool_use_id": block.id,
+                                    "name": block.name,
+                                    "content": outcome.message,
+                                    "is_error": True,
+                                },
+                            )
+                        )
+                        raise TurnCancelled(produced) from outcome
+                check()
+                for block, decision, outcome in zip(batch, decisions, outcomes, strict=True):
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    if outcome.flagged:
                         fire(
                             await store.append_event(
                                 session_id,
@@ -1504,32 +1590,36 @@ async def agent_turn(
                                 {"tool_use_id": block.id, "name": block.name},
                             )
                         )
-                check()
-                kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
-                payload = {"tool_use_id": block.id, "name": block.name, "content": result}
-                if decision.behavior == "allow" and persisted_path:
-                    payload["persisted_path"] = persisted_path
-                if kind == "MemoryRecall":
-                    try:
-                        parsed = json.loads(result)
-                        payload["chunk_ids"] = parsed.get("chunk_ids") or []
-                        payload["text"] = parsed.get("text") or result
-                    except json.JSONDecodeError:
-                        payload["text"] = result
-                res_ev = await store.append_event(session_id, kind, payload)
-                fire(res_ev)
-                if block.name == "ProposePatch" and decision.behavior == "allow":
-                    fire(
-                        await store.append_event(
-                            session_id, "patch_proposal", {"tool_use_id": block.id, "content": result}
+                    result = outcome.content
+                    if decision.behavior == "ask":
+                        stop_after_ask = True
+                    kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
+                    payload = {"tool_use_id": block.id, "name": block.name, "content": result}
+                    if decision.behavior == "allow" and outcome.persisted_path:
+                        payload["persisted_path"] = outcome.persisted_path
+                    if kind == "MemoryRecall":
+                        try:
+                            parsed = json.loads(result)
+                            payload["chunk_ids"] = parsed.get("chunk_ids") or []
+                            payload["text"] = parsed.get("text") or result
+                        except json.JSONDecodeError:
+                            payload["text"] = result
+                    res_ev = await store.append_event(session_id, kind, payload)
+                    fire(res_ev)
+                    if block.name == "ProposePatch" and decision.behavior == "allow":
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "patch_proposal",
+                                {"tool_use_id": block.id, "content": result},
+                            )
                         )
-                    )
-                if block.name == "ScheduleTask" and decision.behavior == "allow":
-                    fire(
-                        await store.append_event(
-                            session_id, "schedule_request", {"input": dict(block.input)}
+                    if block.name == "ScheduleTask" and decision.behavior == "allow":
+                        fire(
+                            await store.append_event(
+                                session_id, "schedule_request", {"input": dict(block.input)}
+                            )
                         )
-                    )
             if waiting_ask:
                 break
             if stop_after_ask:
