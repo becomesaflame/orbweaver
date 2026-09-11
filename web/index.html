@@ -1084,27 +1084,76 @@
       const protocols = tok ? ["bearer", tok] : [];
       return new WebSocket(sessionWsUrl(sid), protocols);
     }
+    function maxSeqInLog() {
+      let top = 0;
+      $("log").querySelectorAll("[data-seq]").forEach((n) => {
+        const s = Number(n.dataset.seq);
+        if (Number.isFinite(s) && s > top) top = s;
+      });
+      return top;
+    }
+    const RECONNECT_BASE_MS = 500;
+    const RECONNECT_CAP_MS = 10000;
+    // Runs one turn over the session WebSocket. If the socket drops after the
+    // turn has started, reconnects with backoff and sends
+    // {type:"subscribe", after_seq} so the server replays the gap; frames are
+    // deduplicated by seq and the promise settles only on turn_done (or a
+    // turn_status that says the turn is over).
     function streamTurn(sid, payload, onEvent) {
       return new Promise((resolve, reject) => {
         let settled = false;
-        let ws;
+        let ws = null;
+        let retryTimer = null;
+        let attempt = 0;
+        let started = false;    // saw at least one stored event for this turn
+        let replaying = false;  // between sending subscribe and receiving turn_status
+        let lastSeq = maxSeqInLog();
+        const seen = new Set();
+        const here = () => currentSid() === sid;
+        const setLink = (state) => {
+          if (!here()) return;
+          const w = $("log").querySelector(".msg.working .msg-body");
+          if (state === "reconnecting") {
+            $("status").textContent = "reconnecting… (" + attempt + ")";
+            if (w) w.textContent = "assistant: Working… (reconnecting)";
+          } else {
+            if ($("status").textContent.startsWith("reconnecting")) $("status").textContent = "working…";
+            if (w) w.textContent = "assistant: Working…";
+          }
+        };
         const finish = (fn, val) => {
           if (settled) return;
           settled = true;
+          if (retryTimer) clearTimeout(retryTimer);
           try { if (ws) ws.close(); } catch (e) {}
+          if ($("status").textContent.startsWith("reconnecting")) $("status").textContent = "working…";
           fn(val);
         };
-        try { ws = openSessionWs(sid); }
-        catch (e) { reject(e); return; }
-        ws.onopen = () => {
-          try { ws.send(JSON.stringify(payload)); }
-          catch (e) { finish(reject, e); }
+        const scheduleReconnect = () => {
+          const delay = Math.min(RECONNECT_CAP_MS, RECONNECT_BASE_MS * Math.pow(2, attempt));
+          attempt += 1;
+          setLink("reconnecting");
+          retryTimer = setTimeout(() => connect(true), delay);
         };
-        ws.onmessage = (ev) => {
-          let msg;
-          try { msg = JSON.parse(ev.data); }
-          catch (e) { finish(reject, e); return; }
-          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" || msg.kind === "idle" || msg.kind === "approval") {
+        const onFrame = (msg) => {
+          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" ||
+              msg.kind === "idle" || msg.kind === "injected" || msg.kind === "approval") {
+            return;
+          }
+          if (msg.kind === "turn_status") {
+            replaying = false;
+            attempt = 0;
+            if (msg.running) { setLink("connected"); return; }
+            const last = msg.last_turn_done;
+            if (!started) {
+              finish(reject, new Error("connection lost before the turn started"));
+            } else if (last && last.status === "error") {
+              finish(reject, new Error(last.detail || "turn failed"));
+            } else if (last) {
+              finish(resolve, { status: last.status || "ok", user_seq: last.user_seq });
+            } else {
+              finish(resolve, { status: "stopped", user_seq: null });
+            }
             return;
           }
           if (msg.kind === "error") {
@@ -1116,15 +1165,55 @@
             finish(resolve, { status: msg.status || "ok", user_seq: msg.user_seq });
             return;
           }
+          if (msg.seq != null) {
+            started = true;
+            if (seen.has(msg.seq)) return;
+            seen.add(msg.seq);
+            if (msg.seq > lastSeq) lastSeq = msg.seq;
+            if (replaying && here() && $("log").querySelector('[data-seq="' + msg.seq + '"]')) return;
+          }
           if (onEvent) onEvent(msg);
         };
-        ws.onerror = () => finish(reject, new Error("WebSocket error"));
-        ws.onclose = (ev) => {
+        function connect(resub) {
           if (settled) return;
-          if (ev.code === 4401) finish(reject, new Error("unauthorized"));
-          else if (ev.code === 4404) finish(reject, new Error("session not found"));
-          else finish(reject, new Error("WebSocket closed (" + ev.code + ")"));
-        };
+          retryTimer = null;
+          let sock;
+          try { sock = openSessionWs(sid); }
+          catch (e) {
+            if (resub) scheduleReconnect(); else reject(e);
+            return;
+          }
+          ws = sock;
+          sock.onopen = () => {
+            if (settled || ws !== sock) return;
+            try {
+              if (resub) {
+                replaying = true;
+                sock.send(JSON.stringify({ type: "subscribe", after_seq: lastSeq }));
+              } else {
+                sock.send(JSON.stringify(payload));
+              }
+            } catch (e) { try { sock.close(); } catch (e2) {} }
+          };
+          sock.onmessage = (ev) => {
+            if (settled || ws !== sock) return;
+            let msg;
+            try { msg = JSON.parse(ev.data); }
+            catch (e) { finish(reject, e); return; }
+            onFrame(msg);
+          };
+          sock.onerror = () => {};
+          sock.onclose = (ev) => {
+            if (settled || ws !== sock) return;
+            ws = null;
+            if (ev.code === 4401) { finish(reject, new Error("unauthorized")); return; }
+            if (ev.code === 4404) { finish(reject, new Error("session not found")); return; }
+            if (!started) { finish(reject, new Error("WebSocket closed (" + ev.code + ")")); return; }
+            replaying = false;
+            scheduleReconnect();
+          };
+        }
+        connect(false);
       });
     }
     async function continueTurn() {
