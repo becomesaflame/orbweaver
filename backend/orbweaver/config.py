@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     compact_rehydrate_chars_per_file: int = 20000
     compact_rehydrate_token_budget: int = 50000
     compact_notes_max_chars: int = 12000
+    # Loop detection (orbweaver.stuck). Streaks count tool calls since the last user
+    # message; stuck_window is how many recent tool calls are scanned.
+    stuck_detection: bool = True
+    stuck_repeat_threshold: int = 3
+    stuck_alternating_threshold: int = 6
+    stuck_window: int = 20
     database_url: str = "postgresql://orbweaver:orbweaver@localhost:5432/orbweaver"
     orbweaver_store: str = "memory"  # memory | postgres
     workspace_root: str = "."
