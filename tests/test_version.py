@@ -3,8 +3,7 @@ from orbweaver.agent import build_agent_system, static_system
 
 
 def test_version_is_semver_zero():
-<<<<<<< HEAD
-    assert __version__ == "0.33.6"
+    assert __version__ == "0.43.1"
     parts = __version__.split(".")
     assert len(parts) == 3
     assert all(p.isdigit() for p in parts)
