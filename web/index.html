@@ -341,7 +341,7 @@
 </head>
 <body>
   <aside id="rail">
-    <div class="brand"><h1>Orbweaver</h1><span class="ver" id="app-ver"></span></div>
+    <div class="brand"><h1>Orbweaver</h1><span class="ver" id="app-ver"></span><span class="ver" id="app-model"></span></div>
     <div class="rail-actions">
       <button type="button" class="btn-new" id="newsession">+ New chat</button>
       <button type="button" class="btn-new secondary" id="newworkspace">+ New workspace</button>
@@ -433,12 +433,12 @@
       try {
         const r = await fetch($("base").value.replace(/\/$/, "") + "/health");
         const j = await r.json();
-        const bits = [];
-        if (j.version) bits.push("v" + j.version);
-        if (j.llm && j.llm.model) bits.push(j.llm.model);
-        $("app-ver").textContent = bits.join(" · ");
+        $("app-ver").textContent = j.version ? "v" + j.version : "";
+        const model = j.llm && j.llm.model ? String(j.llm.model) : "";
+        $("app-model").textContent = model ? "\u00b7 " + model : "";
       } catch {
         $("app-ver").textContent = "";
+        $("app-model").textContent = "";
       }
     }
     pingVersion();
