@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -13,10 +14,18 @@ import signal
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from orbweaver.config import settings
+from orbweaver.procs import (
+    STATUS_INTERRUPTED,
+    STATUS_TIMEOUT,
+    BashInterrupted,
+    communicate_async,
+    start_shell,
+)
 from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
 from orbweaver.tooltext import normalize_grep_pattern
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
@@ -29,6 +38,9 @@ GREP_HIT_CAP = 50
 GLOB_HIT_CAP = 200
 GREP_LINE_CAP = 200
 RG_TIMEOUT_SEC = 30
+_JOB_POLL_S = 0.2
+_SHELL_POLL_SLICE_S = 1.0
+_CANCEL_DRAIN_S = 5.0
 _RG_MISSING = (
     "ripgrep (rg) is required for Grep and Glob. "
     "Install ripgrep (Debian/Ubuntu: apt install ripgrep) and ensure rg is on PATH."
@@ -165,6 +177,10 @@ def _timeout_message(timeout: int, output: str) -> str:
     return f"{prefix}\n{body}" if body else prefix
 
 
+def _unknown_job(job_id: str) -> str:
+    return json.dumps({"job_id": job_id, "status": "unknown", "error": "no such job"})
+
+
 CWD_MARK = "__OW_CWD__"
 RC_MARK = "__OW_RC__"
 
@@ -228,6 +244,18 @@ def with_bash_header(
     return f"{header}\n{output}" if output else header
 
 
+@dataclass(frozen=True)
+class _BashPlan:
+    """How LocalWorkspace.bash / bash_async should run one call."""
+
+    mode: str  # "job" | "error" | "raw" | "sandbox"
+    command: str = ""
+    seconds: int = 0
+    full_network: bool = False
+    job_id: str = ""
+    error: str = ""
+
+
 class _BashJob:
     def __init__(self, job_id: str, command: str, timeout: int, proc: subprocess.Popen, cleanup=None):
         self.job_id = job_id
@@ -271,6 +299,9 @@ class _BashJob:
 
     def wait(self, seconds: float) -> bool:
         return self._done.wait(timeout=max(0.0, seconds))
+
+    def done(self) -> bool:
+        return self._done.is_set()
 
     def snapshot(self) -> str:
         payload: dict = {
@@ -552,6 +583,17 @@ class LocalWorkspace:
             start_new_session=True,
         )
 
+    async def _raw_bash_async(
+        self, command: str, timeout: int, *, cancel: asyncio.Event | None = None
+    ) -> str:
+        proc = await start_shell(command, self.root)
+        out, status = await communicate_async(proc, timeout, cancel=cancel)
+        if status == STATUS_INTERRUPTED:
+            raise BashInterrupted(out[-200_000:])
+        if status == STATUS_TIMEOUT:
+            return _timeout_message(timeout, out)
+        return out[-200_000:]
+
     def collect_job(self, job_id: str, wait_s: float = 0, session_key: str | None = None) -> str:
         """Snapshot of a background job: host-side jobs first, then the session shell's."""
         job = self._jobs.get(job_id)
@@ -568,7 +610,49 @@ class LocalWorkspace:
                 snap = None
             if snap is not None:
                 return snap
-        return json.dumps({"job_id": job_id, "status": "unknown", "error": "no such job"})
+        return _unknown_job(job_id)
+
+    async def collect_job_async(
+        self,
+        job_id: str,
+        wait_s: float = 0,
+        *,
+        cancel: asyncio.Event | None = None,
+        session_key: str | None = None,
+    ) -> str:
+        """collect_job that yields to the loop while waiting; stops early on cancel."""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        job = self._jobs.get(job_id)
+        if job is not None:
+            while not job.done():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or (cancel is not None and cancel.is_set()):
+                    break
+                await asyncio.sleep(min(_JOB_POLL_S, remaining))
+            return job.snapshot()
+        from orbweaver.sandbox.shell import ShellDead, peek_session_shell
+
+        shell = peek_session_shell(self._shell_key(session_key))
+        if shell is None:
+            return _unknown_job(job_id)
+        # The shell's poll blocks in a worker thread; poll in short slices so a
+        # Stop during a long wait returns promptly.
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            slice_s = min(remaining, _SHELL_POLL_SLICE_S)
+            try:
+                snap = await asyncio.to_thread(shell.poll, job_id, slice_s)
+            except ShellDead:
+                snap = None
+            if snap is None:
+                return _unknown_job(job_id)
+            if remaining <= slice_s or (cancel is not None and cancel.is_set()):
+                return snap
+            try:
+                if json.loads(snap).get("status") != "running":
+                    return snap
+            except ValueError:
+                return snap
 
     def _start_job(self, command: str, timeout: int, proc: subprocess.Popen, cleanup=None) -> str:
         job_id = f"bj_{uuid4().hex[:12]}"
@@ -589,17 +673,68 @@ class LocalWorkspace:
 
         return close_session_shell(self._shell_key(session_key))
 
-    def _oneshot(self, run, cmd: str, cwd: str | None, key: str) -> str:
-        """Run one command with cwd tracking; ``run`` maps the wrapped command to output."""
+    def _begin_command(self, key: str) -> str | None:
+        """Persisted cwd the command starts in; remembered for the git ritual."""
+        from orbweaver.sandbox.shell import session_cwd
+
+        cwd = session_cwd(key)
+        self.last_command_cwd = cwd or str(self.root)
+        return cwd
+
+    def _finish_oneshot(self, out: str, token: str, cwd: str | None, key: str) -> str:
         from orbweaver.sandbox.shell import set_session_cwd
 
-        token = uuid4().hex[:12]
-        out = run(wrap_cwd_tracking(cmd, cwd, self.root, token))
         cleaned, new_cwd, rc = parse_cwd_sentinel(out, token)
         if new_cwd:
             set_session_cwd(key, new_cwd)
         status = "timeout" if cleaned.startswith("timeout: command exceeded") else "exited"
         return with_bash_header(cleaned, new_cwd or cwd or str(self.root), rc, status)
+
+    def _oneshot(self, run, cmd: str, cwd: str | None, key: str) -> str:
+        """Run one command with cwd tracking; ``run`` maps the wrapped command to output."""
+        token = uuid4().hex[:12]
+        out = run(wrap_cwd_tracking(cmd, cwd, self.root, token))
+        return self._finish_oneshot(out, token, cwd, key)
+
+    async def _oneshot_async(self, run, cmd: str, cwd: str | None, key: str) -> str:
+        """:meth:`_oneshot` for a coroutine-returning ``run`` (may raise BashInterrupted)."""
+        token = uuid4().hex[:12]
+        out = await run(wrap_cwd_tracking(cmd, cwd, self.root, token))
+        return self._finish_oneshot(out, token, cwd, key)
+
+    def _raw_oneshot(
+        self, cmd: str, seconds: int, cwd: str | None, key: str, background: bool
+    ) -> str:
+        if background:
+            return self._start_job(cmd, seconds, self._spawn_raw(cwd_prefix(cmd, cwd, self.root)))
+        return self._oneshot(lambda c: self._raw_bash(c, seconds), cmd, cwd, key)
+
+    @staticmethod
+    def _bash_plan(
+        command: str,
+        timeout: int | None,
+        sandbox: bool,
+        unsandboxed: bool,
+        permissions,
+        job_id: str | None,
+        block_until_ms: int | None,
+    ) -> _BashPlan:
+        if job_id:
+            wait_default = 0 if timeout is None and block_until_ms is None else DEFAULT_BASH_TIMEOUT_S
+            wait_s = resolve_bash_timeout(timeout, block_until_ms, default=wait_default)
+            return _BashPlan("job", job_id=str(job_id), seconds=wait_s)
+        seconds = resolve_bash_timeout(timeout, block_until_ms)
+        cmd = command if isinstance(command, str) else str(command or "")
+        if not cmd.strip():
+            return _BashPlan("error", error="error: command is required unless job_id is set")
+        perms = _bash_permissions(permissions, unsandboxed)
+        use_raw = "all" in perms or not sandbox or not settings.orbweaver_sandbox
+        return _BashPlan(
+            "raw" if use_raw else "sandbox",
+            command=cmd,
+            seconds=seconds,
+            full_network="full_network" in perms,
+        )
 
     def bash(
         self,
@@ -613,27 +748,24 @@ class LocalWorkspace:
         block_until_ms: int | None = None,
         session_key: str | None = None,
     ) -> str:
-        key = self._shell_key(session_key)
-        if job_id:
-            wait_default = 0 if timeout is None and block_until_ms is None else DEFAULT_BASH_TIMEOUT_S
-            wait_s = resolve_bash_timeout(timeout, block_until_ms, default=wait_default)
-            return self.collect_job(str(job_id), wait_s=wait_s, session_key=key)
-        seconds = resolve_bash_timeout(timeout, block_until_ms)
-        cmd = command if isinstance(command, str) else str(command or "")
-        if not cmd.strip():
-            return "error: command is required unless job_id is set"
-        from orbweaver.sandbox.shell import session_cwd
+        """Run a command synchronously. Blocks the calling thread for up to ``timeout``.
 
-        cwd = session_cwd(key)
-        self.last_command_cwd = cwd or str(self.root)
-        perms = _bash_permissions(permissions, unsandboxed)
-        use_raw = "all" in perms or not sandbox or not settings.orbweaver_sandbox
-        if use_raw:
-            if background:
-                return self._start_job(
-                    cmd, seconds, self._spawn_raw(cwd_prefix(cmd, cwd, self.root))
-                )
-            return self._oneshot(lambda c: self._raw_bash(c, seconds), cmd, cwd, key)
+        Async callers (the agent loop) use :meth:`bash_async` so the event loop
+        keeps serving other sessions and the command can be interrupted.
+        ``session_key`` (the session id) selects the persistent shell and cwd.
+        """
+        key = self._shell_key(session_key)
+        plan = self._bash_plan(
+            command, timeout, sandbox, unsandboxed, permissions, job_id, block_until_ms
+        )
+        if plan.mode == "job":
+            return self.collect_job(plan.job_id, wait_s=plan.seconds, session_key=key)
+        if plan.mode == "error":
+            return plan.error
+        cmd, seconds = plan.command, plan.seconds
+        cwd = self._begin_command(key)
+        if plan.mode == "raw":
+            return self._raw_oneshot(cmd, seconds, cwd, key, background)
         from orbweaver.sandbox.bwrap import (
             SandboxUnavailable,
             is_containerized,
@@ -642,14 +774,9 @@ class LocalWorkspace:
         )
 
         if is_containerized():
-            if background:
-                return self._start_job(
-                    cmd, seconds, self._spawn_raw(cwd_prefix(cmd, cwd, self.root))
-                )
-            return self._oneshot(lambda c: self._raw_bash(c, seconds), cmd, cwd, key)
-        full_network = "full_network" in perms
+            return self._raw_oneshot(cmd, seconds, cwd, key, background)
         try:
-            if not full_network:
+            if not plan.full_network:
                 persistent = self._persistent_bash(cmd, seconds, cwd, key, background)
                 if persistent is not None:
                     return persistent
@@ -658,7 +785,7 @@ class LocalWorkspace:
                     cwd_prefix(cmd, cwd, self.root),
                     self.root,
                     policy=self._policy(),
-                    full_network=full_network,
+                    full_network=plan.full_network,
                 )
                 return self._start_job(cmd, seconds, session.proc, cleanup=session.close)
             return self._oneshot(
@@ -667,7 +794,7 @@ class LocalWorkspace:
                     self.root,
                     seconds,
                     policy=self._policy(),
-                    full_network=full_network,
+                    full_network=plan.full_network,
                 ),
                 cmd,
                 cwd,
@@ -676,11 +803,7 @@ class LocalWorkspace:
         except SandboxUnavailable as e:
             if settings.orbweaver_sandbox_fail_if_unavailable:
                 return f"sandbox_unavailable: {e}"
-            if background:
-                return self._start_job(
-                    cmd, seconds, self._spawn_raw(cwd_prefix(cmd, cwd, self.root))
-                )
-            return self._oneshot(lambda c: self._raw_bash(c, seconds), cmd, cwd, key)
+            return self._raw_oneshot(cmd, seconds, cwd, key, background)
 
     def _persistent_bash(
         self, cmd: str, seconds: int, cwd: str | None, key: str, background: bool
@@ -718,9 +841,131 @@ class LocalWorkspace:
             body = f"error: {body}"
         return with_bash_header(body, res.cwd or cwd or str(self.root), res.returncode, res.status)
 
+    async def _persistent_bash_async(
+        self,
+        cmd: str,
+        seconds: int,
+        cwd: str | None,
+        key: str,
+        cancel: asyncio.Event | None,
+    ) -> str | None:
+        """:meth:`_persistent_bash` off the event loop; Stop kills the session sandbox.
+
+        The shell protocol is synchronous, so the request runs in a worker thread.
+        When ``cancel`` fires first the whole session sandbox is closed (the
+        foreground command and any background servers die with it) and
+        :class:`BashInterrupted` is raised, matching the one-shot paths.
+        """
+        from orbweaver.sandbox.shell import persistent_shell_enabled
+
+        if not persistent_shell_enabled():
+            return None
+        if cancel is not None and cancel.is_set():
+            raise BashInterrupted()
+        work = asyncio.ensure_future(
+            asyncio.to_thread(self._persistent_bash, cmd, seconds, cwd, key, False)
+        )
+        if cancel is None:
+            return await work
+        stop = asyncio.ensure_future(cancel.wait())
+        try:
+            await asyncio.wait({work, stop}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop.cancel()
+        if work.done():
+            return work.result()
+        await asyncio.to_thread(self.close_shell, key)
+        # The worker sees ShellDead once the sandbox is gone; its result is discarded.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(work, timeout=_CANCEL_DRAIN_S)
+        raise BashInterrupted()
+
     async def abash(self, *args, **kwargs) -> str:
         """Non-blocking Bash for async callers; same arguments as ``bash``."""
         return await asyncio.to_thread(self.bash, *args, **kwargs)
+
+    async def bash_async(
+        self,
+        command: str = "",
+        timeout: int | None = None,
+        sandbox: bool = True,
+        unsandboxed: bool = False,
+        permissions: list[str] | tuple[str, ...] | None = None,
+        background: bool = False,
+        job_id: str | None = None,
+        block_until_ms: int | None = None,
+        session_key: str | None = None,
+        *,
+        cancel: asyncio.Event | None = None,
+    ) -> str:
+        """:meth:`bash` for the event loop.
+
+        Foreground commands run as asyncio subprocesses (or, with the persistent
+        shell, in a worker thread) so other sessions keep being served. When
+        ``cancel`` is set mid-command the process group (or the session sandbox)
+        is killed and :class:`BashInterrupted` is raised. Background jobs are
+        started in a worker thread and polled without blocking.
+        """
+        key = self._shell_key(session_key)
+        plan = self._bash_plan(
+            command, timeout, sandbox, unsandboxed, permissions, job_id, block_until_ms
+        )
+        if plan.mode == "job":
+            return await self.collect_job_async(
+                plan.job_id, plan.seconds, cancel=cancel, session_key=key
+            )
+        if plan.mode == "error":
+            return plan.error
+        if background:
+            return await asyncio.to_thread(
+                self.bash,
+                plan.command,
+                timeout=timeout,
+                sandbox=sandbox,
+                unsandboxed=unsandboxed,
+                permissions=permissions,
+                background=True,
+                block_until_ms=block_until_ms,
+                session_key=key,
+            )
+        cmd, seconds = plan.command, plan.seconds
+        cwd = self._begin_command(key)
+
+        def raw(c: str):
+            return self._raw_bash_async(c, seconds, cancel=cancel)
+
+        if plan.mode == "raw":
+            return await self._oneshot_async(raw, cmd, cwd, key)
+        from orbweaver.sandbox.bwrap import (
+            SandboxUnavailable,
+            is_containerized,
+            run_sandboxed_async,
+        )
+
+        if is_containerized():
+            return await self._oneshot_async(raw, cmd, cwd, key)
+        try:
+            if not plan.full_network:
+                persistent = await self._persistent_bash_async(cmd, seconds, cwd, key, cancel)
+                if persistent is not None:
+                    return persistent
+            return await self._oneshot_async(
+                lambda c: run_sandboxed_async(
+                    c,
+                    self.root,
+                    seconds,
+                    policy=self._policy(),
+                    full_network=plan.full_network,
+                    cancel=cancel,
+                ),
+                cmd,
+                cwd,
+                key,
+            )
+        except SandboxUnavailable as e:
+            if settings.orbweaver_sandbox_fail_if_unavailable:
+                return f"sandbox_unavailable: {e}"
+            return await self._oneshot_async(raw, cmd, cwd, key)
 
     def propose_patch(self, path: str, old: str, new: str) -> dict:
         target = self._resolve(path, write=True)

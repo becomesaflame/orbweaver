@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID
 
 from orbweaver.store import SESSION_TYPE, Entity, Event, Store, new_uuid, session_at_id
+from orbweaver.turns import running_turn
 
 try:
     from orbweaver.permissions.handoff import review_subagent_return
@@ -202,22 +203,25 @@ async def run_subagent(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
 
     status = "ok"
     try:
-        await agent_turn(
-            store,
-            child_id,
-            task,
-            ctx["workspace"],
-            workspace_kind=workspace_kind,
-            cancel=ctx.get("cancel"),
-            headless=True,
-            tools=child_tool_spec(
-                await session_tools(ctx["workspace"], parent_channel), kind
-            ),
-            system_extra=subagent_system_extra(kind),
-            max_rounds=SUBAGENT_MAX_ROUNDS,
-            subagent_depth=1,
-            channel=parent_channel or None,
-        )
+        # The child is a fresh session, but registering it keeps web/Telegram/cron
+        # from starting a second turn on it while the subagent runs.
+        async with running_turn(child_id, channel="subagent"):
+            await agent_turn(
+                store,
+                child_id,
+                task,
+                ctx["workspace"],
+                workspace_kind=workspace_kind,
+                cancel=ctx.get("cancel"),
+                headless=True,
+                tools=child_tool_spec(
+                    await session_tools(ctx["workspace"], parent_channel), kind
+                ),
+                system_extra=subagent_system_extra(kind),
+                max_rounds=SUBAGENT_MAX_ROUNDS,
+                subagent_depth=1,
+                channel=parent_channel or None,
+            )
     except TurnCancelled:
         status = "cancelled"
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import UUID
 
 from orbweaver import __version__
-from orbweaver.agent import agent_turn
+from orbweaver.agent import TurnCancelled, agent_turn
 from orbweaver.auth import mint_token
 from orbweaver.config import settings
 from orbweaver.image import (
@@ -24,6 +24,10 @@ from orbweaver.store import (
     new_uuid,
     session_at_id,
 )
+from orbweaver.turns import RunningTurn
+from orbweaver.turns import acquire as acquire_turn
+from orbweaver.turns import get as get_running_turn
+from orbweaver.turns import release as release_turn
 from orbweaver.workspace import WORKSPACE_KIND_LOCAL, apply_local_workspace_kind, bind_workspace
 
 log = logging.getLogger(__name__)
@@ -228,25 +232,59 @@ async def _session_workspace(update, context):
     return store, session_id, ws, kind
 
 
+def _busy_reply(state: RunningTurn) -> str:
+    via = f" ({state.channel})" if state.channel else ""
+    return (
+        f"A turn is already running on this session{via}; your message was added to it. "
+        "Use Stop in the web UI or wait for it to finish."
+    )
+
+
 async def _run_turn(update, context, text: str, images: list[dict[str, str]] | None = None) -> None:
+    state: RunningTurn | None = None
+    session_id: UUID | None = None
     try:
         store, session_id, ws, kind = await _session_workspace(update, context)
-        events = await agent_turn(
-            store,
-            session_id,
-            text,
-            ws,
-            workspace_kind=kind,
-            headless=True,
-            interactive=True,
-            images=images,
-            system_extra=TELEGRAM_IMAGE_HINT,
-            channel="telegram",
-        )
-        reply = texts_for_reply(events) or "(no assistant text)"
+        state = acquire_turn(session_id, channel="telegram")
+        if state is None:
+            # Same path as POST /turns/inject: the running turn picks the text up
+            # on its next LLM call instead of a second agent_turn racing it.
+            from orbweaver.app import inject_into_turn
+
+            running = get_running_turn(session_id)
+            if running is None:
+                reply = "A turn is already running on this session; send that again in a moment."
+            else:
+                await inject_into_turn(store, session_id, running, text, images)
+                reply = _busy_reply(running)
+            log.info("telegram: session %s busy, message injected into running turn", session_id)
+        else:
+            events = await agent_turn(
+                store,
+                session_id,
+                text,
+                ws,
+                workspace_kind=kind,
+                headless=True,
+                interactive=True,
+                images=images,
+                system_extra=TELEGRAM_IMAGE_HINT,
+                channel="telegram",
+                cancel=state.cancel,
+                turn_state=state,
+            )
+            reply = texts_for_reply(events) or "(no assistant text)"
+    except TurnCancelled as e:
+        # Stop from the web UI reaches Telegram turns through the shared registry.
+        if session_id is not None:
+            await store.append_event(session_id, "turn_interrupted", {"reason": "stop"})
+        reply = texts_for_reply(e.produced) or "Turn stopped."
     except Exception as e:
         log.exception("telegram turn failed")
         reply = f"Turn failed: {e}"[:3500]
+    finally:
+        if state is not None and session_id is not None:
+            release_turn(session_id, state)
     if update.message:
         await update.message.reply_text(reply)
 

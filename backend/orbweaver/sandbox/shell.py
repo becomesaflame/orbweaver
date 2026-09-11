@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import shlex
 import subprocess
@@ -32,7 +33,7 @@ from uuid import uuid4
 
 from orbweaver.config import settings
 from orbweaver.sandbox import bwrap as _bwrap
-from orbweaver.sandbox.bwrap import SandboxUnavailable, build_bwrap_argv, terminate_process
+from orbweaver.sandbox.bwrap import SandboxUnavailable, terminate_process
 from orbweaver.sandbox.policy import SandboxPolicy, load_sandbox_policy
 
 if TYPE_CHECKING:
@@ -327,20 +328,16 @@ class SessionShell:
             raise SandboxUnavailable("containerized hosts use unsandboxed bash")
         if not _bwrap.bwrap_path():
             raise SandboxUnavailable("bwrap is not installed")
-        tmp = self.root / ".orbweaver-tmp"
-        tmp.mkdir(parents=True, exist_ok=True)
         token = uuid4().hex
-        inner = _server_command(token)
-        if not self.full_network:
-            from orbweaver.sandbox.proxy import DomainProxy, wrap_command_with_proxy
-
-            sock = tmp / f"ow-proxy-{uuid4().hex[:12]}.sock"
-            self.proxy = DomainProxy(sock, self.policy.network)
-            self.proxy.start()
-            inner = wrap_command_with_proxy(inner, str(sock))
-        argv = build_bwrap_argv(
-            inner, self.root, tmp, policy=self.policy, full_network=self.full_network
+        # Same proxy relay, seccomp filter, cleared environment and rlimits as a
+        # one-shot run_sandboxed: the persistent shell is not a weaker sandbox.
+        argv, proxy, seccomp_fd = _bwrap._prepare_sandbox(
+            _server_command(token),
+            self.root,
+            policy=self.policy,
+            full_network=self.full_network,
         )
+        self.proxy = proxy
         try:
             self.proc = subprocess.Popen(
                 argv,
@@ -350,6 +347,7 @@ class SessionShell:
                 text=True,
                 bufsize=1,
                 start_new_session=True,
+                pass_fds=(seccomp_fd,) if seccomp_fd is not None else (),
             )
         except FileNotFoundError as e:
             self.close()
@@ -357,6 +355,10 @@ class SessionShell:
         except OSError as e:
             self.close()
             raise SandboxUnavailable(f"bwrap failed to start: {e}") from e
+        finally:
+            # bwrap inherited its own copy; the program is fully read before exec.
+            if seccomp_fd is not None:
+                os.close(seccomp_fd)
         threading.Thread(target=self._pump_stdout, daemon=True, name="ow-shell-out").start()
         threading.Thread(target=self._pump_stderr, daemon=True, name="ow-shell-err").start()
         deadline = time.monotonic() + self.start_timeout

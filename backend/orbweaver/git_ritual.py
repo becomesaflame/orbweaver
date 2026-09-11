@@ -46,10 +46,39 @@ STAGED_TMP_WARNING = (
     "Add only the files you changed."
 )
 
+# Config-execution vectors git reads from the repo's own .git/config. A hostile
+# workspace can set these to run an arbitrary host command when the ritual runs
+# `git status`/`rev-parse` (see issue #94). Command-line `-c` has the highest
+# precedence, so these override whatever the repo config says.
+_GIT_CONFIG_ARGS: tuple[str, ...] = (
+    "-c",
+    "core.fsmonitor=",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.sshCommand=",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "credential.helper=",
+)
+
 _GIT_ENV = {
-    "GIT_OPTIONAL_LOCKS": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_TERMINAL_PROMPT": "0",
+    "GIT_OPTIONAL_LOCKS": "0",
 }
+
+# Only a minimal environment reaches git, not os.environ (the gateway user's
+# secrets). #93 tracks the broader env-inheritance problem for sandboxed Bash.
+_GIT_ENV_PASSTHROUGH = ("PATH", "HOME", "LANG")
+
+
+def _git_env() -> dict[str, str]:
+    env = {k: os.environ[k] for k in _GIT_ENV_PASSTHROUGH if k in os.environ}
+    env.update(_GIT_ENV)
+    return env
 
 
 def command_uses_git(command: str) -> bool:
@@ -68,13 +97,12 @@ def cd_targets(command: str) -> list[str]:
 
 
 def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, **_GIT_ENV}
     return subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", *_GIT_CONFIG_ARGS, "-C", str(repo), *args],
         capture_output=True,
         text=True,
         timeout=8,
-        env=env,
+        env=_git_env(),
         check=False,
     )
 
@@ -89,16 +117,39 @@ def git_toplevel(cwd: Path) -> Path | None:
     return Path(top) if top else None
 
 
+def _working_set_roots(root: Path) -> tuple[Path, ...]:
+    """Working-set roots for the ritual: never follow `cd` outside them (#94).
+
+    A hostile `cd /any/attacker/checkout && git log` must not make the host-side
+    ritual honor that repo's config. Fall back to the workspace root alone if the
+    sandbox policy cannot be loaded.
+    """
+    try:
+        from orbweaver.sandbox.policy import load_sandbox_policy
+
+        return load_sandbox_policy(root).working_set_roots(root)
+    except Exception:
+        return (root,)
+
+
 def repo_for_command(
     workspace_root: Path, command: str, cwd: Path | str | None = None
 ) -> Path | None:
-    """Repo the command ran in. ``cwd`` is the persisted session cwd it started from."""
+    """Repo the command ran in.
+
+    ``cwd`` is the persisted session cwd the command started from. It is only
+    honoured when it lies inside the working-set roots; otherwise the workspace
+    root is the base, exactly as for ``cd`` targets.
+    """
     root = Path(workspace_root).resolve()
+    from orbweaver.sandbox.policy import in_roots
+
+    roots = _working_set_roots(root)
     base = root
     if cwd:
         try:
             candidate = Path(cwd).expanduser().resolve()
-            if candidate.is_dir():
+            if candidate.is_dir() and in_roots(candidate, roots):
                 base = candidate
         except OSError:
             pass
@@ -108,9 +159,12 @@ def repo_for_command(
         if not path.is_absolute():
             path = (base / path)
         try:
-            candidates.append(path.resolve())
+            resolved = path.resolve()
         except OSError:
             continue
+        if not in_roots(resolved, roots):
+            continue
+        candidates.append(resolved)
     candidates.append(base)
     candidates.append(root)
     seen: set[Path] = set()
