@@ -10,6 +10,7 @@ import resource
 import shutil
 import signal
 import subprocess
+import time
 from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
@@ -43,6 +44,7 @@ from orbweaver.sandbox.ssh import (
     ssh_identity_bind_args,
     ssh_private_identity_files,
 )
+from orbweaver.tooltext import BASH_OUTPUT_CAP, format_bash_result
 
 log = logging.getLogger(__name__)
 
@@ -72,10 +74,10 @@ def _decode_captured(data) -> str:
     return str(data)
 
 
-def _timeout_message(timeout: int, output: str) -> str:
-    body = (output or "")[-200_000:]
-    prefix = f"timeout: command exceeded {timeout}s"
-    return f"{prefix}\n{body}" if body else prefix
+def _timeout_message(timeout: int, output: str, *, returncode: int | None = None) -> str:
+    return format_bash_result(
+        output, returncode=returncode, elapsed_s=float(timeout), timed_out_after=timeout
+    )
 
 
 def terminate_process(proc: subprocess.Popen) -> None:
@@ -599,6 +601,7 @@ def run_sandboxed(
 ) -> str:
     if is_containerized():
         return _raw(command, workspace_root, timeout)
+    started = time.monotonic()
     session = spawn_sandboxed(command, workspace_root, policy=policy, full_network=full_network)
     try:
         try:
@@ -607,12 +610,20 @@ def run_sandboxed(
             terminate_process(session.proc)
             stdout, stderr = session.proc.communicate(timeout=5)
             out = (stdout or "") + (stderr or "")
-            return _timeout_message(timeout, label_sandbox_output(out[-200_000:]))
+            return _timeout_message(
+                timeout,
+                label_sandbox_output(out[-BASH_OUTPUT_CAP:]),
+                returncode=session.proc.returncode,
+            )
     finally:
         session.close()
     out = (stdout or "") + (stderr or "")
     _raise_if_bwrap_eperm(session.proc.returncode, out)
-    return label_sandbox_output(out[-200_000:])
+    return format_bash_result(
+        label_sandbox_output(out[-BASH_OUTPUT_CAP:]),
+        returncode=session.proc.returncode,
+        elapsed_s=time.monotonic() - started,
+    )
 
 
 def _raise_if_bwrap_eperm(returncode: int | None, out: str) -> None:
@@ -637,6 +648,7 @@ async def run_sandboxed_async(
     """
     if is_containerized():
         return await _raw_async(command, workspace_root, timeout, cancel=cancel)
+    started = time.monotonic()
     session = await spawn_sandboxed_async(
         command, workspace_root, policy=policy, full_network=full_network
     )
@@ -645,11 +657,19 @@ async def run_sandboxed_async(
     finally:
         session.close()
     if status == STATUS_INTERRUPTED:
-        raise BashInterrupted(label_sandbox_output(out[-200_000:]))
+        raise BashInterrupted(label_sandbox_output(out[-BASH_OUTPUT_CAP:]))
     if status == STATUS_TIMEOUT:
-        return _timeout_message(timeout, label_sandbox_output(out[-200_000:]))
+        return _timeout_message(
+            timeout,
+            label_sandbox_output(out[-BASH_OUTPUT_CAP:]),
+            returncode=session.proc.returncode,
+        )
     _raise_if_bwrap_eperm(session.proc.returncode, out)
-    return label_sandbox_output(out[-200_000:])
+    return format_bash_result(
+        label_sandbox_output(out[-BASH_OUTPUT_CAP:]),
+        returncode=session.proc.returncode,
+        elapsed_s=time.monotonic() - started,
+    )
 
 
 async def _raw_async(
@@ -659,16 +679,20 @@ async def _raw_async(
     *,
     cancel: asyncio.Event | None = None,
 ) -> str:
+    started = time.monotonic()
     proc = await start_shell(command, workspace_root)
     out, status = await communicate_async(proc, timeout, cancel=cancel)
     if status == STATUS_INTERRUPTED:
-        raise BashInterrupted(out[-200_000:])
+        raise BashInterrupted(out[-BASH_OUTPUT_CAP:])
     if status == STATUS_TIMEOUT:
-        return _timeout_message(timeout, out)
-    return out[-200_000:]
+        return _timeout_message(timeout, out, returncode=proc.returncode)
+    return format_bash_result(
+        out, returncode=proc.returncode, elapsed_s=time.monotonic() - started
+    )
 
 
 def _raw(command: str, workspace_root: Path, timeout: int) -> str:
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             command,
@@ -681,4 +705,8 @@ def _raw(command: str, workspace_root: Path, timeout: int) -> str:
         )
     except subprocess.TimeoutExpired as e:
         return _timeout_message(timeout, _decode_captured(e.stdout) + _decode_captured(e.stderr))
-    return ((proc.stdout or "") + (proc.stderr or ""))[-200_000:]
+    return format_bash_result(
+        (proc.stdout or "") + (proc.stderr or ""),
+        returncode=proc.returncode,
+        elapsed_s=time.monotonic() - started,
+    )

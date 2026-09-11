@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     orbweaver_auto_allow_bash_if_sandboxed: bool = True
     orbweaver_sandbox_config: str = ""
     orbweaver_mcp_config: str = ""
+    # Host variable names (comma-separated) every MCP server may reference via
+    # ${VAR} in mcp.json env/headers; per-server `envPassthrough` adds to it.
+    orbweaver_mcp_env_passthrough: str = ""
+    # Auto-allow mcp_* tools whose server annotates readOnlyHint: true.
+    orbweaver_mcp_auto_allow_readonly: bool = True
     # Concurrency-safe tool calls from one assistant round that may run at once.
     orbweaver_max_parallel_tools: int = 8
     orbweaver_sandbox_additional_readonly: str = ""
@@ -66,8 +71,14 @@ class Settings(BaseSettings):
     orbweaver_sandbox_seccomp: str = "auto"
     orbweaver_sandbox_hide_sys: bool = True
     orbweaver_sandbox_env_allow: str = ""  # extra env names/globs passed into sandboxed Bash
+    orbweaver_checkpoints: bool = True  # per-turn git tree of the workspace for rewind
+    orbweaver_checkpoint_keep_days: int = 14  # prune refs/orbweaver/checkpoints older than this
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
+    # Per-item cap for one instruction doc / rule / skill body inlined in a prompt.
+    orbweaver_instruction_item_token_cap: int = 2000
+    # User-level instructions; empty → <orbweaver_data_dir or ~/.orbweaver>/AGENTS.md
+    orbweaver_user_instructions: str = ""
     context_window: int = 200_000
     output_reserve: int = 16_000
     static_token_estimate: int = 12_000
@@ -75,7 +86,20 @@ class Settings(BaseSettings):
     # (~85% of the 200k window). Claw Code uses 100k cumulative input tokens.
     compact_ratio: float = 0.85
     orbweaver_compact_model: str = "claude-haiku-4-5"
+    # Microcompact (stub old tool results in the prompt) runs only under pressure:
+    # when the payload estimate of the live window exceeds compact_micro_pressure
+    # of event_budget it clears the oldest large results, in chunks of
+    # (pressure - release) * event_budget, until the window is back under the
+    # pressure line. Chunking keeps the message prefix byte-identical between
+    # consecutive rounds so Anthropic prompt caching keeps hitting.
+    compact_micro_pressure: float = 0.6
+    compact_micro_release: float = 0.4
+    # Floor: the newest N compactable results are never stubbed.
     compact_micro_keep: int = 5
+    # Independent of pressure: a result older than this many tool rounds *and*
+    # larger than this many chars is stubbed (0 rounds disables the age rule).
+    compact_micro_stale_rounds: int = 24
+    compact_micro_stale_chars: int = 20000
     compact_tool_result_chars: int = 8000
     compact_max_failures: int = 3
     compact_overflow_retries: int = 4
@@ -83,6 +107,12 @@ class Settings(BaseSettings):
     compact_rehydrate_chars_per_file: int = 20000
     compact_rehydrate_token_budget: int = 50000
     compact_notes_max_chars: int = 12000
+    # Loop detection (orbweaver.stuck). Streaks count tool calls since the last user
+    # message; stuck_window is how many recent tool calls are scanned.
+    stuck_detection: bool = True
+    stuck_repeat_threshold: int = 3
+    stuck_alternating_threshold: int = 6
+    stuck_window: int = 20
     database_url: str = "postgresql://orbweaver:orbweaver@localhost:5432/orbweaver"
     orbweaver_store: str = "memory"  # memory | postgres
     workspace_root: str = "."
@@ -94,6 +124,9 @@ class Settings(BaseSettings):
     orbweaver_image_model: str = "dall-e-3"
     orbweaver_image_size: str = "1024x1024"
     orbweaver_linter: str = ""  # e.g. ruff check {paths} ; empty uses the Python AST stub
+    # Write/StrReplace/NotebookEdit/Delete on an existing file require a prior Read
+    # this session and refuse when the file changed on disk since that Read.
+    edit_require_read: bool = True
     orbweaver_search_provider: str = ""  # duckduckgo | brave | empty auto
     orbweaver_brave_api_key: str = ""
     brave_search_api_key: str = ""

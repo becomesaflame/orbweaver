@@ -144,6 +144,10 @@
       font-size:0.75rem; color:var(--muted); padding:0.12rem 0.45rem; border-radius:6px;
     }
     .msg-actions button:hover { color:var(--ink); }
+    .msg-actions .restore-files {
+      display:flex; align-items:center; gap:0.25rem; font-size:0.75rem; color:var(--muted); cursor:pointer;
+    }
+    .msg.checkpoint { border-left-color:#8ac8a0; }
     .btn-new.secondary {
       background:transparent; color:var(--ink); border:1px solid var(--line); font-weight:600;
     }
@@ -367,6 +371,22 @@
       edit.title = pending ? "Pause and edit this prompt" : "Edit this prompt";
       edit.onclick = (ev) => { ev.stopPropagation(); editPrompt(text, seq, el); };
       actions.appendChild(edit);
+      if (!pending && seq != null) {
+        const lab = document.createElement("label");
+        lab.className = "restore-files";
+        lab.title = "Put the workspace back to how it was before this turn (git checkpoint)";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.className = "restore-files-box";
+        box.dataset.auto = "1";
+        box.checked = turnEditsFilesAfter(seq);
+        box.onclick = (ev) => ev.stopPropagation();
+        box.onchange = () => { box.dataset.auto = "0"; };
+        lab.appendChild(box);
+        lab.appendChild(document.createTextNode(" also restore files"));
+        lab.onclick = (ev) => ev.stopPropagation();
+        actions.appendChild(lab);
+      }
       if (pending) {
         const cancel = document.createElement("button");
         cancel.type = "button";
@@ -377,10 +397,45 @@
       }
       el.appendChild(actions);
     }
+    const FILE_EDIT_TOOLS = new Set(["Write", "StrReplace", "Delete", "NotebookEdit", "Bash"]);
+    function turnEditsFilesAfter(seq) {
+      for (const node of $("log").children) {
+        const s = Number(node.dataset.seq);
+        if (Number.isFinite(s) && s >= seq && node.dataset.editsFiles === "1") return true;
+      }
+      return false;
+    }
+    function syncRestoreDefaults() {
+      for (const box of $("log").querySelectorAll(".restore-files-box[data-auto='1']")) {
+        const msg = box.closest(".msg");
+        const seq = msg ? Number(msg.dataset.seq) : NaN;
+        if (Number.isFinite(seq)) box.checked = turnEditsFilesAfter(seq);
+      }
+    }
+    function restoreSummaryText(p) {
+      if (p.status === "skipped") return "files not restored: " + (p.note || "no checkpoint");
+      const restored = p.restored || [], deleted = p.deleted || [];
+      const parts = [];
+      if (restored.length) parts.push("restored " + restored.length + " file" + (restored.length === 1 ? "" : "s"));
+      if (deleted.length) parts.push("deleted " + deleted.length + " file" + (deleted.length === 1 ? "" : "s"));
+      const names = restored.concat(deleted.map((d) => "-" + d));
+      const shown = names.slice(0, 6).join(", ") + (names.length > 6 ? ", …" : "");
+      return "workspace " + (parts.length ? parts.join(", ") : "already matched the checkpoint")
+        + (shown ? " (" + shown + ")" : "");
+    }
     function renderEvent(ev) {
       const p = ev.payload || {};
+      if (ev.kind === "checkpoint_restore") {
+        add("tool", restoreSummaryText(p), { seq: ev.seq, extraClass: "checkpoint" });
+        return;
+      }
+      if (ev.kind === "tool_call" && FILE_EDIT_TOOLS.has(p.name)) {
+        const el = add("tool", ev.kind + " " + JSON.stringify(p).slice(0,400), { seq: ev.seq });
+        el.dataset.editsFiles = "1";
+        return;
+      }
       if (ev.kind === "user" || ev.kind === "assistant") {
-        const extra = p.injected ? "injected" : "";
+        const extra = (p.injected || p.stuck_nudge) ? "injected" : "";
         const el = add(ev.kind, p.text || "", { seq: ev.seq, extraClass: extra });
         if (ev.kind === "user") attachUserActions(el, p.text || "", ev.seq, false);
       } else if (ev.kind === "ask_user") {
@@ -801,10 +856,12 @@
           $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
         } else {
           for (const ev of evs) renderEvent(ev);
+          syncRestoreDefaults();
           if (pendingAskFromEvents(evs)) waitingAskSids.add(sid);
           else {
-            const last = evs[evs.length - 1];
-            if (last.kind !== "assistant") stoppedSids.add(sid);
+            const turns = evs.filter((e) => e.kind !== "checkpoint_restore");
+            const last = turns[turns.length - 1];
+            if (last && last.kind !== "assistant") stoppedSids.add(sid);
           }
         }
         $("status").textContent = "";
@@ -977,11 +1034,17 @@
       }
       stoppedSids.delete(sid);
       if (pending || seq == null) { syncComposer(); return; }
+      const box = el ? el.querySelector(".restore-files-box") : null;
+      const restoreFiles = box ? box.checked : turnEditsFilesAfter(seq);
       try {
-        await api("/v1/sessions/" + sid + "/rewind", {
-          method:"POST", body: JSON.stringify({ from_seq: seq })
+        const r = await api("/v1/sessions/" + sid + "/rewind", {
+          method:"POST", body: JSON.stringify({ from_seq: seq, restore_files: restoreFiles })
         });
         dropFromSeq(seq);
+        if (r.checkpoint_restore) {
+          const cp = r.checkpoint_restore;
+          add("tool", restoreSummaryText(cp), { seq: cp.seq, extraClass: "checkpoint" });
+        }
         ensurePlaceholder();
         await refreshSessions();
       } catch (e) { $("status").textContent = String(e); }
@@ -1160,6 +1223,7 @@
         } else if (stillHere) {
           if (userEl && r.user_seq != null) userEl.dataset.seq = String(r.user_seq);
           if (userEl) attachUserActions(userEl, text, r.user_seq, false);
+          syncRestoreDefaults();
           if (r.status === "waiting_ask") waitingAskSids.add(sid);
           if (r.status === "stopped") stoppedSids.add(sid);
         }

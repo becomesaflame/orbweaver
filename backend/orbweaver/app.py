@@ -45,6 +45,13 @@ from orbweaver.auth import (
     require_user,
     websocket_subprotocol_token,
 )
+from orbweaver.checkpoints import (
+    CheckpointError,
+    CheckpointHeadMismatch,
+    find_checkpoint,
+    restore_checkpoint,
+    turn_edits_files,
+)
 from orbweaver.config import settings
 from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
 from orbweaver.ratelimit import FileRateLimiter, get_rate_limiter
@@ -268,6 +275,10 @@ class ApproveBody(BaseModel):
 
 class RewindBody(BaseModel):
     from_seq: int
+    # None: restore when a discarded turn called a file-editing tool.
+    restore_files: bool | None = None
+    # Restore even when the workspace HEAD moved since the checkpoint.
+    force: bool = False
 
 
 class JobBody(BaseModel):
@@ -826,12 +837,51 @@ async def rewind(
         raise HTTPException(404, "session not found")
     events = await store.list_events(session_id)
     discarded = next((e for e in events if e.seq == body.from_seq), None)
+    dropped = [e for e in events if e.seq >= body.from_seq]
+    restore = body.restore_files
+    if restore is None:
+        restore = turn_edits_files(dropped)
+    summary = await _restore_workspace(sess, dropped, restore, force=body.force)
     await store.truncate_events(session_id, body.from_seq)
     text = ""
     if discarded and discarded.kind == "user":
         text = str(discarded.payload.get("text") or "")
         await _revert_autotitle_if_needed(store, sess, text)
-    return {"status": "ok", "text": text}
+    out: dict[str, Any] = {"status": "ok", "text": text, "restore_files": restore}
+    if summary is not None:
+        if summary.get("status") == "restored":
+            ev = await store.append_event(session_id, "checkpoint_restore", summary)
+            _broadcast(session_id, _event_dict(ev))
+            summary = {**summary, "seq": ev.seq}
+        out["checkpoint_restore"] = summary
+    return out
+
+
+async def _restore_workspace(
+    sess: Entity, dropped: list, restore: bool, *, force: bool
+) -> dict[str, Any] | None:
+    """Restore files from the first discarded turn's checkpoint, or explain why not."""
+    if not restore:
+        return None
+    checkpoint = find_checkpoint(dropped)
+    if checkpoint is None:
+        note = "no workspace checkpoint was recorded for these turns; files left as they are"
+        for ev in dropped:
+            cp = ev.payload.get("checkpoint") if ev.kind == "user" else None
+            if isinstance(cp, dict) and cp.get("unavailable"):
+                note = str(cp["unavailable"])
+                break
+        return {"status": "skipped", "note": note}
+    ws, _kind, _changed = bind_workspace(sess.jsonld, settings.workspace_root)
+    try:
+        result = await asyncio.to_thread(
+            restore_checkpoint, ws.root, checkpoint, force=force
+        )
+    except CheckpointHeadMismatch as e:
+        raise HTTPException(409, str(e)) from e
+    except CheckpointError as e:
+        raise HTTPException(500, f"checkpoint restore failed: {e}") from e
+    return result.payload()
 
 
 @app.post("/v1/sessions/{session_id}/correction")

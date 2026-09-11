@@ -283,7 +283,7 @@ def test_sandboxed_background_job_excludes_gateway_secrets(live_root, monkeypatc
 def test_sandboxed_bash_timeout_expiry(live_root):
     ws = LocalWorkspace("workspace:default", str(live_root))
     out = ws.bash("sleep 5", timeout=1)
-    assert "timeout: command exceeded 1s" in out
+    assert "timed out after 1s" in out
 
 
 def test_sandboxed_bash_raised_timeout_completes(live_root):
@@ -442,7 +442,7 @@ def test_hardened_sandbox_contains_fork_bomb(live_root, monkeypatch):
     out = run_sandboxed(":(){ :|:& };:; wait", live_root, timeout=5)
     elapsed = time.monotonic() - t0
     assert elapsed < 20, f"fork bomb was not contained in time: {elapsed:.1f}s"
-    assert "Resource temporarily unavailable" in out or "timeout: command exceeded" in out, out[-500:]
+    assert "Resource temporarily unavailable" in out or "timed out after" in out, out[-500:]
     time.sleep(1)
     after = len(os.listdir("/proc"))
     assert after < before + 20, "sandboxed processes leaked past the timeout"

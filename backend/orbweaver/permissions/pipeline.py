@@ -9,7 +9,7 @@ from uuid import UUID
 from orbweaver.config import settings
 from orbweaver.permissions.classifier import classify_action
 from orbweaver.permissions.denial import DenialTrackingState, denial_state_for
-from orbweaver.permissions.prompts import DELEGATION_FRAMING
+from orbweaver.permissions.prompts import DELEGATION_FRAMING, MCP_DESTRUCTIVE_FRAMING
 from orbweaver.permissions.rules import (
     SAFE_ALLOWLIST,
     allow_rules,
@@ -260,6 +260,17 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
 
     extra = DELEGATION_FRAMING if name == "SpawnSubagent" else ""
     fast = "handoff" if name == "SpawnSubagent" else "classifier"
+    if name.startswith("mcp_"):
+        from orbweaver.mcp.tools import mcp_tool_annotations
+
+        ann = mcp_tool_annotations(name)
+        if ann is not None:
+            if ann.auto_allow_candidate and settings.orbweaver_mcp_auto_allow_readonly:
+                return PermissionDecision(
+                    "allow", f"MCP tool {ann.server}/{ann.original} is readOnlyHint", "mcp_readonly"
+                )
+            if ann.destructive:
+                extra = MCP_DESTRUCTIVE_FRAMING
     result = await classify_action(
         events, name, inp, workspace=workspace, extra_framing=extra
     )

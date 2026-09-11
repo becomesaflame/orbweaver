@@ -17,6 +17,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from orbweaver.config import settings
+from orbweaver.editmatch import TIER_EXACT, find_replacement, nearest_lines, unified_diff
 from orbweaver.procs import (
     STATUS_INTERRUPTED,
     STATUS_TIMEOUT,
@@ -24,8 +25,16 @@ from orbweaver.procs import (
     communicate_async,
     start_shell,
 )
+from orbweaver.redact import redact_secrets
 from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
-from orbweaver.tooltext import normalize_grep_pattern
+from orbweaver.tooltext import (
+    BASH_OUTPUT_CAP,
+    TRUNCATE_MAX_LINES,
+    format_bash_result,
+    needs_truncation,
+    normalize_grep_pattern,
+    truncate_head_tail,
+)
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
 
 log = logging.getLogger(__name__)
@@ -167,10 +176,10 @@ def _terminate_process(proc: subprocess.Popen) -> None:
             pass
 
 
-def _timeout_message(timeout: int, output: str) -> str:
-    body = (output or "")[-200_000:]
-    prefix = f"timeout: command exceeded {timeout}s"
-    return f"{prefix}\n{body}" if body else prefix
+def _timeout_message(timeout: int, output: str, *, returncode: int | None = None) -> str:
+    return format_bash_result(
+        output, returncode=returncode, elapsed_s=float(timeout), timed_out_after=timeout
+    )
 
 
 @dataclass(frozen=True)
@@ -193,6 +202,7 @@ class _BashJob:
         self.proc = proc
         self.cleanup = cleanup
         self.started_at = time.monotonic()
+        self.finished_at: float | None = None
         self.status = "running"
         self.returncode: int | None = None
         self.output = ""
@@ -206,19 +216,22 @@ class _BashJob:
                 stdout, stderr = self.proc.communicate(timeout=self.timeout)
                 self.status = "exited"
                 self.returncode = self.proc.returncode
-                self.output = (_decode_captured(stdout) + _decode_captured(stderr))[-200_000:]
+                self.output = (_decode_captured(stdout) + _decode_captured(stderr))[-BASH_OUTPUT_CAP:]
             except subprocess.TimeoutExpired:
                 _terminate_process(self.proc)
                 stdout, stderr = self.proc.communicate(timeout=5)
                 self.status = "timeout"
                 self.returncode = self.proc.returncode
                 self.output = _timeout_message(
-                    self.timeout, _decode_captured(stdout) + _decode_captured(stderr)
+                    self.timeout,
+                    _decode_captured(stdout) + _decode_captured(stderr),
+                    returncode=self.returncode,
                 )
         except Exception as e:
             self.status = "error"
             self.output = str(e)
         finally:
+            self.finished_at = time.monotonic()
             if self.cleanup is not None:
                 try:
                     self.cleanup()
@@ -232,7 +245,7 @@ class _BashJob:
     def done(self) -> bool:
         return self._done.is_set()
 
-    def snapshot(self) -> str:
+    def payload(self) -> dict:
         payload: dict = {
             "job_id": self.job_id,
             "status": self.status,
@@ -242,9 +255,14 @@ class _BashJob:
         if self.status == "running":
             payload["elapsed_s"] = round(time.monotonic() - self.started_at, 3)
         else:
+            end = self.finished_at if self.finished_at is not None else time.monotonic()
+            payload["elapsed_s"] = round(end - self.started_at, 3)
             payload["returncode"] = self.returncode
             payload["output"] = self.output
-        return json.dumps(payload)
+        return payload
+
+    def snapshot(self) -> str:
+        return json.dumps(self.payload())
 
 
 class LocalWorkspace:
@@ -299,10 +317,34 @@ class LocalWorkspace:
     def read(self, path: str) -> str:
         return self._resolve(path).read_text(encoding="utf-8")
 
+    def edit_target(self, path: str) -> Path:
+        """Resolved path an edit tool would touch (write-side policy applied)."""
+        return self._resolve(path, write=True)
+
+    def read_target(self, path: str) -> Path:
+        return self._resolve(path)
+
     def write(self, path: str, content: str) -> None:
         p = self._resolve(path, write=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
+
+    def write_with_diff(self, path: str, content: str) -> str:
+        """Write and describe the change: a unified diff for existing files."""
+        p = self._resolve(path, write=True)
+        before: str | None = None
+        if p.is_file():
+            try:
+                before = p.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                before = None
+        self.write(path, content)
+        line_count = len(content.splitlines())
+        if before is None:
+            return f"wrote {path} (new file, {line_count} lines)"
+        if before == content:
+            return f"wrote {path} (unchanged)"
+        return f"wrote {path}\n{unified_diff(before, content, path)}"
 
     def str_replace(
         self, path: str, old: str, new: str, *, replace_all: bool = False
@@ -313,18 +355,25 @@ class LocalWorkspace:
         if not target.is_file():
             return f"error: file not found: {path}"
         current = target.read_text(encoding="utf-8")
-        n = current.count(old)
-        if n == 0:
-            return f"error: old_string not found in {path}"
+        match = find_replacement(current, old, new)
+        if match is None:
+            msg = f"error: old_string not found in {path}"
+            near = nearest_lines(current, old)
+            if near:
+                msg += ". Nearest lines:\n" + "\n".join(near)
+            return msg
+        n = match.count
+        via = "" if match.tier == TIER_EXACT else f" via {match.tier}"
         if n > 1 and not replace_all:
+            where = ", ".join(str(s.line) for s in match.spans[:10])
             return (
-                f"error: old_string matched {n} times in {path}; "
+                f"error: old_string matched {n} times in {path}{via} (lines {where}); "
                 "include more surrounding context for a unique match, or set replace_all true"
             )
-        updated = current.replace(old, new) if replace_all else current.replace(old, new, 1)
+        updated = match.apply(current, replace_all=replace_all)
         target.write_text(updated, encoding="utf-8")
         noun = "occurrence" if n == 1 else "occurrences"
-        return f"updated {path} ({n} {noun})"
+        return f"updated {path} ({n} {noun}{via})\n{unified_diff(current, updated, path)}"
 
     def write_bytes(self, path: str, data: bytes) -> str:
         p = self._resolve(path, write=True)
@@ -480,6 +529,7 @@ class LocalWorkspace:
         return hits
 
     def _raw_bash(self, command: str, timeout: int) -> str:
+        started = time.monotonic()
         try:
             proc = subprocess.run(
                 command,
@@ -492,7 +542,11 @@ class LocalWorkspace:
             )
         except subprocess.TimeoutExpired as e:
             return _timeout_message(timeout, _decode_captured(e.stdout) + _decode_captured(e.stderr))
-        return ((proc.stdout or "") + (proc.stderr or ""))[-200_000:]
+        return format_bash_result(
+            (proc.stdout or "") + (proc.stderr or ""),
+            returncode=proc.returncode,
+            elapsed_s=time.monotonic() - started,
+        )
 
     def _spawn_raw(self, command: str) -> subprocess.Popen:
         return subprocess.Popen(
@@ -508,20 +562,53 @@ class LocalWorkspace:
     async def _raw_bash_async(
         self, command: str, timeout: int, *, cancel: asyncio.Event | None = None
     ) -> str:
+        started = time.monotonic()
         proc = await start_shell(command, self.root)
         out, status = await communicate_async(proc, timeout, cancel=cancel)
         if status == STATUS_INTERRUPTED:
-            raise BashInterrupted(out[-200_000:])
+            raise BashInterrupted(out[-BASH_OUTPUT_CAP:])
         if status == STATUS_TIMEOUT:
-            return _timeout_message(timeout, out)
-        return out[-200_000:]
+            return _timeout_message(timeout, out, returncode=proc.returncode)
+        return format_bash_result(
+            out, returncode=proc.returncode, elapsed_s=time.monotonic() - started
+        )
 
     def collect_job(self, job_id: str, wait_s: float = 0) -> str:
         job = self._jobs.get(job_id)
         if job is None:
             return json.dumps({"job_id": job_id, "status": "unknown", "error": "no such job"})
         job.wait(wait_s)
-        return job.snapshot()
+        payload = job.payload()
+        output = payload.get("output")
+        if isinstance(output, str):
+            payload.update(self._preview_job_output(job_id, output))
+        return json.dumps(payload)
+
+    def _preview_job_output(self, job_id: str, output: str) -> dict:
+        """Head + tail preview of oversized job output; the full text goes to the workspace.
+
+        Leaves room for the JSON envelope so the snapshot itself stays under the
+        persisted-result threshold instead of being persisted a second time as JSON.
+        """
+        text = redact_secrets(output)
+        threshold = int(settings.compact_tool_result_chars)
+        budget = max(1000, threshold * 3 // 4)
+        if not needs_truncation(text, max_chars=budget, max_lines=TRUNCATE_MAX_LINES):
+            return {"output": text}
+        rel: str | None = f".orbweaver/tool-results/{job_id}.txt"
+        try:
+            self.write(str(rel), text)
+        except (OSError, PermissionError):
+            rel = None
+        fields: dict = {
+            "output": truncate_head_tail(
+                text, max_chars=budget, max_lines=TRUNCATE_MAX_LINES, path=rel
+            ),
+            "output_chars": len(text),
+        }
+        if rel:
+            fields["persisted_path"] = rel
+        return fields
 
     async def collect_job_async(
         self, job_id: str, wait_s: float = 0, *, cancel: asyncio.Event | None = None

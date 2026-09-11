@@ -140,14 +140,24 @@ def test_tool_metadata_marks_read_only_tools_safe():
 
 
 def test_mcp_tools_are_unsafe_unless_read_only_hint(monkeypatch):
-    monkeypatch.setitem(mcp_tools._tool_read_only, "mcp_srv_list", True)
-    monkeypatch.setitem(mcp_tools._tool_read_only, "mcp_srv_write", False)
+    def registered(read_only: bool, destructive: bool = False):
+        return mcp_tools._Registered(
+            "srv",
+            "orig",
+            mcp_tools.KIND_TOOL,
+            mcp_tools.McpToolAnnotations(read_only=read_only, destructive=destructive),
+        )
+
+    monkeypatch.setitem(mcp_tools._tool_index, "mcp_srv_list", registered(True))
+    monkeypatch.setitem(mcp_tools._tool_index, "mcp_srv_write", registered(False))
+    monkeypatch.setitem(mcp_tools._tool_index, "mcp_srv_purge", registered(True, destructive=True))
     assert tool_meta("mcp_srv_list").concurrency_safe is True
     assert tool_meta("mcp_srv_write").concurrency_safe is False
+    assert tool_meta("mcp_srv_purge").concurrency_safe is False
     assert tool_meta("mcp_srv_unlisted").concurrency_safe is False
-    assert mcp_tools.tool_annotation_read_only({"annotations": {"readOnlyHint": True}})
-    assert not mcp_tools.tool_annotation_read_only({"annotations": {"readOnlyHint": "yes"}})
-    assert not mcp_tools.tool_annotation_read_only({"name": "x"})
+    assert mcp_tools._parse_annotations({"annotations": {"readOnlyHint": True}}, "s", "t").read_only
+    assert not mcp_tools._parse_annotations({"annotations": {"readOnlyHint": "yes"}}, "s", "t").read_only
+    assert not mcp_tools._parse_annotations({"name": "x"}, "s", "t").read_only
 
 
 def test_partition_groups_safe_runs_and_isolates_unsafe_calls():

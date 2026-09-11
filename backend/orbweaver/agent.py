@@ -14,8 +14,10 @@ from typing import Any, cast
 from uuid import UUID
 
 from orbweaver import __version__
+from orbweaver.checkpoints import checkpoint_user_turn, pin_user_turn
 from orbweaver.compact import (
     CONTEXT_FULL_MESSAGE,
+    PROJECT_INSTRUCTIONS_KIND,
     ContextFullError,
     ensure_tool_use_results,
     events_to_messages,
@@ -23,9 +25,8 @@ from orbweaver.compact import (
     maybe_compact,
     persist_tool_result,
     prompt_events,
-    record_usage,
+    record_response_usage,
     rehydrate_messages,
-    usage_input_tokens,
 )
 from orbweaver.compact.overflow import (
     OVERFLOW_KEEP_ROUNDS,
@@ -34,7 +35,13 @@ from orbweaver.compact.overflow import (
 )
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
+from orbweaver.instructions import instruction_blocks_for_call, seen_instruction_keys
 from orbweaver.lints import read_lints
+from orbweaver.llm import (
+    prompt_cache_supported,
+    with_message_cache_breakpoint,
+    with_tool_cache_breakpoint,
+)
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import (
     PermissionDecision,
@@ -50,8 +57,10 @@ from orbweaver.permissions.session_rules import (
     session_rules_from,
 )
 from orbweaver.procs import BashInterrupted
+from orbweaver.readstate import ReadState, read_state_for
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
+from orbweaver.stuck import NUDGE_KIND, StuckDetector
 from orbweaver.todos import inject_session_todos, persist_todos
 from orbweaver.tools import partition_tool_calls
 from orbweaver.tooltext import format_read
@@ -96,7 +105,11 @@ TOOL_SPEC = [
             "Relative paths are the session workspace. Absolute paths in extra sandbox "
             "roots are auto-allowed; other host paths are classified. Use offset "
             "(1-based line, or negative from the end) and limit to page text; do not "
-            "page files with Bash. The result says how to continue when truncated."
+            "page files with Bash. Default limit is 400 lines: Grep (or one wide Read) "
+            "to find a symbol; do not take tiny windows, and do not re-Read a path "
+            "already in this turn unless its result was truncated or cleared. Once you "
+            "have the numbered lines, edit with StrReplace. The result says how to "
+            "continue when truncated."
         ),
         "input_schema": {
             "type": "object",
@@ -113,7 +126,13 @@ TOOL_SPEC = [
     },
     {
         "name": "Write",
-        "description": "Write a file in the session workspace.",
+        "description": (
+            "Write a file in the session workspace. Overwriting an existing file "
+            "requires that you Read it earlier this session and that it has not "
+            "changed on disk since; otherwise the call is refused and you must Read "
+            "first. New files skip that check. The result is a unified diff for "
+            "existing files. Prefer StrReplace for partial edits."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
@@ -124,10 +143,16 @@ TOOL_SPEC = [
         "name": "StrReplace",
         "description": (
             "Edit an existing workspace file by replacing old_string with new_string. "
-            "old_string must match exactly once unless replace_all is true. Prefer this "
-            "over Write for existing files and over Bash (python, sed, perl) for source "
-            "edits. To resolve a git conflict, replace the entire hunk including "
-            "<<<<<<< / ======= / >>>>>>> marker lines with the resolved text."
+            "Read the file first: edits to a file you have not Read this session, or "
+            "that changed on disk since you read it, are refused. old_string must "
+            "match exactly once unless replace_all is true. When no exact match exists "
+            "the tool retries with line-number prefixes stripped, then a per-line "
+            "whitespace-trimmed match (the file's indentation is kept), then a "
+            "first/last-line anchor for blocks of 3+ lines; the result says which tier "
+            "matched and shows a unified diff. Prefer this over Write for existing "
+            "files and over Bash (python, sed, perl) for source edits. To resolve a git "
+            "conflict, replace the entire hunk including <<<<<<< / ======= / >>>>>>> "
+            "marker lines with the resolved text."
         ),
         "input_schema": {
             "type": "object",
@@ -147,7 +172,8 @@ TOOL_SPEC = [
         "name": "NotebookEdit",
         "description": (
             "Edit one cell in a .ipynb notebook. Do not Write the whole notebook JSON. "
-            "action is replace (default), insert, or delete. replace can set source or "
+            "Read the notebook first this session or the edit is refused. action is "
+            "replace (default), insert, or delete. replace can set source or "
             "search-replace with old_string/new_string."
         ),
         "input_schema": {
@@ -173,7 +199,8 @@ TOOL_SPEC = [
         "description": (
             "Delete a file or directory in the session working set. Same deny/ask rules as "
             "Write: always-deny secrets (.env, keys), and paths outside the working set are "
-            "blocked. Prefer this over Bash rm."
+            "blocked. Deleting a file requires that you Read it this session. Prefer this "
+            "over Bash rm."
         ),
         "input_schema": {
             "type": "object",
@@ -248,6 +275,28 @@ TOOL_SPEC = [
         },
     },
     {
+        "name": "Skill",
+        "description": (
+            "Load a workspace skill (SKILL.md) or an on-demand rule by name. The system "
+            "prompt lists available skills and description-only rules as name: description; "
+            "call this to read the full body before following one. kind is skill (default) "
+            "or rule."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill or rule name from the list."},
+                "kind": {
+                    "type": "string",
+                    "enum": ["skill", "rule"],
+                    "description": "skill loads SKILL.md (default); rule loads a .cursor/rules "
+                    "or .orbweaver/rules entry that is not always-on.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
         "name": "Bash",
         "description": (
             "Run a shell command in the workspace. Default timeout is 30 seconds if unspecified; "
@@ -260,9 +309,11 @@ TOOL_SPEC = [
             "escalation. If the sandbox blocks the command, ask the user before setting "
             "permissions to [\"full_network\"] (arbitrary internet) or [\"all\"] "
             "(host writes/docker/sudo). Those overrides pause for approval. "
-            "unsandboxed true aliases [\"all\"]. Git commands get an automatic "
-            "status footer (branch, HEAD, rebase-in-progress); trust that over "
-            "success substrings in the command output."
+            "unsandboxed true aliases [\"all\"]. Every result starts with a header line "
+            "(`exit <code> in <seconds>s`, or `timed out after Ns`); trust it over success "
+            "substrings in the output. Oversized output is saved under "
+            ".orbweaver/tool-results/ and shown as head + tail around an omission marker. "
+            "Git commands get an automatic status footer (branch, HEAD, rebase-in-progress)."
         ),
         "input_schema": {
             "type": "object",
@@ -731,7 +782,9 @@ def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dic
 def static_system(channel: str = "") -> str:
     write_line = (
         "In auto mode, in-project Write and StrReplace apply immediately. "
-        "Prefer StrReplace for existing files. "
+        "Prefer StrReplace for existing files. Read a file before you edit it: "
+        "Write, StrReplace, NotebookEdit and Delete refuse existing files you have "
+        "not Read this session or that changed since. "
     )
     if channel_allows_proposepatch(channel):
         write_line += "Prefer ProposePatch when a visible diff overlay helps the user. "
@@ -755,6 +808,11 @@ def static_system(channel: str = "") -> str:
         "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
         "Configured MCP servers appear as mcp_<server>_<tool> and use the "
         "same permission pipeline as other tools. "
+        "Project instructions: the workspace section below holds always-on rules; "
+        "skills and on-demand rules are listed by name, so call Skill(name) before "
+        "following one. Nested AGENTS.md / CLAUDE.md / .cursor/rules for a directory "
+        "arrive as <project-instructions dir=...> blocks after you touch a path under it; "
+        "follow them for work in that directory. "
         "Git: after clone, fetch, rebase, merge, commit, or push, read Git's state — "
         "the Bash footer 'git ritual' (status, branch, HEAD) is authoritative, not a "
         "success substring like 'Everything up-to-date'. Identify the repo (cd target "
@@ -788,6 +846,21 @@ def build_agent_system(
         {"type": "text", "text": static_system(channel), "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": rest},
     ]
+
+
+def _nested_instructions_for(
+    workspace, name: str, inp: dict[str, Any], ctx: dict[str, Any]
+) -> list[str]:
+    """Nested AGENTS.md / CLAUDE.md / .cursor/rules blocks for paths this call touched."""
+    root = getattr(workspace, "root", None)
+    if root is None:
+        return []
+    seen = ctx.setdefault("instructions_seen", set())
+    try:
+        return instruction_blocks_for_call(Path(root), name, inp, seen)
+    except Exception as e:  # discovery must never break the tool round
+        log.warning("nested instruction discovery failed for %s: %s", name, e)
+        return []
 
 
 def _blocked_tool_result(decision) -> str:
@@ -952,6 +1025,55 @@ def _ask_user_headless_abort(question: str) -> TurnAborted:
     )
 
 
+def _read_state(ctx: dict[str, Any], ws: Any) -> ReadState | None:
+    """Session ReadState (seeded from events once); None when tracking is off."""
+    if not settings.edit_require_read or not hasattr(ws, "edit_target"):
+        return None
+    state = ctx.get("read_state")
+    if not isinstance(state, ReadState):
+        state = read_state_for(ctx["session_id"])
+        ctx["read_state"] = state
+    state.seed(ctx.get("events"), ws.read_target)
+    return state
+
+
+def _edit_guard(ctx: dict[str, Any], ws: Any, path: str) -> str | None:
+    """Error text when ``path`` exists but was not Read this session or changed since."""
+    state = _read_state(ctx, ws)
+    if state is None:
+        return None
+    try:
+        target = ws.edit_target(path)
+    except PermissionError:
+        return None  # the tool itself reports the policy error
+    problem = state.check(target, path)
+    return f"error: {problem}" if problem else None
+
+
+def _note_edit(ctx: dict[str, Any], ws: Any, path: str, *, deleted: bool = False) -> None:
+    state = _read_state(ctx, ws)
+    if state is None:
+        return
+    try:
+        target = ws.edit_target(path)
+    except PermissionError:
+        return
+    if deleted:
+        state.forget(target)
+    else:
+        state.record(target)
+
+
+def _note_read(ctx: dict[str, Any], ws: Any, path: str) -> None:
+    state = _read_state(ctx, ws)
+    if state is None:
+        return
+    try:
+        state.record(ws.read_target(path))
+    except PermissionError:
+        return
+
+
 class ToolInterrupted(Exception):
     """A running tool was killed because the user stopped the turn."""
 
@@ -987,30 +1109,60 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             raw = await asyncio.to_thread(ws.read, path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
+        _note_read(ctx, ws, path)
         return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
-        await asyncio.to_thread(ws.write, inp["path"], inp["content"])
-        return f"wrote {inp['path']}"
+        path = str(inp.get("path") or "")
+        refused = _edit_guard(ctx, ws, path)
+        if refused:
+            return refused
+        if hasattr(ws, "write_with_diff"):
+            result = await asyncio.to_thread(ws.write_with_diff, path, inp["content"])
+        else:
+            await asyncio.to_thread(ws.write, path, inp["content"])
+            result = f"wrote {path}"
+        _note_edit(ctx, ws, path)
+        return result
     if name == "StrReplace":
+        path = str(inp.get("path") or "")
         try:
-            return await asyncio.to_thread(
+            refused = _edit_guard(ctx, ws, path)
+            if refused:
+                return refused
+            result = await asyncio.to_thread(
                 ws.str_replace,
-                str(inp.get("path") or ""),
+                path,
                 str(inp.get("old_string") or ""),
                 str(inp.get("new_string") if inp.get("new_string") is not None else ""),
                 replace_all=bool(inp.get("replace_all")),
             )
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error replacing in {inp.get('path')}: {e}"
+        if result.startswith("updated"):
+            _note_edit(ctx, ws, path)
+        return result
     if name == "NotebookEdit":
         from orbweaver.notebook import apply_notebook_edit
 
-        return await asyncio.to_thread(apply_notebook_edit, ws, inp)
+        path = str(inp.get("path") or "")
+        refused = _edit_guard(ctx, ws, path)
+        if refused:
+            return refused
+        result = await asyncio.to_thread(apply_notebook_edit, ws, inp)
+        if not result.startswith("error"):
+            _note_edit(ctx, ws, path)
+        return result
     if name == "Delete":
+        path = str(inp.get("path") or "")
         try:
-            return await asyncio.to_thread(ws.delete, inp["path"])
+            refused = _edit_guard(ctx, ws, path)
+            if refused:
+                return refused
+            result = await asyncio.to_thread(ws.delete, path)
         except (OSError, PermissionError) as e:
             return f"error deleting {inp.get('path')}: {e}"
+        _note_edit(ctx, ws, path, deleted=True)
+        return result
     if name == "ProposePatch":
         result = await asyncio.to_thread(
             ws.propose_patch, inp["path"], inp.get("old_string") or "", inp["new_string"]
@@ -1040,6 +1192,18 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             return str(e)
     if name == "ReadLints":
         return await asyncio.to_thread(read_lints, ws, inp, ctx.get("events"))
+    if name == "Skill":
+        from orbweaver.instructions import load_skill_or_rule
+
+        root = getattr(ws, "root", None)
+        if root is None:
+            return "error: this workspace has no local root for skills"
+        return await asyncio.to_thread(
+            load_skill_or_rule,
+            Path(root),
+            str(inp.get("name") or ""),
+            str(inp.get("kind") or "skill"),
+        )
     if name == "Bash":
         from orbweaver.git_ritual import annotate_bash_output, ritual_says_not_done
         from orbweaver.permissions.pipeline import bash_permissions
@@ -1304,13 +1468,21 @@ async def _create_with_overflow_retry(
         if nudge:
             _nudge_user(messages, nudge)
         messages = ensure_tool_use_results(messages)
+        send_tools = tools
+        if prompt_cache_supported(client):
+            # Breakpoints: static system block (build_agent_system), the tools
+            # array when large, and the final user block. Each round appends
+            # tool results after the previous breakpoint, so the prefix is a
+            # cache read. Only Anthropic sees these; the Ollama shim drops them.
+            messages = with_message_cache_breakpoint(messages)
+            send_tools = with_tool_cache_breakpoint(tools)
         try:
             return await _await_or_cancel(
                 client.messages.create(
                     model=model,
                     max_tokens=4096,
                     system=cast(Any, system),
-                    tools=cast(Any, tools),
+                    tools=cast(Any, send_tools),
                     messages=cast(Any, messages),
                 ),
                 cancel,
@@ -1434,7 +1606,16 @@ async def agent_turn(
             payload["ask_answer"] = True
         if images:
             payload["images"] = images
+        checkpoint: dict[str, Any] | None = None
+        if subagent_depth == 0:
+            checkpoint = await asyncio.to_thread(checkpoint_user_turn, workspace)
+            if checkpoint is not None:
+                payload["checkpoint"] = checkpoint
         user_ev = await store.append_event(session_id, "user", payload)
+        if checkpoint is not None:
+            await asyncio.to_thread(
+                pin_user_turn, workspace, checkpoint, session_id, user_ev.seq
+            )
         if turn_state is not None:
             turn_state.user_seq = user_ev.seq
         if emit:
@@ -1464,6 +1645,27 @@ async def agent_turn(
         payload.setdefault("text", exc.message)
         fire(await store.append_event(session_id, "turn_aborted", payload))
         fire(await store.append_event(session_id, "assistant", {"text": exc.message}))
+
+    stuck_detector = StuckDetector()
+
+    async def check_stuck() -> None:
+        """Nudge once per loop streak; raise TurnAborted when the streak outlives the nudge."""
+        verdict = stuck_detector.check(await store.list_events(session_id))
+        if verdict is None:
+            return
+        if verdict.action == "abort":
+            log.warning(
+                "stuck: %s loop on %s x%d, ending turn", verdict.pattern, verdict.tool, verdict.count
+            )
+            raise TurnAborted(verdict.text, verdict.abort_payload())
+        log.info("stuck: %s loop on %s x%d, nudging", verdict.pattern, verdict.tool, verdict.count)
+        fire(await store.append_event(session_id, NUDGE_KIND, verdict.nudge_payload()))
+        # Same kind as injected follow-ups so events_to_messages renders it as a user turn.
+        fire(
+            await store.append_event(
+                session_id, "user", {"text": verdict.text, NUDGE_KIND: True}
+            )
+        )
 
     if answering and pending is not None:
         uid = str((pending.payload or {}).get("id") or pending.id)
@@ -1510,6 +1712,9 @@ async def agent_turn(
         "subagent_depth": subagent_depth,
         "channel": resolved_channel,
         "session_rules": session_rules_from(sess.jsonld if sess else None),
+        # Per-turn cache of nested instruction dirs / glob rules already injected. Seeded
+        # from blocks still in the live prompt window so a later turn does not repeat them.
+        "instructions_seen": seen_instruction_keys(live_events(prior)),
         # Background subagents spawned by this turn (str child id -> ChildRun).
         "children": {},
     }
@@ -1749,7 +1954,7 @@ async def agent_turn(
             events = await store.list_events(session_id)
             ctx["events"] = events
             last_seq = events[-1].seq if events else 0
-            record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
+            record_response_usage(session_id, getattr(resp, "usage", None), last_seq)
             tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
             if texts:
@@ -1769,6 +1974,7 @@ async def agent_turn(
             stop_after_ask = False
             approval_timed_out = False
             waiting_ask = False
+            instruction_blocks: list[str] = []
             # #99: consecutive concurrency-safe calls (Read, Grep, ...) form one
             # batch and run together; every unsafe call is a batch of one and a
             # barrier. tool_call events for a batch are recorded up front and
@@ -1858,6 +2064,10 @@ async def agent_turn(
                         if outcome.approval != "cancelled":
                             check()
                         await record_result(block, outcome)
+                        if outcome.executed:
+                            instruction_blocks.extend(
+                                _nested_instructions_for(workspace, block.name, dict(block.input), ctx)
+                            )
                         if outcome.approval == "cancelled":
                             # The is_error result is on record; now stop like any other cancel.
                             check()
@@ -1880,11 +2090,28 @@ async def agent_turn(
                 for block, decision, got in zip(batch, decisions, outcomes, strict=True):
                     if isinstance(got, BaseException):
                         raise got
+                    if got.executed:
+                        instruction_blocks.extend(
+                            _nested_instructions_for(workspace, block.name, dict(block.input), ctx)
+                        )
                     if decision.behavior == "ask":
                         # The pipeline aborts headless asks before this; an ask that
                         # could not be held for a human ends the turn unexecuted.
                         stop_after_ask = True
                     await record_result(block, got)
+            if instruction_blocks:
+                # User-side message for the next round (rendered after the tool results),
+                # same path as injected follow-ups: persisted event, projected into the prompt.
+                fire(
+                    await store.append_event(
+                        session_id,
+                        PROJECT_INSTRUCTIONS_KIND,
+                        {
+                            "text": "\n\n".join(instruction_blocks),
+                            "keys": sorted(ctx["instructions_seen"]),
+                        },
+                    )
+                )
             if waiting_ask:
                 break
             if approval_timed_out:
@@ -1908,6 +2135,7 @@ async def agent_turn(
                     )
                 )
                 break
+            await check_stuck()
             await maybe_compact(
                 store, session_id, client=client, workspace=workspace, system=system
             )
@@ -1937,7 +2165,7 @@ async def agent_turn(
                 return produced
             events = await store.list_events(session_id)
             last_seq = events[-1].seq if events else 0
-            record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
+            record_response_usage(session_id, getattr(resp, "usage", None), last_seq)
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
             if texts:
                 fire(
