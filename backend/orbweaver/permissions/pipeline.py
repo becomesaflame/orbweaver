@@ -9,7 +9,7 @@ from uuid import UUID
 from orbweaver.config import settings
 from orbweaver.permissions.classifier import classify_action
 from orbweaver.permissions.denial import DenialTrackingState, denial_state_for
-from orbweaver.permissions.prompts import DELEGATION_FRAMING
+from orbweaver.permissions.prompts import DELEGATION_FRAMING, MCP_DESTRUCTIVE_FRAMING
 from orbweaver.permissions.rules import (
     SAFE_ALLOWLIST,
     allow_rules,
@@ -23,6 +23,7 @@ from orbweaver.permissions.rules import (
     path_is_always_denied,
     write_is_always_denied,
 )
+from orbweaver.permissions.session_rules import matching_session_rule
 from orbweaver.sandbox.bwrap import sandbox_available
 from orbweaver.store import Event
 
@@ -143,7 +144,9 @@ def bash_sandboxable(inp: dict[str, Any], workspace_kind: str) -> bool:
 async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> PermissionDecision:
     workspace = ctx.get("workspace")
     workspace_kind = str(ctx.get("workspace_kind") or "local")
-    headless = bool(ctx.get("headless"))
+    # `ask` can only be held for a human who can answer: web, or Telegram (which runs
+    # headless=True but interactive=True). Cron and subagents abort instead.
+    headless = bool(ctx.get("headless")) and not bool(ctx.get("interactive"))
     events: list[Event] = ctx.get("events") or []
     mode = (settings.orbweaver_permission_mode or "auto").strip().lower()
 
@@ -247,8 +250,27 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
             "sandbox",
         )
 
+    session_hit = matching_session_rule(ctx.get("session_rules"), name, inp)
+    if session_hit:
+        return PermissionDecision(
+            "allow",
+            f"session rule {name}({session_hit.get('subject') or '*'})",
+            "session_rule",
+        )
+
     extra = DELEGATION_FRAMING if name == "SpawnSubagent" else ""
     fast = "handoff" if name == "SpawnSubagent" else "classifier"
+    if name.startswith("mcp_"):
+        from orbweaver.mcp.tools import mcp_tool_annotations
+
+        ann = mcp_tool_annotations(name)
+        if ann is not None:
+            if ann.auto_allow_candidate and settings.orbweaver_mcp_auto_allow_readonly:
+                return PermissionDecision(
+                    "allow", f"MCP tool {ann.server}/{ann.original} is readOnlyHint", "mcp_readonly"
+                )
+            if ann.destructive:
+                extra = MCP_DESTRUCTIVE_FRAMING
     result = await classify_action(
         events, name, inp, workspace=workspace, extra_framing=extra
     )

@@ -14,15 +14,19 @@ from typing import Any, cast
 from uuid import UUID
 
 from orbweaver import __version__
+from orbweaver.checkpoints import checkpoint_user_turn, pin_user_turn
 from orbweaver.compact import (
     CONTEXT_FULL_MESSAGE,
+    PROJECT_INSTRUCTIONS_KIND,
     ContextFullError,
     ensure_tool_use_results,
     events_to_messages,
     live_events,
     maybe_compact,
     persist_tool_result,
+    probe_stats,
     prompt_events,
+    record_probe_usage,
     record_response_usage,
     rehydrate_messages,
 )
@@ -33,6 +37,7 @@ from orbweaver.compact.overflow import (
 )
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
+from orbweaver.instructions import instruction_blocks_for_call, seen_instruction_keys
 from orbweaver.lints import read_lints
 from orbweaver.llm import (
     prompt_cache_supported,
@@ -46,8 +51,21 @@ from orbweaver.permissions import (
     can_use_tool,
     denial_state_for,
 )
-from orbweaver.permissions.injection_probe import probe_tool_output
+from orbweaver.permissions.injection_probe import (
+    ProbeItem,
+    await_round_probes,
+    probe_tool_output,
+    should_probe,
+    start_round_probes,
+)
+from orbweaver.permissions.pipeline import summarize_input
+from orbweaver.permissions.session_rules import (
+    add_session_rule,
+    make_session_rule,
+    session_rules_from,
+)
 from orbweaver.procs import BashInterrupted
+from orbweaver.readstate import ReadState, read_state_for
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.stuck import NUDGE_KIND, StuckDetector
@@ -116,7 +134,13 @@ TOOL_SPEC = [
     },
     {
         "name": "Write",
-        "description": "Write a file in the session workspace.",
+        "description": (
+            "Write a file in the session workspace. Overwriting an existing file "
+            "requires that you Read it earlier this session and that it has not "
+            "changed on disk since; otherwise the call is refused and you must Read "
+            "first. New files skip that check. The result is a unified diff for "
+            "existing files. Prefer StrReplace for partial edits."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
@@ -127,10 +151,16 @@ TOOL_SPEC = [
         "name": "StrReplace",
         "description": (
             "Edit an existing workspace file by replacing old_string with new_string. "
-            "old_string must match exactly once unless replace_all is true. Prefer this "
-            "over Write for existing files and over Bash (python, sed, perl) for source "
-            "edits. To resolve a git conflict, replace the entire hunk including "
-            "<<<<<<< / ======= / >>>>>>> marker lines with the resolved text."
+            "Read the file first: edits to a file you have not Read this session, or "
+            "that changed on disk since you read it, are refused. old_string must "
+            "match exactly once unless replace_all is true. When no exact match exists "
+            "the tool retries with line-number prefixes stripped, then a per-line "
+            "whitespace-trimmed match (the file's indentation is kept), then a "
+            "first/last-line anchor for blocks of 3+ lines; the result says which tier "
+            "matched and shows a unified diff. Prefer this over Write for existing "
+            "files and over Bash (python, sed, perl) for source edits. To resolve a git "
+            "conflict, replace the entire hunk including <<<<<<< / ======= / >>>>>>> "
+            "marker lines with the resolved text."
         ),
         "input_schema": {
             "type": "object",
@@ -150,7 +180,8 @@ TOOL_SPEC = [
         "name": "NotebookEdit",
         "description": (
             "Edit one cell in a .ipynb notebook. Do not Write the whole notebook JSON. "
-            "action is replace (default), insert, or delete. replace can set source or "
+            "Read the notebook first this session or the edit is refused. action is "
+            "replace (default), insert, or delete. replace can set source or "
             "search-replace with old_string/new_string."
         ),
         "input_schema": {
@@ -176,7 +207,8 @@ TOOL_SPEC = [
         "description": (
             "Delete a file or directory in the session working set. Same deny/ask rules as "
             "Write: always-deny secrets (.env, keys), and paths outside the working set are "
-            "blocked. Prefer this over Bash rm."
+            "blocked. Deleting a file requires that you Read it this session. Prefer this "
+            "over Bash rm."
         ),
         "input_schema": {
             "type": "object",
@@ -248,6 +280,28 @@ TOOL_SPEC = [
                     "description": "Workspace paths to check. Empty uses recently edited files.",
                 }
             },
+        },
+    },
+    {
+        "name": "Skill",
+        "description": (
+            "Load a workspace skill (SKILL.md) or an on-demand rule by name. The system "
+            "prompt lists available skills and description-only rules as name: description; "
+            "call this to read the full body before following one. kind is skill (default) "
+            "or rule."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill or rule name from the list."},
+                "kind": {
+                    "type": "string",
+                    "enum": ["skill", "rule"],
+                    "description": "skill loads SKILL.md (default); rule loads a .cursor/rules "
+                    "or .orbweaver/rules entry that is not always-on.",
+                },
+            },
+            "required": ["name"],
         },
     },
     {
@@ -736,7 +790,9 @@ def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dic
 def static_system(channel: str = "") -> str:
     write_line = (
         "In auto mode, in-project Write and StrReplace apply immediately. "
-        "Prefer StrReplace for existing files. "
+        "Prefer StrReplace for existing files. Read a file before you edit it: "
+        "Write, StrReplace, NotebookEdit and Delete refuse existing files you have "
+        "not Read this session or that changed since. "
     )
     if channel_allows_proposepatch(channel):
         write_line += "Prefer ProposePatch when a visible diff overlay helps the user. "
@@ -760,6 +816,11 @@ def static_system(channel: str = "") -> str:
         "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
         "Configured MCP servers appear as mcp_<server>_<tool> and use the "
         "same permission pipeline as other tools. "
+        "Project instructions: the workspace section below holds always-on rules; "
+        "skills and on-demand rules are listed by name, so call Skill(name) before "
+        "following one. Nested AGENTS.md / CLAUDE.md / .cursor/rules for a directory "
+        "arrive as <project-instructions dir=...> blocks after you touch a path under it; "
+        "follow them for work in that directory. "
         "Git: after clone, fetch, rebase, merge, commit, or push, read Git's state — "
         "the Bash footer 'git ritual' (status, branch, HEAD) is authoritative, not a "
         "success substring like 'Everything up-to-date'. Identify the repo (cd target "
@@ -795,6 +856,21 @@ def build_agent_system(
     ]
 
 
+def _nested_instructions_for(
+    workspace, name: str, inp: dict[str, Any], ctx: dict[str, Any]
+) -> list[str]:
+    """Nested AGENTS.md / CLAUDE.md / .cursor/rules blocks for paths this call touched."""
+    root = getattr(workspace, "root", None)
+    if root is None:
+        return []
+    seen = ctx.setdefault("instructions_seen", set())
+    try:
+        return instruction_blocks_for_call(Path(root), name, inp, seen)
+    except Exception as e:  # discovery must never break the tool round
+        log.warning("nested instruction discovery failed for %s: %s", name, e)
+        return []
+
+
 def _blocked_tool_result(decision) -> str:
     if decision.behavior == "ask":
         return (
@@ -805,6 +881,114 @@ def _blocked_tool_result(decision) -> str:
         f"Blocked by permission gate ({decision.fast_path}): {decision.reason}. "
         "Treat this boundary in good faith. Find a safer path; do not route around the block."
     )
+
+
+APPROVAL_DECISIONS = frozenset({"allow", "deny"})
+APPROVAL_SCOPES = frozenset({"once", "session"})
+APPROVAL_TIMEOUT_NOTICE = (
+    "The approval request timed out and the action was not executed. "
+    "Reply to continue."
+)
+
+
+def _denied_tool_result(reason: str) -> str:
+    return (
+        f"Denied by user. This action needed approval ({reason}) and the user declined. "
+        "Do not retry the same action; adapt or ask what they want instead."
+    )
+
+
+def _approval_timeout_result(reason: str, timeout: float) -> str:
+    return (
+        f"Not executed: no approval decision within {timeout:g}s "
+        f"(needed approval: {reason})."
+    )
+
+
+def _approval_cancelled_result(reason: str) -> str:
+    return f"Not executed: the turn was cancelled while waiting for approval ({reason})."
+
+
+@dataclass
+class PendingApproval:
+    """A held tool call waiting for the user's allow / deny."""
+
+    session_id: UUID
+    tool_use_id: str
+    name: str
+    input: dict[str, Any]
+    reason: str
+    future: asyncio.Future[tuple[str, str]]
+
+
+# session_id -> tool_use_id -> pending approval. One turn runs per session, so the
+# session is the natural key for the HTTP/WS/Telegram decision transports.
+_pending_approvals: dict[UUID, dict[str, PendingApproval]] = {}
+
+
+def pending_approvals(session_id: UUID) -> list[PendingApproval]:
+    return [p for p in _pending_approvals.get(session_id, {}).values() if not p.future.done()]
+
+
+def resolve_approval(
+    session_id: UUID, tool_use_id: str, decision: str, scope: str = "once"
+) -> bool:
+    """Deliver a decision to a held tool call. False when nothing is waiting for it."""
+    decision = str(decision or "").strip().lower()
+    scope = str(scope or "once").strip().lower() or "once"
+    if decision not in APPROVAL_DECISIONS:
+        raise ValueError(f"decision must be one of {sorted(APPROVAL_DECISIONS)}")
+    if scope not in APPROVAL_SCOPES:
+        raise ValueError(f"scope must be one of {sorted(APPROVAL_SCOPES)}")
+    pend = _pending_approvals.get(session_id, {}).get(str(tool_use_id))
+    if pend is None or pend.future.done():
+        return False
+    pend.future.set_result((decision, scope))
+    return True
+
+
+def reset_pending_approvals_for_tests() -> None:
+    _pending_approvals.clear()
+
+
+def _register_approval(pend: PendingApproval) -> None:
+    _pending_approvals.setdefault(pend.session_id, {})[pend.tool_use_id] = pend
+
+
+def _unregister_approval(pend: PendingApproval) -> None:
+    bucket = _pending_approvals.get(pend.session_id)
+    if bucket is None:
+        return
+    bucket.pop(pend.tool_use_id, None)
+    if not bucket:
+        _pending_approvals.pop(pend.session_id, None)
+
+
+async def _wait_for_approval(
+    pend: PendingApproval,
+    cancel: asyncio.Event | None,
+    timeout: float,
+) -> tuple[str, str] | None:
+    """(decision, scope) once the user answers; None on timeout or cancel."""
+    watchers: set[asyncio.Future[Any]] = {pend.future}
+    cancel_task: asyncio.Task[Any] | None = None
+    if cancel is not None:
+        if cancel.is_set():
+            return None
+        cancel_task = asyncio.create_task(cancel.wait())
+        watchers.add(cancel_task)
+    try:
+        done, _pending = await asyncio.wait(
+            watchers, timeout=max(0.0, timeout), return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        if cancel_task is not None:
+            cancel_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cancel_task
+    if pend.future in done:
+        return pend.future.result()
+    return None
 
 
 def can_wait_for_user(ctx: dict[str, Any]) -> bool:
@@ -849,6 +1033,55 @@ def _ask_user_headless_abort(question: str) -> TurnAborted:
     )
 
 
+def _read_state(ctx: dict[str, Any], ws: Any) -> ReadState | None:
+    """Session ReadState (seeded from events once); None when tracking is off."""
+    if not settings.edit_require_read or not hasattr(ws, "edit_target"):
+        return None
+    state = ctx.get("read_state")
+    if not isinstance(state, ReadState):
+        state = read_state_for(ctx["session_id"])
+        ctx["read_state"] = state
+    state.seed(ctx.get("events"), ws.read_target)
+    return state
+
+
+def _edit_guard(ctx: dict[str, Any], ws: Any, path: str) -> str | None:
+    """Error text when ``path`` exists but was not Read this session or changed since."""
+    state = _read_state(ctx, ws)
+    if state is None:
+        return None
+    try:
+        target = ws.edit_target(path)
+    except PermissionError:
+        return None  # the tool itself reports the policy error
+    problem = state.check(target, path)
+    return f"error: {problem}" if problem else None
+
+
+def _note_edit(ctx: dict[str, Any], ws: Any, path: str, *, deleted: bool = False) -> None:
+    state = _read_state(ctx, ws)
+    if state is None:
+        return
+    try:
+        target = ws.edit_target(path)
+    except PermissionError:
+        return
+    if deleted:
+        state.forget(target)
+    else:
+        state.record(target)
+
+
+def _note_read(ctx: dict[str, Any], ws: Any, path: str) -> None:
+    state = _read_state(ctx, ws)
+    if state is None:
+        return
+    try:
+        state.record(ws.read_target(path))
+    except PermissionError:
+        return
+
+
 class ToolInterrupted(Exception):
     """A running tool was killed because the user stopped the turn."""
 
@@ -884,30 +1117,60 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             raw = await asyncio.to_thread(ws.read, path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
+        _note_read(ctx, ws, path)
         return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
-        await asyncio.to_thread(ws.write, inp["path"], inp["content"])
-        return f"wrote {inp['path']}"
+        path = str(inp.get("path") or "")
+        refused = _edit_guard(ctx, ws, path)
+        if refused:
+            return refused
+        if hasattr(ws, "write_with_diff"):
+            result = await asyncio.to_thread(ws.write_with_diff, path, inp["content"])
+        else:
+            await asyncio.to_thread(ws.write, path, inp["content"])
+            result = f"wrote {path}"
+        _note_edit(ctx, ws, path)
+        return result
     if name == "StrReplace":
+        path = str(inp.get("path") or "")
         try:
-            return await asyncio.to_thread(
+            refused = _edit_guard(ctx, ws, path)
+            if refused:
+                return refused
+            result = await asyncio.to_thread(
                 ws.str_replace,
-                str(inp.get("path") or ""),
+                path,
                 str(inp.get("old_string") or ""),
                 str(inp.get("new_string") if inp.get("new_string") is not None else ""),
                 replace_all=bool(inp.get("replace_all")),
             )
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error replacing in {inp.get('path')}: {e}"
+        if result.startswith("updated"):
+            _note_edit(ctx, ws, path)
+        return result
     if name == "NotebookEdit":
         from orbweaver.notebook import apply_notebook_edit
 
-        return await asyncio.to_thread(apply_notebook_edit, ws, inp)
+        path = str(inp.get("path") or "")
+        refused = _edit_guard(ctx, ws, path)
+        if refused:
+            return refused
+        result = await asyncio.to_thread(apply_notebook_edit, ws, inp)
+        if not result.startswith("error"):
+            _note_edit(ctx, ws, path)
+        return result
     if name == "Delete":
+        path = str(inp.get("path") or "")
         try:
-            return await asyncio.to_thread(ws.delete, inp["path"])
+            refused = _edit_guard(ctx, ws, path)
+            if refused:
+                return refused
+            result = await asyncio.to_thread(ws.delete, path)
         except (OSError, PermissionError) as e:
             return f"error deleting {inp.get('path')}: {e}"
+        _note_edit(ctx, ws, path, deleted=True)
+        return result
     if name == "ProposePatch":
         result = await asyncio.to_thread(
             ws.propose_patch, inp["path"], inp.get("old_string") or "", inp["new_string"]
@@ -937,6 +1200,18 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             return str(e)
     if name == "ReadLints":
         return await asyncio.to_thread(read_lints, ws, inp, ctx.get("events"))
+    if name == "Skill":
+        from orbweaver.instructions import load_skill_or_rule
+
+        root = getattr(ws, "root", None)
+        if root is None:
+            return "error: this workspace has no local root for skills"
+        return await asyncio.to_thread(
+            load_skill_or_rule,
+            Path(root),
+            str(inp.get("name") or ""),
+            str(inp.get("kind") or "skill"),
+        )
     if name == "Bash":
         from orbweaver.git_ritual import annotate_bash_output, ritual_says_not_done
         from orbweaver.permissions.pipeline import bash_permissions
@@ -1149,9 +1424,19 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class _ToolOutcome:
+    """What one tool_use produced: the tool_result text plus how it was reached.
+
+    ``executed`` is False when the gate text stands in for the tool (blocked, denied,
+    not approved in time). ``approval`` names the held-call outcome that did not run
+    the tool: "deny", "timeout" or "cancelled".
+    """
+
     content: str
     persisted_path: str | None = None
     flagged: bool = False
+    is_error: bool = False
+    executed: bool = True
+    approval: str | None = None
 
 
 class TurnCancelled(Exception):
@@ -1329,7 +1614,16 @@ async def agent_turn(
             payload["ask_answer"] = True
         if images:
             payload["images"] = images
+        checkpoint: dict[str, Any] | None = None
+        if subagent_depth == 0:
+            checkpoint = await asyncio.to_thread(checkpoint_user_turn, workspace)
+            if checkpoint is not None:
+                payload["checkpoint"] = checkpoint
         user_ev = await store.append_event(session_id, "user", payload)
+        if checkpoint is not None:
+            await asyncio.to_thread(
+                pin_user_turn, workspace, checkpoint, session_id, user_ev.seq
+            )
         if turn_state is not None:
             turn_state.user_seq = user_ev.seq
         if emit:
@@ -1359,6 +1653,64 @@ async def agent_turn(
         payload.setdefault("text", exc.message)
         fire(await store.append_event(session_id, "turn_aborted", payload))
         fire(await store.append_event(session_id, "assistant", {"text": exc.message}))
+
+    probe_task: asyncio.Task[int] | None = None
+
+    async def flag_injection(item: ProbeItem) -> None:
+        fire(
+            await store.append_event(
+                session_id,
+                "injection_warning",
+                {"tool_use_id": item.tool_use_id, "name": item.name},
+            )
+        )
+
+    def launch_probes(items: list[ProbeItem]) -> None:
+        nonlocal probe_task
+        if not items:
+            return
+        probe_task = start_round_probes(
+            items,
+            on_flagged=flag_injection,
+            session_id=session_id,
+            probe=probe_tool_output,
+        )
+
+    async def settle_probes() -> None:
+        """Wait a short budget for the last round's probes; late ones finish in the background.
+
+        A warning that arrives after the budget still attaches to its tool_result in the
+        *next* prompt (see ``flagged_tool_use_ids``), so the round is not blocked on it.
+        """
+        nonlocal probe_task
+        if probe_task is None:
+            return
+        if await await_round_probes(probe_task):
+            probe_task = None
+        else:
+            stats = record_probe_usage(session_id, calls=0, results=0, late=1)
+            log.info(
+                "injection probe over budget for session %s; warning (if any) lands in a later prompt "
+                "(late=%d)",
+                session_id,
+                stats.late,
+            )
+        stats = probe_stats(session_id)
+        if stats.calls:
+            log.info(
+                "injection probe session %s: calls=%d results=%d flagged=%d late=%d "
+                "latency=%.2fs tokens_in=%d tokens_out=%d",
+                session_id,
+                stats.calls,
+                stats.results,
+                stats.flagged,
+                stats.late,
+                stats.latency_s,
+                stats.input_tokens,
+                stats.output_tokens,
+            )
+
+    round_probes: list[ProbeItem] = []
 
     stuck_detector = StuckDetector()
 
@@ -1425,6 +1777,10 @@ async def agent_turn(
         "emit": emit,
         "subagent_depth": subagent_depth,
         "channel": resolved_channel,
+        "session_rules": session_rules_from(sess.jsonld if sess else None),
+        # Per-turn cache of nested instruction dirs / glob rules already injected. Seeded
+        # from blocks still in the live prompt window so a later turn does not repeat them.
+        "instructions_seen": seen_instruction_keys(live_events(prior)),
         # Background subagents spawned by this turn (str child id -> ChildRun).
         "children": {},
     }
@@ -1437,19 +1793,178 @@ async def agent_turn(
             fire(await store.append_event(session_id, "subagent_result", body))
     tool_slots = asyncio.Semaphore(max(1, int(settings.orbweaver_max_parallel_tools)))
 
-    async def execute_tool(block: Any, decision: PermissionDecision) -> _ToolOutcome:
-        """Run one permitted tool_use and probe its output; blocked calls get the gate text."""
-        if decision.behavior != "allow":
-            return _ToolOutcome(_blocked_tool_result(decision))
+    async def run_allowed_tool(block: Any, inp: dict[str, Any]) -> _ToolOutcome:
+        """Run one permitted tool_use with the given input and probe its output."""
         if block.name == "AskUser":
             # Waiting for the user is handled in the round loop; only an empty
             # question reaches here.
             return _ToolOutcome("error: question is required")
         async with tool_slots:
-            raw = await run_tools(block.name, dict(block.input), ctx)
+            raw = await run_tools(block.name, inp, ctx)
         text, persisted_path = persist_tool_result(workspace, str(block.id), block.name, raw)
-        probed = await probe_tool_output(block.name, text)
-        return _ToolOutcome(probed["output"], persisted_path, bool(probed.get("flagged")))
+        # Probes run after the round, concurrently (see launch_probes); a flagged
+        # result gets its warning via an injection_warning event.
+        if should_probe(block.name, inp, text, workspace):
+            round_probes.append(ProbeItem(str(block.id), block.name, text))
+        return _ToolOutcome(text, persisted_path)
+
+    async def execute_tool(block: Any, decision: PermissionDecision) -> _ToolOutcome:
+        """Fast path: run an allowed tool_use; blocked (deny / unheld ask) calls get the gate text."""
+        if decision.behavior != "allow":
+            return _ToolOutcome(_blocked_tool_result(decision), is_error=True, executed=False)
+        return await run_allowed_tool(block, dict(block.input))
+
+    async def hold_for_approval(block: Any, decision: PermissionDecision) -> _ToolOutcome:
+        """Hold an ask-gated tool_use until the user answers, then run exactly what they saw.
+
+        Records permission_request / permission_response (and permission_rule_added
+        for allow-for-session). Deny, timeout and cancel return the gate text as an
+        is_error result without running the tool.
+        """
+        recorded_input = dict(block.input)
+        pend = PendingApproval(
+            session_id=session_id,
+            tool_use_id=str(block.id),
+            name=block.name,
+            input=recorded_input,
+            reason=decision.reason,
+            future=asyncio.get_running_loop().create_future(),
+        )
+        _register_approval(pend)
+        try:
+            fire(
+                await store.append_event(
+                    session_id,
+                    "permission_request",
+                    {
+                        "tool_use_id": block.id,
+                        "name": block.name,
+                        "input": recorded_input,
+                        "reason": decision.reason,
+                        "summary": summarize_input(block.name, recorded_input),
+                    },
+                )
+            )
+            timeout = float(settings.orbweaver_approval_timeout_s)
+            verdict = await _wait_for_approval(pend, cancel, timeout)
+        finally:
+            _unregister_approval(pend)
+        if verdict is None:
+            cancelled = cancel is not None and cancel.is_set()
+            outcome = "cancelled" if cancelled else "timeout"
+            scope = "once"
+        else:
+            outcome, scope = verdict
+        fire(
+            await store.append_event(
+                session_id,
+                "permission_response",
+                {
+                    "tool_use_id": block.id,
+                    "name": block.name,
+                    "decision": outcome,
+                    "scope": scope,
+                },
+            )
+        )
+        if outcome == "cancelled":
+            return _ToolOutcome(
+                _approval_cancelled_result(decision.reason),
+                is_error=True,
+                executed=False,
+                approval="cancelled",
+            )
+        if outcome == "timeout":
+            return _ToolOutcome(
+                _approval_timeout_result(decision.reason, timeout),
+                is_error=True,
+                executed=False,
+                approval="timeout",
+            )
+        if outcome == "deny":
+            return _ToolOutcome(
+                _denied_tool_result(decision.reason),
+                is_error=True,
+                executed=False,
+                approval="deny",
+            )
+        if scope == "session":
+            rule = make_session_rule(block.name, recorded_input)
+            rules = ctx.setdefault("session_rules", [])
+            if add_session_rule(rules, rule):
+                current = await store.get_entity(session_id)
+                if current is not None:
+                    current.jsonld["permission_rules"] = list(rules)
+                    await store.put_entity(current)
+                fire(
+                    await store.append_event(
+                        session_id,
+                        "permission_rule_added",
+                        {
+                            "tool_use_id": block.id,
+                            "tool": rule["tool"],
+                            "subject": rule["subject"],
+                            "permissions": rule.get("permissions") or [],
+                        },
+                    )
+                )
+        check()
+        # Execute exactly the input the user saw, not a re-issued call.
+        return await run_allowed_tool(block, recorded_input)
+
+    async def record_interrupted(block: Any, exc: ToolInterrupted) -> None:
+        fire(
+            await store.append_event(
+                session_id,
+                "tool_result",
+                {
+                    "tool_use_id": block.id,
+                    "name": block.name,
+                    "content": exc.message,
+                    "is_error": True,
+                },
+            )
+        )
+
+    async def record_result(block: Any, outcome: _ToolOutcome) -> None:
+        """tool_result (or MemoryRecall) for one block, plus its follow-on events."""
+        if outcome.flagged:
+            fire(
+                await store.append_event(
+                    session_id,
+                    "injection_warning",
+                    {"tool_use_id": block.id, "name": block.name},
+                )
+            )
+        result = outcome.content
+        kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
+        payload: dict[str, Any] = {"tool_use_id": block.id, "name": block.name, "content": result}
+        if outcome.is_error:
+            payload["is_error"] = True
+        if outcome.executed and outcome.persisted_path:
+            payload["persisted_path"] = outcome.persisted_path
+        if kind == "MemoryRecall":
+            try:
+                parsed = json.loads(result)
+                payload["chunk_ids"] = parsed.get("chunk_ids") or []
+                payload["text"] = parsed.get("text") or result
+            except json.JSONDecodeError:
+                payload["text"] = result
+        fire(await store.append_event(session_id, kind, payload))
+        if block.name == "ProposePatch" and outcome.executed:
+            fire(
+                await store.append_event(
+                    session_id,
+                    "patch_proposal",
+                    {"tool_use_id": block.id, "content": result},
+                )
+            )
+        if block.name == "ScheduleTask" and outcome.executed:
+            fire(
+                await store.append_event(
+                    session_id, "schedule_request", {"input": dict(block.input)}
+                )
+            )
 
     pins = await pinned_prompt(store)
     system = build_agent_system(
@@ -1487,6 +2002,7 @@ async def agent_turn(
                 )
             elif ctx.pop("git_not_done_nudge_pending", False):
                 nudge = GIT_NOT_DONE_NUDGE
+            await settle_probes()
             try:
                 resp = await _create_with_overflow_retry(
                     client,
@@ -1526,7 +2042,10 @@ async def agent_turn(
                     continue
                 break
             stop_after_ask = False
+            approval_timed_out = False
             waiting_ask = False
+            instruction_blocks: list[str] = []
+            del round_probes[:]
             # #99: consecutive concurrency-safe calls (Read, Grep, ...) form one
             # batch and run together; every unsafe call is a batch of one and a
             # barrier. tool_call events for a batch are recorded up front and
@@ -1599,68 +2118,80 @@ async def agent_turn(
                         )
                         waiting_ask = True
                         break
+                needs_approval = any(d.behavior == "ask" for d in decisions)
+                if needs_approval and can_wait_for_user(ctx):
+                    # A held call must not run alongside anything else before the
+                    # user answers: walk this batch one block at a time, in order.
+                    for block, decision in zip(batch, decisions, strict=True):
+                        check()
+                        if decision.behavior == "ask":
+                            outcome = await hold_for_approval(block, decision)
+                        else:
+                            try:
+                                outcome = await execute_tool(block, decision)
+                            except ToolInterrupted as e:
+                                await record_interrupted(block, e)
+                                raise TurnCancelled(produced) from e
+                        if outcome.approval != "cancelled":
+                            check()
+                        await record_result(block, outcome)
+                        if outcome.executed:
+                            instruction_blocks.extend(
+                                _nested_instructions_for(workspace, block.name, dict(block.input), ctx)
+                            )
+                        if outcome.approval == "cancelled":
+                            # The is_error result is on record; now stop like any other cancel.
+                            check()
+                        if outcome.approval == "timeout":
+                            approval_timed_out = True
+                            break
+                    if approval_timed_out:
+                        # Later tool_uses in this round never ran; the model re-plans next turn.
+                        break
+                    continue
                 outcomes = await asyncio.gather(
                     *(execute_tool(b, d) for b, d in zip(batch, decisions, strict=True)),
                     return_exceptions=True,
                 )
-                for block, outcome in zip(batch, outcomes, strict=True):
-                    if isinstance(outcome, ToolInterrupted):
-                        fire(
-                            await store.append_event(
-                                session_id,
-                                "tool_result",
-                                {
-                                    "tool_use_id": block.id,
-                                    "name": block.name,
-                                    "content": outcome.message,
-                                    "is_error": True,
-                                },
-                            )
-                        )
-                        raise TurnCancelled(produced) from outcome
+                for block, got in zip(batch, outcomes, strict=True):
+                    if isinstance(got, ToolInterrupted):
+                        await record_interrupted(block, got)
+                        raise TurnCancelled(produced) from got
                 check()
-                for block, decision, outcome in zip(batch, decisions, outcomes, strict=True):
-                    if isinstance(outcome, BaseException):
-                        raise outcome
-                    if outcome.flagged:
-                        fire(
-                            await store.append_event(
-                                session_id,
-                                "injection_warning",
-                                {"tool_use_id": block.id, "name": block.name},
-                            )
+                for block, decision, got in zip(batch, decisions, outcomes, strict=True):
+                    if isinstance(got, BaseException):
+                        raise got
+                    if got.executed:
+                        instruction_blocks.extend(
+                            _nested_instructions_for(workspace, block.name, dict(block.input), ctx)
                         )
-                    result = outcome.content
                     if decision.behavior == "ask":
+                        # The pipeline aborts headless asks before this; an ask that
+                        # could not be held for a human ends the turn unexecuted.
                         stop_after_ask = True
-                    kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
-                    payload = {"tool_use_id": block.id, "name": block.name, "content": result}
-                    if decision.behavior == "allow" and outcome.persisted_path:
-                        payload["persisted_path"] = outcome.persisted_path
-                    if kind == "MemoryRecall":
-                        try:
-                            parsed = json.loads(result)
-                            payload["chunk_ids"] = parsed.get("chunk_ids") or []
-                            payload["text"] = parsed.get("text") or result
-                        except json.JSONDecodeError:
-                            payload["text"] = result
-                    res_ev = await store.append_event(session_id, kind, payload)
-                    fire(res_ev)
-                    if block.name == "ProposePatch" and decision.behavior == "allow":
-                        fire(
-                            await store.append_event(
-                                session_id,
-                                "patch_proposal",
-                                {"tool_use_id": block.id, "content": result},
-                            )
-                        )
-                    if block.name == "ScheduleTask" and decision.behavior == "allow":
-                        fire(
-                            await store.append_event(
-                                session_id, "schedule_request", {"input": dict(block.input)}
-                            )
-                        )
+                    await record_result(block, got)
+            if instruction_blocks:
+                # User-side message for the next round (rendered after the tool results),
+                # same path as injected follow-ups: persisted event, projected into the prompt.
+                fire(
+                    await store.append_event(
+                        session_id,
+                        PROJECT_INSTRUCTIONS_KIND,
+                        {
+                            "text": "\n\n".join(instruction_blocks),
+                            "keys": sorted(ctx["instructions_seen"]),
+                        },
+                    )
+                )
+            launch_probes(list(round_probes))
             if waiting_ask:
+                break
+            if approval_timed_out:
+                fire(
+                    await store.append_event(
+                        session_id, "assistant", {"text": APPROVAL_TIMEOUT_NOTICE}
+                    )
+                )
                 break
             if stop_after_ask:
                 fire(
@@ -1681,6 +2212,7 @@ async def agent_turn(
                 store, session_id, client=client, workspace=workspace, system=system
             )
         else:
+            await settle_probes()
             await deliver_child_results()
             try:
                 resp = await _create_with_overflow_retry(

@@ -11,12 +11,16 @@ from typing import Any
 
 from orbweaver.config import settings
 from orbweaver.image import image_read_tool_content, parse_image_read_payload, user_image_blocks
+from orbweaver.permissions.prompts import INJECTION_WARNING
 from orbweaver.store import Event
 from orbweaver.tokens import estimate_tokens
 
 log = logging.getLogger(__name__)
 
 BOUNDARY_KINDS = frozenset({"compact_boundary", "compact_summary"})
+# Nested AGENTS.md / CLAUDE.md / .cursor/rules discovered mid-turn; rendered on the user
+# side after the tool results of the round that touched the directory.
+PROJECT_INSTRUCTIONS_KIND = "project_instructions"
 COMPACTABLE_TOOLS = frozenset({"Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Browser"})
 # Tools that change a file in place; a Read of that path is kept while it is being edited.
 EDIT_TOOLS = frozenset({"Write", "StrReplace"})
@@ -29,6 +33,9 @@ PAIR_KINDS = frozenset(
         "tool_result",
         "MemoryRecall",
         "permission_decision",
+        "permission_request",
+        "permission_response",
+        "permission_rule_added",
         "injection_warning",
         "patch_proposal",
         "schedule_request",
@@ -445,9 +452,32 @@ def ensure_tool_use_results(messages: list[dict[str, Any]]) -> list[dict[str, An
     return out
 
 
+def flagged_tool_use_ids(events: list[Event]) -> set[str]:
+    """tool_use_ids with an ``injection_warning`` event anywhere in the list.
+
+    The probe runs off the critical path, so the warning event may land several
+    events after its result (or in a later round). Rendering attaches it to the
+    matching ``tool_result`` regardless of where it landed.
+    """
+    return {
+        str(ev.payload.get("tool_use_id"))
+        for ev in events
+        if ev.kind == "injection_warning" and ev.payload.get("tool_use_id")
+    }
+
+
+def _with_injection_warning(content: Any) -> Any:
+    if isinstance(content, str):
+        return INJECTION_WARNING + content
+    if isinstance(content, list):
+        return [{"type": "text", "text": INJECTION_WARNING.strip()}, *content]
+    return content
+
+
 def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     pending_tool: list[dict[str, Any]] = []
+    flagged = flagged_tool_use_ids(events)
     for ev in events:
         k = ev.kind
         p = ev.payload
@@ -481,9 +511,12 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                 if content:
                     blocks.append({"type": "text", "text": str(content)})
                 content = blocks or content
+            tool_use_id = p.get("tool_use_id") or p.get("id") or "unknown"
+            if flagged and str(tool_use_id) in flagged:
+                content = _with_injection_warning(content)
             block: dict[str, Any] = {
                 "type": "tool_result",
-                "tool_use_id": p.get("tool_use_id") or p.get("id") or "unknown",
+                "tool_use_id": tool_use_id,
                 "content": content,
             }
             if p.get("is_error"):
@@ -496,6 +529,11 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                 messages.append({"role": "user", "content": [block]})
         elif k in STOP_KINDS:
             _flush_pending_tools(messages, pending_tool, stub_results=True)
+        elif k == PROJECT_INSTRUCTIONS_KIND:
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
+            text = str(p.get("text") or "")
+            if text:
+                _append_user_content(messages, text)
         elif k == "UserCorrection":
             _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append(

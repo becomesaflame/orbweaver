@@ -21,10 +21,26 @@ class Settings(BaseSettings):
     orbweaver_model: str = "claude-sonnet-4-6"
     orbweaver_classifier_model: str = "claude-sonnet-4-6"
     orbweaver_injection_probe_model: str = "claude-haiku-4-5"
+    # off | scoped | all. scoped skips in-project Read/Grep/Glob/WorkspaceSearch and
+    # benign Bash; all probes every eligible result (pre-0.33.22 behaviour).
+    orbweaver_injection_probe_mode: str = "scoped"
+    # Comma-separated dirs (relative to a project root) whose files are untrusted
+    # even inside the project. "$defaults" expands to the built-in list.
+    orbweaver_injection_probe_skip_dirs: str = "$defaults"
+    # ';'- or newline-separated regexes. Bash whose command matches is probed.
+    orbweaver_injection_probe_bash_network: str = "$defaults"
+    # ';'- or newline-separated regexes. Output matching any of these is probed
+    # regardless of tool or path (cheap prefilter for instruction-like phrasing).
+    orbweaver_injection_probe_prefilter: str = "$defaults"
+    # Seconds the next LLM call waits for a round's probes before proceeding.
+    orbweaver_injection_probe_budget_s: float = 3.0
     orbweaver_permission_mode: str = "auto"
     orbweaver_permission_deny: str = ""
     orbweaver_permission_ask: str = ""
     orbweaver_permission_allow: str = ""
+    # How long a held `ask` tool call waits for the user's allow/deny before it
+    # is recorded as an error and the turn ends (seconds).
+    orbweaver_approval_timeout_s: float = 600.0
     orbweaver_automode_environment: str = "$defaults"
     orbweaver_automode_soft_deny: str = "$defaults"
     orbweaver_automode_hard_deny: str = "$defaults"
@@ -34,6 +50,11 @@ class Settings(BaseSettings):
     orbweaver_auto_allow_bash_if_sandboxed: bool = True
     orbweaver_sandbox_config: str = ""
     orbweaver_mcp_config: str = ""
+    # Host variable names (comma-separated) every MCP server may reference via
+    # ${VAR} in mcp.json env/headers; per-server `envPassthrough` adds to it.
+    orbweaver_mcp_env_passthrough: str = ""
+    # Auto-allow mcp_* tools whose server annotates readOnlyHint: true.
+    orbweaver_mcp_auto_allow_readonly: bool = True
     # Concurrency-safe tool calls from one assistant round that may run at once.
     orbweaver_max_parallel_tools: int = 8
     orbweaver_sandbox_additional_readonly: str = ""
@@ -63,8 +84,14 @@ class Settings(BaseSettings):
     orbweaver_sandbox_seccomp: str = "auto"
     orbweaver_sandbox_hide_sys: bool = True
     orbweaver_sandbox_env_allow: str = ""  # extra env names/globs passed into sandboxed Bash
+    orbweaver_checkpoints: bool = True  # per-turn git tree of the workspace for rewind
+    orbweaver_checkpoint_keep_days: int = 14  # prune refs/orbweaver/checkpoints older than this
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
+    # Per-item cap for one instruction doc / rule / skill body inlined in a prompt.
+    orbweaver_instruction_item_token_cap: int = 2000
+    # User-level instructions; empty → <orbweaver_data_dir or ~/.orbweaver>/AGENTS.md
+    orbweaver_user_instructions: str = ""
     context_window: int = 200_000
     output_reserve: int = 16_000
     static_token_estimate: int = 12_000
@@ -110,6 +137,9 @@ class Settings(BaseSettings):
     orbweaver_image_model: str = "dall-e-3"
     orbweaver_image_size: str = "1024x1024"
     orbweaver_linter: str = ""  # e.g. ruff check {paths} ; empty uses the Python AST stub
+    # Write/StrReplace/NotebookEdit/Delete on an existing file require a prior Read
+    # this session and refuse when the file changed on disk since that Read.
+    edit_require_read: bool = True
     orbweaver_search_provider: str = ""  # duckduckgo | brave | empty auto
     orbweaver_brave_api_key: str = ""
     brave_search_api_key: str = ""

@@ -20,13 +20,28 @@ class UsageAnchor:
     cache_creation_input_tokens: int = 0
 
 
+@dataclass
+class ProbeStats:
+    """Cumulative injection-probe overhead for one session (see ``record_probe_usage``)."""
+
+    calls: int = 0
+    results: int = 0
+    flagged: int = 0
+    late: int = 0
+    latency_s: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
 _anchors: dict[UUID, UsageAnchor] = {}
 _failures: dict[UUID, int] = {}
+_probes: dict[UUID, ProbeStats] = {}
 
 
 def reset_compact_state() -> None:
     _anchors.clear()
     _failures.clear()
+    _probes.clear()
 
 
 def record_usage(
@@ -73,8 +88,36 @@ def last_usage(session_id: UUID) -> UsageAnchor | None:
     return _anchors.get(session_id)
 
 
+def record_probe_usage(
+    session_id: UUID,
+    *,
+    calls: int = 1,
+    results: int = 1,
+    flagged: int = 0,
+    late: int = 0,
+    latency_s: float = 0.0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> ProbeStats:
+    """Accumulate injection-probe calls, latency, and tokens so the overhead is visible."""
+    stats = _probes.setdefault(session_id, ProbeStats())
+    stats.calls += max(0, calls)
+    stats.results += max(0, results)
+    stats.flagged += max(0, flagged)
+    stats.late += max(0, late)
+    stats.latency_s += max(0.0, latency_s)
+    stats.input_tokens += max(0, input_tokens)
+    stats.output_tokens += max(0, output_tokens)
+    return stats
+
+
+def probe_stats(session_id: UUID) -> ProbeStats:
+    return _probes.get(session_id, ProbeStats())
+
+
 def clear_usage(session_id: UUID) -> None:
     _anchors.pop(session_id, None)
+    _probes.pop(session_id, None)
 
 
 def compact_failures(session_id: UUID) -> int:
