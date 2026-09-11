@@ -515,7 +515,11 @@ TOOL_SPEC = [
             "Spawn a nested agent with its own event stream to complete a focused task. "
             "Shares this workspace and memory. Returns a summary. Nested spawns are not allowed. "
             "type/role selects a tool subset: explore (read/search), implement (default, edits), "
-            "or shell (Bash)."
+            "or shell (Bash). With background true it returns {subagent_id, status: running} "
+            "at once and the child runs concurrently; spawn several in one round to fan out. "
+            "Finished background results are delivered to you automatically after your "
+            "next reply, or call SubagentWait to block for them. Children are cancelled if "
+            "you end the turn without collecting them."
         ),
         "input_schema": {
             "type": "object",
@@ -532,8 +536,44 @@ TOOL_SPEC = [
                     "enum": ["explore", "implement", "shell"],
                     "description": "Alias for type.",
                 },
+                "background": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return immediately and run the child concurrently "
+                        "(default false: wait for the result)."
+                    ),
+                },
+                "timeout_s": {
+                    "type": "number",
+                    "description": (
+                        "Wall-clock limit for the child in seconds (default 600). "
+                        "On timeout the child is cancelled and the result is an error."
+                    ),
+                },
+                "max_rounds": {
+                    "type": "integer",
+                    "description": "Tool-round budget for the child (default 24).",
+                },
             },
             "required": ["task"],
+        },
+    },
+    {
+        "name": "SubagentWait",
+        "description": (
+            "Block until background subagents finish and return their results "
+            "({subagent_id, status, text} each). ids selects children; omit it to wait "
+            "for every child spawned this turn whose result you have not seen."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "subagent_id values from SpawnSubagent (default: all pending).",
+                }
+            },
         },
     },
     {
@@ -1051,6 +1091,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         from orbweaver.subagent import run_subagent
 
         return await run_subagent(inp, ctx)
+    if name == "SubagentWait":
+        from orbweaver.subagent import wait_subagents
+
+        return await wait_subagents(inp, ctx)
     if name == "ScheduleTask":
         try:
             due = datetime.fromisoformat(str(inp["due_at"]).replace("Z", "+00:00"))  # noqa: FURB162
@@ -1338,9 +1382,19 @@ async def agent_turn(
         "events": [],
         "cancel": cancel,
         "fire": fire,
+        "emit": emit,
         "subagent_depth": subagent_depth,
         "channel": resolved_channel,
+        # Background subagents spawned by this turn (str child id -> ChildRun).
+        "children": {},
     }
+
+    async def deliver_child_results() -> None:
+        """Background children that finished since the last round: show the model."""
+        from orbweaver.subagent import collect_finished
+
+        for body in collect_finished(ctx):
+            fire(await store.append_event(session_id, "subagent_result", body))
     tool_slots = asyncio.Semaphore(max(1, int(settings.orbweaver_max_parallel_tools)))
 
     async def execute_tool(block: Any, decision: PermissionDecision) -> _ToolOutcome:
@@ -1380,6 +1434,7 @@ async def agent_turn(
     try:
         for round_i in range(max_rounds):
             check()
+            await deliver_child_results()
             inj = inject_event()
             if inj is not None:
                 inj.clear()
@@ -1585,6 +1640,7 @@ async def agent_turn(
                 store, session_id, client=client, workspace=workspace, system=system
             )
         else:
+            await deliver_child_results()
             try:
                 resp = await _create_with_overflow_retry(
                     client,
@@ -1640,7 +1696,15 @@ async def agent_turn(
         raise
     finally:
         from orbweaver.hindsight import retain_turn
+        from orbweaver.subagent import settle_children
 
+        if ctx.get("children"):
+            try:
+                await settle_children(
+                    ctx, cancelled=bool(cancel is not None and cancel.is_set())
+                )
+            except Exception:
+                log.exception("settling background subagents failed")
         await retain_turn(
             session_id,
             user_text,

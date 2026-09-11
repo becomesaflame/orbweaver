@@ -378,6 +378,12 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                     "content": f"User correction: {p.get('text') or json.dumps(p)}",
                 }
             )
+        elif k == "subagent_result":
+            # Background child finished: user-side note, like an injected follow-up.
+            from orbweaver.subagent import format_subagent_result
+
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
+            _append_user_content(messages, format_subagent_result(p))
         elif k in BOUNDARY_KINDS:
             _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append(
