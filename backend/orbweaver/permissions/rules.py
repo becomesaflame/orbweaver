@@ -240,7 +240,12 @@ def path_is_always_denied(rel: str) -> bool:
         return True
     if ".ssh" in lowered or ".gnupg" in lowered:
         return True
-    return str(rel).startswith("/etc") or "/etc/" in str(rel)
+    if str(rel).startswith("/etc") or "/etc/" in str(rel):
+        return True
+    # Same credential list the bubblewrap deny overlays use, so Read/Grep/Glob and Bash agree.
+    from orbweaver.sandbox.policy import is_default_denied_read
+
+    return is_default_denied_read(str(rel))
 
 
 def write_is_always_denied(rel: str) -> bool:
