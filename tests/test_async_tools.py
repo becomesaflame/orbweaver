@@ -144,12 +144,12 @@ async def test_bash_async_timeout_and_output(tmp_path: Path, monkeypatch):
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     out = await ws.bash_async("echo hi; echo err 1>&2")
     header, *body = out.strip().splitlines()
-    assert header == f"[cwd {tmp_path.resolve()}]"  # cwd header, as for sync bash (#105)
+    assert header.startswith(f"[cwd {tmp_path.resolve()} | exit 0 in ")  # cwd + exit header (#105/#104)
     assert body == ["hi", "err"]
     started = time.monotonic()
     out = await ws.bash_async("echo partial; sleep 5", timeout=1)
     assert time.monotonic() - started < 4
-    assert "timeout: command exceeded 1s" in out
+    assert out.splitlines()[0].endswith("| timed out after 1s]")
     assert "partial" in out
 
 
@@ -305,5 +305,6 @@ async def test_sync_workspace_api_still_works(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox", False)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     ws.write("a.txt", "x\n")
-    assert ws.bash("echo sync").strip().splitlines() == [f"[cwd {tmp_path.resolve()}]", "sync"]
+    header, *body = ws.bash("echo sync").strip().splitlines()
+    assert header.startswith(f"[cwd {tmp_path.resolve()} | exit 0 in ") and body == ["sync"]
     assert ws.glob("*.txt") == ["a.txt"]

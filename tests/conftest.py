@@ -12,6 +12,17 @@ def auth_header() -> dict[str, str]:
 
 
 @pytest.fixture(autouse=True)
+def _no_workspace_checkpoints(monkeypatch):
+    """Turns in tests must not write refs/orbweaver/checkpoints into this checkout.
+
+    Tests that exercise checkpoints set settings.orbweaver_checkpoints back to True.
+    """
+    from orbweaver.config import settings
+
+    monkeypatch.setattr(settings, "orbweaver_checkpoints", False)
+
+
+@pytest.fixture(autouse=True)
 def _dev_insecure_secret(monkeypatch):
     """Tests sign with the default secret; opt into dev mode so startup passes.
 

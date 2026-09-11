@@ -27,6 +27,8 @@ SAFE_ALLOWLIST = frozenset(
         "WebSearch",
         "TodoWrite",
         "ReadLints",
+        "Skill",
+        "SubagentWait",
     }
 )
 

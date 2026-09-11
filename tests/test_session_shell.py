@@ -75,14 +75,14 @@ def test_raw_bash_cwd_persists_between_calls(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox", False)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     first = ws.bash("cd /tmp")
-    assert first.startswith("[cwd /tmp]")
+    assert first.startswith("[cwd /tmp | exit 0 in ")
     second = ws.bash("pwd")
-    assert second.splitlines()[0] == "[cwd /tmp]"
+    assert second.splitlines()[0].startswith("[cwd /tmp | exit 0 in ")
     assert second.splitlines()[1] == "/tmp"
     assert ws.current_cwd() == "/tmp"
     assert ws.last_command_cwd == "/tmp"
     failed = ws.bash("false")
-    assert failed.startswith("[cwd /tmp | exit 1]")
+    assert failed.startswith("[cwd /tmp | exit 1 in ")
 
 
 def test_raw_bash_cwd_is_keyed_by_session_across_instances(tmp_path: Path, monkeypatch):
@@ -166,9 +166,10 @@ def _ws(root: Path) -> LocalWorkspace:
 
 def test_persistent_shell_cwd_and_env_persist(live_root):
     ws = _ws(live_root)
-    assert "[cwd /tmp]" in ws.bash("cd /tmp && export OW_TEST_VAR=kept")
+    assert "[cwd /tmp | exit 0 in " in ws.bash("cd /tmp && export OW_TEST_VAR=kept")
     out = ws.bash("pwd; echo var=$OW_TEST_VAR")
-    assert out.splitlines() == ["[cwd /tmp]", "/tmp", "var=kept"]
+    assert out.splitlines()[0].startswith("[cwd /tmp | exit 0 in ")
+    assert out.splitlines()[1:] == ["/tmp", "var=kept"]
     shell = shell_mod.peek_session_shell(ws.session_key)
     assert shell is not None and shell.alive
 
@@ -200,11 +201,11 @@ def test_persistent_shell_timeout_kills_foreground_only(live_root):
     assert before is not None
     started = time.monotonic()
     out = ws.bash("sleep 30", timeout=1)
-    assert "timeout: command exceeded 1s" in out
+    assert out.splitlines()[0] == "[cwd /tmp | timed out after 1s]"
     assert time.monotonic() - started < 10
     after_out = ws.bash("echo still-here; pwd")
     assert "still-here" in after_out
-    assert "[cwd /tmp]" in after_out
+    assert "[cwd /tmp | exit 0 in " in after_out
     assert shell_mod.peek_session_shell(ws.session_key) is before
     assert before.alive
 
@@ -212,7 +213,7 @@ def test_persistent_shell_timeout_kills_foreground_only(live_root):
 def test_persistent_shell_survives_exit_and_reports_code(live_root):
     ws = _ws(live_root)
     out = ws.bash("echo bye; exit 7")
-    assert out.startswith(f"[cwd {live_root.resolve()} | exit 7]")
+    assert out.startswith(f"[cwd {live_root.resolve()} | exit 7 in ")
     assert "bye" in out
     assert "ok" in ws.bash("echo ok")
 
@@ -222,7 +223,7 @@ def test_persistent_shell_disabled_falls_back_to_oneshot_with_cwd(live_root, mon
     ws = _ws(live_root)
     ws.bash("cd /tmp")
     out = ws.bash("pwd")
-    assert out.splitlines() == ["[cwd /tmp]", "/tmp"]
+    assert out.splitlines()[0].startswith("[cwd /tmp | exit 0 in ") and out.splitlines()[1:] == ["/tmp"]
     assert shell_mod.peek_session_shell(ws.session_key) is None
 
 
@@ -230,9 +231,10 @@ def test_full_network_oneshot_shares_cwd_with_persistent_shell(live_root):
     ws = _ws(live_root)
     ws.bash("cd /tmp")
     out = ws.bash("pwd", permissions=["full_network"])
-    assert out.splitlines() == ["[cwd /tmp]", "/tmp"]
+    assert out.splitlines()[0].startswith("[cwd /tmp | exit 0 in ") and out.splitlines()[1:] == ["/tmp"]
     ws.bash("cd /usr", permissions=["full_network"])
-    assert ws.bash("pwd").splitlines() == ["[cwd /usr]", "/usr"]
+    out = ws.bash("pwd").splitlines()
+    assert out[0].startswith("[cwd /usr | exit 0 in ") and out[1:] == ["/usr"]
 
 
 def test_close_session_shell_reaps_sandbox_and_next_call_restarts(live_root):

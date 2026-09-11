@@ -133,7 +133,9 @@ def test_workspace_bash_forwards_timeout_to_sandbox(tmp_path: Path, monkeypatch)
 
     monkeypatch.setattr("orbweaver.sandbox.bwrap.run_sandboxed", fake_run)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
-    assert ws.bash("sleep 31", timeout=45) == f"[cwd {tmp_path.resolve()}]\nok"
+    # The fake runner returns bare output (no exit line, no cwd sentinel): only the cwd is known.
+    header, body = ws.bash("sleep 31", timeout=45).split("\n", 1)
+    assert header == f"[cwd {tmp_path.resolve()}]" and body == "ok"
     assert seen["timeout"] == 45
     assert "sleep 31\n" in seen["command"]  # wrapped with the cwd sentinel trap
 
@@ -157,7 +159,8 @@ def test_workspace_bash_forwards_timeout_to_session_shell(tmp_path: Path, monkey
         "orbweaver.sandbox.shell.get_session_shell", lambda *a, **k: FakeShell()
     )
     ws = LocalWorkspace("workspace:default", str(tmp_path))
-    assert ws.bash("sleep 31", timeout=45) == "[cwd /tmp/elsewhere]\nok\n"
+    header, body = ws.bash("sleep 31", timeout=45).split("\n", 1)
+    assert header.startswith("[cwd /tmp/elsewhere | exit 0 in ") and body == "ok\n"
     assert seen == {"timeout": 45, "command": "sleep 31", "cwd": None}
     assert ws.current_cwd() == "/tmp/elsewhere"
 

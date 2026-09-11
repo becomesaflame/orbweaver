@@ -140,14 +140,24 @@ def test_tool_metadata_marks_read_only_tools_safe():
 
 
 def test_mcp_tools_are_unsafe_unless_read_only_hint(monkeypatch):
-    monkeypatch.setitem(mcp_tools._tool_read_only, "mcp_srv_list", True)
-    monkeypatch.setitem(mcp_tools._tool_read_only, "mcp_srv_write", False)
+    def registered(read_only: bool, destructive: bool = False):
+        return mcp_tools._Registered(
+            "srv",
+            "orig",
+            mcp_tools.KIND_TOOL,
+            mcp_tools.McpToolAnnotations(read_only=read_only, destructive=destructive),
+        )
+
+    monkeypatch.setitem(mcp_tools._tool_index, "mcp_srv_list", registered(True))
+    monkeypatch.setitem(mcp_tools._tool_index, "mcp_srv_write", registered(False))
+    monkeypatch.setitem(mcp_tools._tool_index, "mcp_srv_purge", registered(True, destructive=True))
     assert tool_meta("mcp_srv_list").concurrency_safe is True
     assert tool_meta("mcp_srv_write").concurrency_safe is False
+    assert tool_meta("mcp_srv_purge").concurrency_safe is False
     assert tool_meta("mcp_srv_unlisted").concurrency_safe is False
-    assert mcp_tools.tool_annotation_read_only({"annotations": {"readOnlyHint": True}})
-    assert not mcp_tools.tool_annotation_read_only({"annotations": {"readOnlyHint": "yes"}})
-    assert not mcp_tools.tool_annotation_read_only({"name": "x"})
+    assert mcp_tools._parse_annotations({"annotations": {"readOnlyHint": True}}, "s", "t").read_only
+    assert not mcp_tools._parse_annotations({"annotations": {"readOnlyHint": "yes"}}, "s", "t").read_only
+    assert not mcp_tools._parse_annotations({"name": "x"}, "s", "t").read_only
 
 
 def test_partition_groups_safe_runs_and_isolates_unsafe_calls():
@@ -272,10 +282,13 @@ async def test_unsafe_call_is_a_barrier_between_safe_runs(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_ask_decision_in_a_batch_still_stops_after_ask(tmp_path, monkeypatch):
+async def test_unheld_ask_decision_in_a_batch_still_stops_after_ask(tmp_path, monkeypatch):
+    """An ask that cannot be held for a human (no waiting channel) ends the turn unexecuted."""
     trace = _Trace()
     _instrument(monkeypatch, trace)
     monkeypatch.setattr(settings, "orbweaver_permission_ask", "Read(f1.txt)")
+    # The pipeline aborts headless asks before the loop; force the loop's own fallback.
+    monkeypatch.setattr("orbweaver.agent.can_wait_for_user", lambda _ctx: False)
     uses = [
         _ToolUse("Read", {"path": "f0.txt"}, "toolu_ok"),
         _ToolUse("Read", {"path": "f1.txt"}, "toolu_ask"),
@@ -290,15 +303,72 @@ async def test_ask_decision_in_a_batch_still_stops_after_ask(tmp_path, monkeypat
     results = [e for e in events if e.kind == "tool_result"]
     assert [e.payload["tool_use_id"] for e in results] == ["toolu_ok", "toolu_ask", "toolu_ok2"]
     assert "needs user approval" in results[1].payload["content"]
+    assert results[1].payload["is_error"] is True
     assert "body 0" in results[0].payload["content"]
     assert "body 2" in results[2].payload["content"]
     assert {p for _n, p, _s, _e in trace.by_name("Read")} == {"f0.txt", "f2.txt"}
     decisions = [e for e in events if e.kind == "permission_decision"]
     assert [e.payload["behavior"] for e in decisions] == ["allow", "ask", "allow"]
+    assert not [e for e in events if e.kind == "permission_request"]
     texts = [e.payload.get("text") or "" for e in events if e.kind == "assistant"]
     assert any("need your approval" in t for t in texts)
     # The turn stopped without asking the model to continue.
     assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_held_ask_in_a_safe_batch_runs_sequentially(tmp_path, monkeypatch):
+    """A batch holding an ask-gated call runs one block at a time around the approval."""
+    import asyncio
+
+    from orbweaver.agent import (
+        pending_approvals,
+        reset_pending_approvals_for_tests,
+        resolve_approval,
+    )
+
+    reset_pending_approvals_for_tests()
+    trace = _Trace()
+    _instrument(monkeypatch, trace)
+    monkeypatch.setattr(settings, "orbweaver_permission_ask", "Read(f1.txt)")
+    monkeypatch.setattr(settings, "orbweaver_approval_timeout_s", 5.0)
+    uses = [
+        _ToolUse("Read", {"path": "f0.txt"}, "toolu_ok"),
+        _ToolUse("Read", {"path": "f1.txt"}, "toolu_ask"),
+        _ToolUse("Read", {"path": "f2.txt"}, "toolu_ok2"),
+    ]
+    client = _install_llm(monkeypatch, [SimpleNamespace(content=uses)])
+    store = reset_store_for_tests()
+    sid = uuid4()
+
+    turn = asyncio.create_task(agent_turn(store, sid, "read", _ws(tmp_path)))
+    for _ in range(300):
+        if any(p.tool_use_id == "toolu_ask" for p in pending_approvals(sid)):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("permission_request never became pending")
+    # The safe call before the held one already ran; nothing after it has.
+    assert {p for _n, p, _s, _e in trace.by_name("Read")} == {"f0.txt"}
+    assert resolve_approval(sid, "toolu_ask", "allow") is True
+    events = await turn
+
+    reads = trace.by_name("Read")
+    assert [p for _n, p, _s, _e in reads] == ["f0.txt", "f1.txt", "f2.txt"]
+    for (_a, _pa, _sa, end_a), (_b, _pb, start_b, _eb) in pairwise(reads):
+        assert end_a <= start_b, "held batch ran two tools at once"
+    results = [e for e in events if e.kind == "tool_result"]
+    assert [e.payload["tool_use_id"] for e in results] == ["toolu_ok", "toolu_ask", "toolu_ok2"]
+    assert "body 1" in results[1].payload["content"]
+    assert not results[1].payload.get("is_error")
+    kinds = [e.kind for e in events]
+    assert kinds.index("permission_request") < kinds.index("permission_response")
+    assert [e.payload["decision"] for e in events if e.kind == "permission_response"] == ["allow"]
+    texts = [e.payload.get("text") or "" for e in events if e.kind == "assistant"]
+    assert not any("need your approval" in t for t in texts)
+    # The model got the results and answered.
+    assert len(client.calls) == 2
+    assert pending_approvals(sid) == []
 
 
 @pytest.mark.asyncio

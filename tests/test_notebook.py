@@ -87,11 +87,33 @@ def test_rejects_non_notebook_and_bad_index(tmp_path):
 async def test_notebook_edit_tool(tmp_path):
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     _write_nb(ws, "lab.ipynb", _nb("print('hi')"))
+    ctx = _ctx(ws)
+    await run_tools("Read", {"path": "lab.ipynb"}, ctx)
+    result = await run_tools(
+        "NotebookEdit",
+        {"path": "lab.ipynb", "cell_idx": 0, "old_string": "hi", "new_string": "bye"},
+        ctx,
+    )
+    assert json.loads(result)["ok"] is True
+    assert "bye" in ws.read("lab.ipynb")
+    assert "print('hi')" not in ws.read("lab.ipynb")
+    # The successful edit refreshed the stamp; a second edit needs no re-read.
+    second = await run_tools(
+        "NotebookEdit",
+        {"path": "lab.ipynb", "cell_idx": 0, "old_string": "bye", "new_string": "ciao"},
+        ctx,
+    )
+    assert json.loads(second)["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_notebook_edit_tool_requires_prior_read(tmp_path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    _write_nb(ws, "lab.ipynb", _nb("print('hi')"))
     result = await run_tools(
         "NotebookEdit",
         {"path": "lab.ipynb", "cell_idx": 0, "old_string": "hi", "new_string": "bye"},
         _ctx(ws),
     )
-    assert json.loads(result)["ok"] is True
-    assert "bye" in ws.read("lab.ipynb")
-    assert "print('hi')" not in ws.read("lab.ipynb")
+    assert result == "error: lab.ipynb has not been read yet. Read it first before editing it."
+    assert "print('hi')" in ws.read("lab.ipynb")
