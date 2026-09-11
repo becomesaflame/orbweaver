@@ -94,21 +94,16 @@ async def test_run_tools_read_uses_offset(tmp_path):
     assert "9|L9" not in out
 
 
-class _Resp:
-    def __init__(self, status, ctype, text):
-        self.status_code = status
-        self.headers = {"content-type": ctype}
-        self.text = text
-
-
 @pytest.mark.asyncio
 async def test_run_tools_webfetch_extracts(monkeypatch, tmp_path):
+    from orbweaver.webfetch import FetchResult
+
     html = "<html><body><h1>Hello</h1><p>Comparable tools use 50+ steps.</p></body></html>"
 
-    async def fake_get(_self, url, **_k):
-        return _Resp(200, "text/html", html)
+    async def fake_fetch(url, network, **_k):
+        return FetchResult(url, url, 200, "text/html", html)
 
-    monkeypatch.setattr("httpx.AsyncClient.get", fake_get)
+    monkeypatch.setattr("orbweaver.webfetch.fetch_url", fake_fetch)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     out = await run_tools(
         "WebFetch",

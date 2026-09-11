@@ -277,17 +277,18 @@ async def test_agent_turn_stop_interrupts_bash_and_records_error_result(
 
 @pytest.mark.asyncio
 async def test_webfetch_uses_async_client(monkeypatch, tmp_path: Path):
-    import httpx
+    """WebFetch awaits the async fetcher on the running loop (no thread hop)."""
+    from orbweaver.webfetch import FetchResult
 
     calls: list[str] = []
+    loop = asyncio.get_running_loop()
 
-    async def fake_get(self, url, **_k):
+    async def fake_fetch(url, network, **_k):
+        assert asyncio.get_running_loop() is loop
         calls.append(url)
-        return httpx.Response(
-            200, headers={"content-type": "text/html"}, text="<p>async fetched</p>"
-        )
+        return FetchResult(url, url, 200, "text/html", "<p>async fetched</p>")
 
-    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    monkeypatch.setattr("orbweaver.webfetch.fetch_url", fake_fetch)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     out = await run_tools("WebFetch", {"url": "https://example.com/x"}, _ctx(ws))
     assert calls == ["https://example.com/x"]

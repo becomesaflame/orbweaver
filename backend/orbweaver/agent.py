@@ -41,7 +41,7 @@ from orbweaver.procs import BashInterrupted
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.todos import inject_session_todos, persist_todos
-from orbweaver.tooltext import format_read, format_webfetch
+from orbweaver.tooltext import format_read
 
 log = logging.getLogger(__name__)
 
@@ -908,12 +908,9 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             ctx["git_not_done"] = ritual_says_not_done(result)
         return result
     if name == "WebFetch":
-        import httpx
+        from orbweaver.webfetch import run_webfetch
 
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            r = await client.get(inp["url"])
-        ctype = r.headers.get("content-type") or ""
-        return format_webfetch(str(inp.get("url") or ""), r.status_code, ctype, r.text)
+        return await run_webfetch(inp, ctx)
     if name == "Browser":
         from orbweaver.browser import run_browser
 
