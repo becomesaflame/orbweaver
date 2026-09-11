@@ -141,6 +141,77 @@ def test_sandbox_available_in_container(monkeypatch):
     assert sandbox_available() is True
 
 
+def _setenv_map(argv: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for i, a in enumerate(argv):
+        if a == "--setenv":
+            out[argv[i + 1]] = argv[i + 2]
+    return out
+
+
+_GATEWAY_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/home/gw",
+    "USER": "gw",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "ANTHROPIC_API_KEY": "sk-ant-FAKE",
+    "OPENROUTER_API_KEY": "sk-or-FAKE",
+    "ORBWEAVER_JWT_SECRET": "x",
+    "TELEGRAM_BOT_TOKEN": "123:abc",
+    "DATABASE_URL": "postgresql://u:p@localhost/db",
+    "HINDSIGHT_API_KEY": "hs-FAKE",
+    "MY_PASSWORD": "hunter2",
+    "PGHOST": "localhost",
+}
+
+
+def test_bwrap_clears_env_and_sets_allowlist(tmp_path: Path):
+    """#93: sandboxed Bash inherited ANTHROPIC_API_KEY, the JWT secret, and the bot token."""
+    argv = build_bwrap_argv("env", tmp_path, tmp_path / "tmp", environ=_GATEWAY_ENV)
+    assert "--clearenv" in argv
+    assert argv.index("--clearenv") < argv.index("--setenv")
+    env = _setenv_map(argv)
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["HOME"] == "/home/gw"
+    assert env["LC_ALL"] == "C.UTF-8"
+    assert env["TMPDIR"] == str((tmp_path / "tmp").resolve())
+    for secret in (
+        "ANTHROPIC_API_KEY",
+        "OPENROUTER_API_KEY",
+        "ORBWEAVER_JWT_SECRET",
+        "TELEGRAM_BOT_TOKEN",
+        "DATABASE_URL",
+        "HINDSIGHT_API_KEY",
+        "MY_PASSWORD",
+        "PGHOST",
+    ):
+        assert secret not in env
+    joined = " ".join(argv)
+    assert "sk-ant-FAKE" not in joined
+    assert "hunter2" not in joined
+
+
+def test_bwrap_env_allow_passes_names_but_excludes_win(tmp_path: Path):
+    policy = SandboxPolicy(env_allow=("PGHOST", "ANTHROPIC_API_KEY", "MY_PASSWORD", "ORBWEAVER_JWT_SECRET"))
+    argv = build_bwrap_argv("env", tmp_path, tmp_path / "tmp", policy=policy, environ=_GATEWAY_ENV)
+    env = _setenv_map(argv)
+    assert env["PGHOST"] == "localhost"
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "MY_PASSWORD" not in env
+    assert "ORBWEAVER_JWT_SECRET" not in env
+
+
+def test_bwrap_ssh_auth_sock_only_when_socket_granted(tmp_path: Path):
+    sock = tmp_path / "agent.sock"
+    environ = {**_GATEWAY_ENV, "SSH_AUTH_SOCK": str(sock)}
+    argv = build_bwrap_argv("env", tmp_path, tmp_path / "tmp", environ=environ)
+    assert "SSH_AUTH_SOCK" not in _setenv_map(argv)
+    granted = SandboxPolicy(allow_unix_sockets=(sock,))
+    argv = build_bwrap_argv("env", tmp_path, tmp_path / "tmp", policy=granted, environ=environ)
+    assert _setenv_map(argv)["SSH_AUTH_SOCK"] == str(sock)
+
+
 def test_bwrap_does_not_ro_bind_git_metadata(tmp_path: Path):
     """Workspace .git is working-set writeable so clone/init/fetch can run."""
     hooks = tmp_path / ".git" / "hooks"

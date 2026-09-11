@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     orbweaver_sandbox_denied_domains: str = ""
     orbweaver_sandbox_network_default: str = ""
     orbweaver_sandbox_include_default_domains: str = ""
+    orbweaver_sandbox_env_allow: str = ""  # extra env names/globs passed into sandboxed Bash
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
     context_window: int = 200_000
