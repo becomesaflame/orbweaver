@@ -15,8 +15,11 @@ cd backend
 pip install -e ".[dev]"
 export ORBWEAVER_STORE=memory   # default; use postgres with compose
 export ANTHROPIC_API_KEY=...    # optional; without it the loop echoes
+export ORBWEAVER_JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")
 python3 -m orbweaver.cli serve
 ```
+
+`serve` refuses to start when `ORBWEAVER_JWT_SECRET` is unset, the default, or shorter than 32 bytes (anyone with the source could forge tokens). For a throwaway local run set `ORBWEAVER_DEV_INSECURE=1` instead. Cross-origin browser clients need `ORBWEAVER_CORS_ORIGINS=https://a.example,https://b.example`; the bundled web UI is same-origin and needs nothing.
 
 Mint a JWT on the gateway host (not over HTTP):
 

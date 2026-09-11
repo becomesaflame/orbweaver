@@ -10,7 +10,14 @@ class Settings(BaseSettings):
     anthropic_workspace_id: str = ""
     ollama_base_url: str = ""
     ollama_model: str = ""
+    # Required in production: >= 32 bytes, not the default. `serve` refuses to
+    # start otherwise unless ORBWEAVER_DEV_INSECURE=1.
     orbweaver_jwt_secret: str = "dev-secret-change-me"
+    orbweaver_dev_insecure: bool = False
+    # Comma-separated browser origins allowed for credentialed cross-origin
+    # calls. Empty (default) means same-origin only; the bundled web UI is
+    # served from the gateway itself and needs nothing here.
+    orbweaver_cors_origins: str = ""
     orbweaver_model: str = "claude-sonnet-4-6"
     orbweaver_classifier_model: str = "claude-sonnet-4-6"
     orbweaver_injection_probe_model: str = "claude-haiku-4-5"
@@ -81,6 +88,10 @@ class Settings(BaseSettings):
         if not self.telegram_allowlist.strip():
             return set()
         return {int(x.strip()) for x in self.telegram_allowlist.split(",") if x.strip()}
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [o.strip() for o in self.orbweaver_cors_origins.split(",") if o.strip()]
 
     @property
     def brave_api_key(self) -> str:
