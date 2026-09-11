@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     orbweaver_auto_allow_bash_if_sandboxed: bool = True
     orbweaver_sandbox_config: str = ""
     orbweaver_mcp_config: str = ""
+    # Host variable names (comma-separated) every MCP server may reference via
+    # ${VAR} in mcp.json env/headers; per-server `envPassthrough` adds to it.
+    orbweaver_mcp_env_passthrough: str = ""
+    # Auto-allow mcp_* tools whose server annotates readOnlyHint: true.
+    orbweaver_mcp_auto_allow_readonly: bool = True
     orbweaver_sandbox_additional_readonly: str = ""
     orbweaver_sandbox_additional_readwrite: str = ""
     orbweaver_sandbox_deny_read: str = ""
