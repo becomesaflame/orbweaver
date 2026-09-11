@@ -23,9 +23,8 @@ from orbweaver.compact import (
     maybe_compact,
     persist_tool_result,
     prompt_events,
-    record_usage,
+    record_response_usage,
     rehydrate_messages,
-    usage_input_tokens,
 )
 from orbweaver.compact.overflow import (
     OVERFLOW_KEEP_ROUNDS,
@@ -35,6 +34,11 @@ from orbweaver.compact.overflow import (
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
 from orbweaver.lints import read_lints
+from orbweaver.llm import (
+    prompt_cache_supported,
+    with_message_cache_breakpoint,
+    with_tool_cache_breakpoint,
+)
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import (
     PermissionDecision,
@@ -91,7 +95,11 @@ TOOL_SPEC = [
             "Relative paths are the session workspace. Absolute paths in extra sandbox "
             "roots are auto-allowed; other host paths are classified. Use offset "
             "(1-based line, or negative from the end) and limit to page text; do not "
-            "page files with Bash. The result says how to continue when truncated."
+            "page files with Bash. Default limit is 400 lines: Grep (or one wide Read) "
+            "to find a symbol; do not take tiny windows, and do not re-Read a path "
+            "already in this turn unless its result was truncated or cleared. Once you "
+            "have the numbered lines, edit with StrReplace. The result says how to "
+            "continue when truncated."
         ),
         "input_schema": {
             "type": "object",
@@ -1181,13 +1189,21 @@ async def _create_with_overflow_retry(
         if nudge:
             _nudge_user(messages, nudge)
         messages = ensure_tool_use_results(messages)
+        send_tools = tools
+        if prompt_cache_supported(client):
+            # Breakpoints: static system block (build_agent_system), the tools
+            # array when large, and the final user block. Each round appends
+            # tool results after the previous breakpoint, so the prefix is a
+            # cache read. Only Anthropic sees these; the Ollama shim drops them.
+            messages = with_message_cache_breakpoint(messages)
+            send_tools = with_tool_cache_breakpoint(tools)
         try:
             return await _await_or_cancel(
                 client.messages.create(
                     model=model,
                     max_tokens=4096,
                     system=cast(Any, system),
-                    tools=cast(Any, tools),
+                    tools=cast(Any, send_tools),
                     messages=cast(Any, messages),
                 ),
                 cancel,
@@ -1490,7 +1506,7 @@ async def agent_turn(
             events = await store.list_events(session_id)
             ctx["events"] = events
             last_seq = events[-1].seq if events else 0
-            record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
+            record_response_usage(session_id, getattr(resp, "usage", None), last_seq)
             tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
             if texts:
@@ -1688,7 +1704,7 @@ async def agent_turn(
                 return produced
             events = await store.list_events(session_id)
             last_seq = events[-1].seq if events else 0
-            record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
+            record_response_usage(session_id, getattr(resp, "usage", None), last_seq)
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
             if texts:
                 fire(
