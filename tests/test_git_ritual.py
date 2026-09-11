@@ -239,7 +239,9 @@ async def test_run_tools_bash_echo_has_no_ritual(tmp_path: Path, monkeypatch):
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     ctx = {"workspace": ws, "store": reset_store_for_tests(), "session_id": uuid4()}
     result = await run_tools("Bash", {"command": "echo hi"}, ctx)
-    assert result.strip() == "hi"
+    header, body = result.strip().split("\n", 1)
+    assert header.startswith("exit 0 in ")
+    assert body == "hi"
     assert RITUAL_MARK not in result
 
 

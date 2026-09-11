@@ -259,6 +259,61 @@ def test_persist_writes_preview_and_file(tmp_path, monkeypatch):
     assert search == big
 
 
+def test_persist_preview_keeps_tail_with_failure_line(tmp_path):
+    """Issue #104: a 300 KB pytest run ends in FAILED; the stored preview must show it."""
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    last = "FAILED tests/x.py::test_y"
+    body = "".join(f"tests/other.py::test_{i} PASSED\n" for i in range(10_000))
+    body = body[: 300_000 - len(last) - 1].rsplit("\n", 1)[0] + "\n" + last
+    assert 299_000 <= len(body) <= 300_000
+    stored, rel = persist_tool_result(ws, "toolu_fail", "Bash", body)
+    assert rel == ".orbweaver/tool-results/toolu_fail.txt"
+    assert ws.read(rel) == body
+    assert last in stored
+    assert "tests/other.py::test_0 PASSED" in stored
+    assert "chars omitted" in stored
+    assert f"full output saved to {rel}" in stored
+    assert stored.rstrip().endswith("</persisted-output>")
+    assert len(stored) <= settings.compact_tool_result_chars
+    # The marker is on its own line between head and tail.
+    lines = stored.splitlines()
+    marker = next(ln for ln in lines if ln.startswith("[... "))
+    assert marker.endswith(" ...]")
+
+
+def test_persist_line_cap_keeps_first_and_last_lines(tmp_path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    body = "\n".join(f"L{i}" for i in range(5000))
+    assert len(body) < 40_000
+    stored, rel = persist_tool_result(ws, "toolu_lines", "Bash", body)
+    assert rel is not None
+    assert "L0\n" in stored
+    assert "\nL4999" in stored
+    assert "L2500" not in stored
+    assert "chars omitted (" in stored and "lines);" in stored
+    assert len(stored.splitlines()) <= 2000
+
+
+def test_persist_small_output_is_unchanged(tmp_path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    small = "exit 0 in 0.02s\nhello\nworld\n"
+    stored, rel = persist_tool_result(ws, "toolu_small", "Bash", small)
+    assert rel is None
+    assert stored == small
+    assert not (tmp_path / ".orbweaver" / "tool-results").exists()
+
+
+def test_persist_mcp_result_gets_head_tail_preview(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "compact_tool_result_chars", 2000)
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    body = "HEAD-MARK\n" + ("row\n" * 5000) + "TAIL-MARK"
+    stored, rel = persist_tool_result(ws, "toolu_mcp", "mcp_server_tool", body)
+    assert rel == ".orbweaver/tool-results/toolu_mcp.txt"
+    assert "HEAD-MARK" in stored
+    assert "TAIL-MARK" in stored
+    assert "chars omitted" in stored
+
+
 @pytest.mark.asyncio
 async def test_session_notes_used_as_summary(monkeypatch):
     store = reset_store_for_tests()
