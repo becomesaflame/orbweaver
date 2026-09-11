@@ -24,7 +24,9 @@ from orbweaver.compact import (
     live_events,
     maybe_compact,
     persist_tool_result,
+    probe_stats,
     prompt_events,
+    record_probe_usage,
     record_response_usage,
     rehydrate_messages,
 )
@@ -49,7 +51,13 @@ from orbweaver.permissions import (
     can_use_tool,
     denial_state_for,
 )
-from orbweaver.permissions.injection_probe import probe_tool_output
+from orbweaver.permissions.injection_probe import (
+    ProbeItem,
+    await_round_probes,
+    probe_tool_output,
+    should_probe,
+    start_round_probes,
+)
 from orbweaver.permissions.pipeline import summarize_input
 from orbweaver.permissions.session_rules import (
     add_session_rule,
@@ -1646,6 +1654,64 @@ async def agent_turn(
         fire(await store.append_event(session_id, "turn_aborted", payload))
         fire(await store.append_event(session_id, "assistant", {"text": exc.message}))
 
+    probe_task: asyncio.Task[int] | None = None
+
+    async def flag_injection(item: ProbeItem) -> None:
+        fire(
+            await store.append_event(
+                session_id,
+                "injection_warning",
+                {"tool_use_id": item.tool_use_id, "name": item.name},
+            )
+        )
+
+    def launch_probes(items: list[ProbeItem]) -> None:
+        nonlocal probe_task
+        if not items:
+            return
+        probe_task = start_round_probes(
+            items,
+            on_flagged=flag_injection,
+            session_id=session_id,
+            probe=probe_tool_output,
+        )
+
+    async def settle_probes() -> None:
+        """Wait a short budget for the last round's probes; late ones finish in the background.
+
+        A warning that arrives after the budget still attaches to its tool_result in the
+        *next* prompt (see ``flagged_tool_use_ids``), so the round is not blocked on it.
+        """
+        nonlocal probe_task
+        if probe_task is None:
+            return
+        if await await_round_probes(probe_task):
+            probe_task = None
+        else:
+            stats = record_probe_usage(session_id, calls=0, results=0, late=1)
+            log.info(
+                "injection probe over budget for session %s; warning (if any) lands in a later prompt "
+                "(late=%d)",
+                session_id,
+                stats.late,
+            )
+        stats = probe_stats(session_id)
+        if stats.calls:
+            log.info(
+                "injection probe session %s: calls=%d results=%d flagged=%d late=%d "
+                "latency=%.2fs tokens_in=%d tokens_out=%d",
+                session_id,
+                stats.calls,
+                stats.results,
+                stats.flagged,
+                stats.late,
+                stats.latency_s,
+                stats.input_tokens,
+                stats.output_tokens,
+            )
+
+    round_probes: list[ProbeItem] = []
+
     stuck_detector = StuckDetector()
 
     async def check_stuck() -> None:
@@ -1736,8 +1802,11 @@ async def agent_turn(
         async with tool_slots:
             raw = await run_tools(block.name, inp, ctx)
         text, persisted_path = persist_tool_result(workspace, str(block.id), block.name, raw)
-        probed = await probe_tool_output(block.name, text)
-        return _ToolOutcome(probed["output"], persisted_path, bool(probed.get("flagged")))
+        # Probes run after the round, concurrently (see launch_probes); a flagged
+        # result gets its warning via an injection_warning event.
+        if should_probe(block.name, inp, text, workspace):
+            round_probes.append(ProbeItem(str(block.id), block.name, text))
+        return _ToolOutcome(text, persisted_path)
 
     async def execute_tool(block: Any, decision: PermissionDecision) -> _ToolOutcome:
         """Fast path: run an allowed tool_use; blocked (deny / unheld ask) calls get the gate text."""
@@ -1933,6 +2002,7 @@ async def agent_turn(
                 )
             elif ctx.pop("git_not_done_nudge_pending", False):
                 nudge = GIT_NOT_DONE_NUDGE
+            await settle_probes()
             try:
                 resp = await _create_with_overflow_retry(
                     client,
@@ -1975,6 +2045,7 @@ async def agent_turn(
             approval_timed_out = False
             waiting_ask = False
             instruction_blocks: list[str] = []
+            del round_probes[:]
             # #99: consecutive concurrency-safe calls (Read, Grep, ...) form one
             # batch and run together; every unsafe call is a batch of one and a
             # barrier. tool_call events for a batch are recorded up front and
@@ -2112,6 +2183,7 @@ async def agent_turn(
                         },
                     )
                 )
+            launch_probes(list(round_probes))
             if waiting_ask:
                 break
             if approval_timed_out:
@@ -2140,6 +2212,7 @@ async def agent_turn(
                 store, session_id, client=client, workspace=workspace, system=system
             )
         else:
+            await settle_probes()
             await deliver_child_results()
             try:
                 resp = await _create_with_overflow_retry(
