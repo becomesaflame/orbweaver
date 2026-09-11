@@ -112,6 +112,9 @@ class Settings(BaseSettings):
     orbweaver_image_model: str = "dall-e-3"
     orbweaver_image_size: str = "1024x1024"
     orbweaver_linter: str = ""  # e.g. ruff check {paths} ; empty uses the Python AST stub
+    # Write/StrReplace/NotebookEdit/Delete on an existing file require a prior Read
+    # this session and refuse when the file changed on disk since that Read.
+    edit_require_read: bool = True
     orbweaver_search_provider: str = ""  # duckduckgo | brave | empty auto
     orbweaver_brave_api_key: str = ""
     brave_search_api_key: str = ""
