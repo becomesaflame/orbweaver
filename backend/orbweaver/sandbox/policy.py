@@ -104,6 +104,9 @@ class SandboxPolicy:
     deny_read: tuple[Path, ...] = ()
     allow_unix_sockets: tuple[Path, ...] = ()
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
+    # Keep .git/config writable inside the sandbox for `git remote set-url`
+    # workflows. .git/hooks and .gitmodules stay read-only either way (#94).
+    allow_git_config: bool = False
 
     def readwrite_roots(self, workspace_root: Path, tmp_dir: Path | None = None) -> tuple[Path, ...]:
         roots = [workspace_root.resolve()]
@@ -206,6 +209,13 @@ def _merge_file(
     net_raw = data.get("networkPolicy") or data.get("network_policy")
     if isinstance(net_raw, dict):
         network = _merge_network(network, net_raw)
+    allow_git_config = policy.allow_git_config
+    git_raw = data.get("allowGitConfig", data.get("allow_git_config"))
+    if git_raw is not None:
+        if isinstance(git_raw, str):
+            allow_git_config = git_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            allow_git_config = bool(git_raw)
     return replace(
         policy,
         additional_readonly=add_paths(policy.additional_readonly, "additionalReadonlyPaths"),
@@ -213,6 +223,7 @@ def _merge_file(
         deny_read=add_paths(policy.deny_read, "denyRead"),
         allow_unix_sockets=add_paths(policy.allow_unix_sockets, "allowUnixSockets"),
         network=network,
+        allow_git_config=allow_git_config,
     )
 
 
@@ -325,6 +336,13 @@ def load_sandbox_policy(
         if item not in deny_dom:
             deny_dom.append(item)
 
+    allow_git_config = policy.allow_git_config
+    git_env = env.get("ORBWEAVER_SANDBOX_ALLOW_GIT_CONFIG")
+    if git_env is None or git_env == "":
+        git_env = str(getattr(cfg, "orbweaver_sandbox_allow_git_config", "") or "")
+    if str(git_env).strip() != "":
+        allow_git_config = str(git_env).strip().lower() in {"1", "true", "yes"}
+
     policy = SandboxPolicy(
         additional_readonly=tuple(_unique_paths(paths_ro)),
         additional_readwrite=tuple(_unique_paths(paths_rw)),
@@ -336,6 +354,7 @@ def load_sandbox_policy(
             allow=tuple(allow),
             deny=tuple(deny_dom),
         ),
+        allow_git_config=allow_git_config,
     )
     policy = _with_hardcoded_denies(policy, home=home_dir, environ=env)
     deny = list(policy.deny_read)

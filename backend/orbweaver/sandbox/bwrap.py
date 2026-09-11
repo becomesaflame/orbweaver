@@ -118,6 +118,73 @@ def _deny_read_overlay_args(hidden: Path) -> list[str]:
     return []
 
 
+# A writable root is `--bind` rw, but files that execute host commands when git
+# runs must stay read-only: `.git/config` (core.fsmonitor, core.sshCommand,
+# aliases, …), `.git/hooks/*`, and `.gitmodules`. The rest of `.git` stays
+# writable so `git add`/`git commit` still work in the sandbox (issue #94).
+# Discovery is a bounded walk; repos nested deeper than this are not protected
+# (matches sandbox-runtime's --max-depth cap and keeps per-command cost cheap).
+GIT_SCAN_MAX_DEPTH = 4
+_GIT_SCAN_PRUNE = {
+    ".git",
+    "node_modules",
+    ".orbweaver-tmp",
+    ".venv",
+    "venv",
+    "__pycache__",
+}
+
+
+def git_protected_paths(
+    root: Path,
+    max_depth: int = GIT_SCAN_MAX_DEPTH,
+    *,
+    allow_git_config: bool = False,
+) -> list[Path]:
+    """`.git/config`, `.git/hooks`, and `.gitmodules` for every repo at or under
+    `root`, up to `max_depth` directories deep. Missing paths are fine: the caller
+    uses `--ro-bind-try`, which skips them (and skips `.git/hooks` for worktrees
+    where `.git` is a file). With `allow_git_config`, `.git/config` stays writable
+    (hooks and .gitmodules do not)."""
+    out: list[Path] = []
+    try:
+        base = root.resolve()
+    except OSError:
+        return out
+    stack: list[tuple[Path, int]] = [(base, 0)]
+    while stack:
+        directory, depth = stack.pop()
+        git_dir = directory / ".git"
+        try:
+            if git_dir.is_dir():
+                if not allow_git_config:
+                    out.append(git_dir / "config")
+                out.append(git_dir / "hooks")
+        except OSError:
+            pass
+        gitmodules = directory / ".gitmodules"
+        try:
+            if gitmodules.is_file():
+                out.append(gitmodules)
+        except OSError:
+            pass
+        if depth >= max_depth:
+            continue
+        try:
+            for child in os.scandir(directory):
+                if child.name in _GIT_SCAN_PRUNE:
+                    continue
+                try:
+                    is_dir = child.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_dir:
+                    stack.append((Path(child.path), depth + 1))
+        except OSError:
+            continue
+    return out
+
+
 def _dir_chain(path: Path) -> list[str]:
     posix = path.as_posix()
     if not posix.startswith("/"):
@@ -194,11 +261,20 @@ def build_bwrap_argv(
     for hidden in pol.deny_read:
         argv.extend(_deny_read_overlay_args(hidden))
     argv.extend(ssh_identity_bind_args())
-    for rw in pol.readwrite_roots(root, tmp):
+    writable_roots = pol.readwrite_roots(root, tmp)
+    for rw in writable_roots:
         argv.extend(["--bind", str(rw), str(rw)])
     for rel in PROTECTED_WRITE_REL:
         protected = root / rel
         argv.extend(["--ro-bind-try", str(protected), str(protected)])
+    seen_git: set[str] = set()
+    for rw in writable_roots:
+        for git_path in git_protected_paths(rw, allow_git_config=pol.allow_git_config):
+            dest = str(git_path)
+            if dest in seen_git:
+                continue
+            seen_git.add(dest)
+            argv.extend(["--ro-bind-try", dest, dest])
     argv.extend(["--setenv", "TMPDIR", str(tmp), "--chdir", str(root), "--", "bash", "-lc", command])
     return argv
 

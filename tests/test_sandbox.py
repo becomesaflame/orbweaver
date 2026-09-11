@@ -141,18 +141,97 @@ def test_sandbox_available_in_container(monkeypatch):
     assert sandbox_available() is True
 
 
-def test_bwrap_does_not_ro_bind_git_metadata(tmp_path: Path):
-    """Workspace .git is working-set writeable so clone/init/fetch can run."""
+def _ro_bind_dests(argv: list[str]) -> set[str]:
+    dests: set[str] = set()
+    i = 0
+    while i < len(argv):
+        if argv[i] in {"--ro-bind", "--ro-bind-try"} and i + 2 < len(argv):
+            dests.add(argv[i + 2])
+            i += 3
+            continue
+        i += 1
+    return dests
+
+
+def _bind_dests(argv: list[str]) -> set[str]:
+    dests: set[str] = set()
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--bind" and i + 2 < len(argv):
+            dests.add(argv[i + 2])
+            i += 3
+            continue
+        i += 1
+    return dests
+
+
+def test_bwrap_ro_binds_git_config_hooks_gitmodules(tmp_path: Path):
+    """Issue #94: .git/config, .git/hooks, and .gitmodules stay read-only inside a
+    writable root so a hostile config cannot execute host commands."""
     hooks = tmp_path / ".git" / "hooks"
     hooks.mkdir(parents=True)
     config = tmp_path / ".git" / "config"
     config.write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+    gitmodules = tmp_path / ".gitmodules"
+    gitmodules.write_text("[submodule \"x\"]\n", encoding="utf-8")
     argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp")
-    protected = {str(hooks.resolve()), str(config.resolve())}
-    i = 0
-    while i < len(argv):
-        if argv[i] in {"--ro-bind", "--ro-bind-try"} and i + 2 < len(argv):
-            assert argv[i + 2] not in protected
-            i += 3
-            continue
-        i += 1
+    ro = _ro_bind_dests(argv)
+    assert str(config.resolve()) in ro
+    assert str(hooks.resolve()) in ro
+    assert str(gitmodules.resolve()) in ro
+    # The workspace itself and the rest of .git stay writable.
+    assert str(tmp_path.resolve()) in _bind_dests(argv)
+    assert str((tmp_path / ".git").resolve()) not in ro
+    # The git ro-binds come after the workspace rw --bind so they win.
+    joined = argv.index(str(config.resolve()))
+    bind_i = next(
+        i for i, a in enumerate(argv)
+        if a == "--bind" and argv[i + 1] == str(tmp_path.resolve())
+    )
+    assert bind_i < joined
+
+
+def test_bwrap_ro_binds_nested_repo_git_metadata(tmp_path: Path):
+    nested = tmp_path / "sub" / "pkg"
+    (nested / ".git" / "hooks").mkdir(parents=True)
+    (nested / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp")
+    ro = _ro_bind_dests(argv)
+    assert str((nested / ".git" / "config").resolve()) in ro
+    assert str((nested / ".git" / "hooks").resolve()) in ro
+
+
+def test_bwrap_allow_git_config_keeps_config_writable(tmp_path: Path):
+    hooks = tmp_path / ".git" / "hooks"
+    hooks.mkdir(parents=True)
+    config = tmp_path / ".git" / "config"
+    config.write_text("[core]\n", encoding="utf-8")
+    policy = SandboxPolicy(allow_git_config=True)
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp", policy=policy)
+    ro = _ro_bind_dests(argv)
+    assert str(config.resolve()) not in ro
+    # Hooks stay read-only regardless of allowGitConfig.
+    assert str(hooks.resolve()) in ro
+
+
+def test_git_protected_paths_respects_depth_and_worktree(tmp_path: Path):
+    from orbweaver.sandbox.bwrap import GIT_SCAN_MAX_DEPTH, git_protected_paths
+
+    (tmp_path / ".git" / "hooks").mkdir(parents=True)
+    (tmp_path / ".git" / "config").write_text("x", encoding="utf-8")
+    # A worktree: .git is a file, so hooks/config never exist there.
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+    # Too deep to be scanned.
+    deep = tmp_path
+    for part in ["a", "b", "c", "d", "e", "f"][: GIT_SCAN_MAX_DEPTH + 2]:
+        deep = deep / part
+    (deep / ".git").mkdir(parents=True)
+    (deep / ".git" / "config").write_text("x", encoding="utf-8")
+
+    found = {str(p) for p in git_protected_paths(tmp_path)}
+    assert str(tmp_path / ".git" / "config") in found
+    assert str(tmp_path / ".git" / "hooks") in found
+    assert str(worktree / ".git" / "config") not in found
+    assert str(deep / ".git" / "config") not in found
