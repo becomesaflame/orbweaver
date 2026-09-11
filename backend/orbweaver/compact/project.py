@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import replace
+import math
+import os
+from dataclasses import dataclass, replace
 from typing import Any
 
 from orbweaver.config import settings
@@ -16,13 +18,24 @@ from orbweaver.tokens import estimate_tokens
 log = logging.getLogger(__name__)
 
 BOUNDARY_KINDS = frozenset({"compact_boundary", "compact_summary"})
+# Nested AGENTS.md / CLAUDE.md / .cursor/rules discovered mid-turn; rendered on the user
+# side after the tool results of the round that touched the directory.
+PROJECT_INSTRUCTIONS_KIND = "project_instructions"
 COMPACTABLE_TOOLS = frozenset({"Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch", "Browser"})
+# Tools that change a file in place; a Read of that path is kept while it is being edited.
+EDIT_TOOLS = frozenset({"Write", "StrReplace"})
+MICRO_STUB = "[Old tool result content cleared]"
+# Results below this many chars are not worth a prefix-cache miss to stub.
+MICRO_SMALL_RESULT_CHARS = 1000
 PAIR_KINDS = frozenset(
     {
         "tool_call",
         "tool_result",
         "MemoryRecall",
         "permission_decision",
+        "permission_request",
+        "permission_response",
+        "permission_rule_added",
         "injection_warning",
         "patch_proposal",
         "schedule_request",
@@ -126,28 +139,147 @@ def choose_keep_from_recent_rounds(live: list[Event], n_rounds: int) -> int:
     return body[keep_idx].seq
 
 
+@dataclass
+class _MicroCandidate:
+    ev: Event
+    size: int
+    round_no: int
+    protected: bool
+
+
+def _result_text(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if content is None or content == "":
+        content = payload.get("text") or ""
+    return content if isinstance(content, str) else str(content)
+
+
+def _norm_path(raw: Any) -> str:
+    text = str(raw or "").strip()
+    return os.path.normpath(text) if text else ""
+
+
+def _micro_stub(payload: dict[str, Any]) -> str:
+    stub = MICRO_STUB
+    path = payload.get("persisted_path")
+    if path:
+        stub = f"{stub} Full output: {path}"
+    return stub
+
+
+def _micro_candidates(events: list[Event]) -> tuple[list[_MicroCandidate], int]:
+    """Compactable results with size, tool-round index, and edited-since-Read protection."""
+    call_info: dict[str, tuple[str, str]] = {}
+    edits: list[tuple[int, str]] = []
+    reads: list[tuple[int, str, _MicroCandidate]] = []
+    candidates: list[_MicroCandidate] = []
+    round_no = 0
+    prev_kind = ""
+    for idx, ev in enumerate(events):
+        p = ev.payload
+        if ev.kind == "tool_call":
+            if prev_kind != "tool_call":
+                round_no += 1
+            name = str(p.get("name") or "")
+            path = _norm_path((p.get("input") or {}).get("path"))
+            call_info[str(p.get("id") or ev.id)] = (name, path)
+            if name in EDIT_TOOLS and path:
+                edits.append((idx, path))
+        elif ev.kind in {"tool_result", "MemoryRecall"}:
+            name = str(p.get("name") or "")
+            if name in COMPACTABLE_TOOLS:
+                cand = _MicroCandidate(
+                    ev=ev,
+                    size=len(_result_text(p)),
+                    round_no=round_no,
+                    protected=False,
+                )
+                candidates.append(cand)
+                if name == "Read":
+                    _, path = call_info.get(str(p.get("tool_use_id") or ""), ("", ""))
+                    if path:
+                        reads.append((idx, path, cand))
+        prev_kind = ev.kind
+    for idx, path, cand in reads:
+        if any(e_idx > idx and e_path == path for e_idx, e_path in edits):
+            cand.protected = True
+    return candidates, round_no
+
+
 def microcompact_events(events: list[Event]) -> list[Event]:
-    """Stub old compactable tool results in a copied list. Store rows stay intact."""
+    """Stub old compactable tool results in a copied list. Store rows stay intact.
+
+    Runs only under pressure. The decision is a pure function of the event
+    list (payload token estimate vs ``event_budget``), never of the API usage
+    anchor: the anchor measures the already-stubbed prompt, so gating on it
+    would restore and re-clear the same results on alternate rounds and the
+    Anthropic prefix cache would never hit.
+
+    Rules, in order:
+
+    * The newest ``compact_micro_keep`` compactable results are never stubbed.
+    * A ``Read`` whose path was later edited by Write/StrReplace in this window
+      is never stubbed; the model is working on that file.
+    * Age rule: a result older than ``compact_micro_stale_rounds`` tool rounds
+      and larger than ``compact_micro_stale_chars`` is stubbed regardless of
+      pressure.
+    * Pressure rule: when the payload estimate exceeds
+      ``compact_micro_pressure * event_budget``, clear the oldest large results
+      first until the estimate is back under the line. The amount cleared is
+      rounded up to whole chunks of ``(pressure - release) * event_budget`` so
+      the cleared set, and therefore the message prefix, stays identical across
+      the rounds it takes to grow another chunk.
+
+    Below the pressure line nothing is stubbed, so round N+1's messages are
+    round N's plus the new assistant/tool blocks.
+    """
+    candidates, current_round = _micro_candidates(events)
+    if not candidates:
+        return list(events)
     keep_n = max(1, int(settings.compact_micro_keep))
-    compactable_ids: list[object] = []
-    for ev in events:
-        if ev.kind not in {"tool_result", "MemoryRecall"}:
-            continue
-        name = str(ev.payload.get("name") or "")
-        if name in COMPACTABLE_TOOLS:
-            compactable_ids.append(ev.id)
-    drop = set(compactable_ids[:-keep_n]) if len(compactable_ids) > keep_n else set()
-    if not drop:
+    floor_ids = {c.ev.id for c in candidates[-keep_n:]}
+    eligible = [c for c in candidates if c.ev.id not in floor_ids and not c.protected]
+    if not eligible:
+        return list(events)
+
+    cleared: set[object] = set()
+    stale_rounds = int(settings.compact_micro_stale_rounds)
+    stale_chars = max(0, int(settings.compact_micro_stale_chars))
+    if stale_rounds > 0:
+        for c in eligible:
+            if current_round - c.round_no > stale_rounds and c.size >= stale_chars:
+                cleared.add(c.ev.id)
+
+    def saving(c: _MicroCandidate) -> int:
+        before = estimate_tokens(_result_text(c.ev.payload))
+        return max(0, before - estimate_tokens(_micro_stub(c.ev.payload)))
+
+    budget = int(settings.event_budget)
+    pressure = float(settings.compact_micro_pressure)
+    release = float(settings.compact_micro_release)
+    line = budget * pressure
+    total = event_token_count(events) - sum(saving(c) for c in eligible if c.ev.id in cleared)
+    if total > line:
+        needed = total - line
+        chunk = (pressure - release) * budget if release < pressure else 0.0
+        goal = math.ceil(needed / chunk) * chunk if chunk >= 1 else needed
+        saved = 0
+        for c in eligible:
+            if saved >= goal:
+                break
+            if c.ev.id in cleared or c.size < MICRO_SMALL_RESULT_CHARS:
+                continue
+            cleared.add(c.ev.id)
+            saved += saving(c)
+
+    if not cleared:
         return list(events)
     out: list[Event] = []
     for ev in events:
-        if ev.id not in drop:
+        if ev.id not in cleared:
             out.append(ev)
             continue
-        path = ev.payload.get("persisted_path")
-        stub = "[Old tool result content cleared]"
-        if path:
-            stub = f"{stub} Full output: {path}"
+        stub = _micro_stub(ev.payload)
         payload = dict(ev.payload)
         payload["content"] = stub
         if "text" in payload:
@@ -249,6 +381,16 @@ def _tool_result_id_set(msg: dict[str, Any] | None) -> set[str]:
         for b in _content_blocks(msg.get("content"))
         if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")
     }
+
+
+def _is_tool_result_message(msg: dict[str, Any] | None) -> bool:
+    """User message made only of tool_result blocks (results of one assistant round)."""
+    if not msg or msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    return all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
 
 
 def _stub_tool_result(tool_use_id: str) -> dict[str, Any]:
@@ -372,20 +514,26 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
             tool_use_id = p.get("tool_use_id") or p.get("id") or "unknown"
             if flagged and str(tool_use_id) in flagged:
                 content = _with_injection_warning(content)
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": content,
-                        }
-                    ],
-                }
-            )
+            block: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+            }
+            if p.get("is_error"):
+                block["is_error"] = True
+            # A parallel round records tool_call, tool_call, result, result: all
+            # results for one assistant message belong in one user message.
+            if _is_tool_result_message(messages[-1] if messages else None):
+                messages[-1]["content"].append(block)
+            else:
+                messages.append({"role": "user", "content": [block]})
         elif k in STOP_KINDS:
             _flush_pending_tools(messages, pending_tool, stub_results=True)
+        elif k == PROJECT_INSTRUCTIONS_KIND:
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
+            text = str(p.get("text") or "")
+            if text:
+                _append_user_content(messages, text)
         elif k == "UserCorrection":
             _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append(
@@ -394,6 +542,12 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                     "content": f"User correction: {p.get('text') or json.dumps(p)}",
                 }
             )
+        elif k == "subagent_result":
+            # Background child finished: user-side note, like an injected follow-up.
+            from orbweaver.subagent import format_subagent_result
+
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
+            _append_user_content(messages, format_subagent_result(p))
         elif k in BOUNDARY_KINDS:
             _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append(

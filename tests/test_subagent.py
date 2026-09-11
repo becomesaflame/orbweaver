@@ -90,6 +90,7 @@ async def test_spawn_creates_hidden_child_session(tmp_path, ws, monkeypatch, aut
     assert captured["user_text"] == "list the files"
     assert captured["kwargs"]["subagent_depth"] == 1
     assert captured["kwargs"]["max_rounds"] == SUBAGENT_MAX_ROUNDS
+    assert captured["kwargs"]["max_rounds"] == 24
     names = {t["name"] for t in captured["kwargs"]["tools"]}
     assert CHILD_BLOCKED_TOOLS.isdisjoint(names)
     assert "Read" in names

@@ -7,7 +7,6 @@ import logging
 import os
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -29,8 +28,30 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from orbweaver import __version__
-from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel, pending_ask_user
-from orbweaver.auth import mint_token, require_user
+from orbweaver.agent import (
+    APPROVAL_DECISIONS,
+    APPROVAL_SCOPES,
+    TurnCancelled,
+    agent_turn,
+    normalize_channel,
+    pending_ask_user,
+    resolve_approval,
+)
+from orbweaver.auth import (
+    WS_BEARER_SUBPROTOCOL,
+    check_jwt_secret,
+    decode_token,
+    mint_token,
+    require_user,
+    websocket_subprotocol_token,
+)
+from orbweaver.checkpoints import (
+    CheckpointError,
+    CheckpointHeadMismatch,
+    find_checkpoint,
+    restore_checkpoint,
+    turn_edits_files,
+)
 from orbweaver.config import settings
 from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
 from orbweaver.ratelimit import FileRateLimiter, get_rate_limiter
@@ -44,6 +65,11 @@ from orbweaver.store import (
     session_at_id,
 )
 from orbweaver.subagent import is_subagent_session
+from orbweaver.turns import RunningTurn
+from orbweaver.turns import acquire as acquire_turn
+from orbweaver.turns import get as get_running_turn
+from orbweaver.turns import is_running as turn_is_running
+from orbweaver.turns import release as release_turn
 from orbweaver.uris import (
     WorkspaceURIError,
     list_workspace_dirs,
@@ -71,6 +97,9 @@ WEB_DIR = _web_dir()
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # Refuse to serve with a forgeable JWT secret (issue #97). Raising here
+    # makes uvicorn log "Application startup failed" and exit non-zero.
+    check_jwt_secret(settings)
     store = get_store()
     connect = getattr(store, "connect", None)
     if connect:
@@ -88,14 +117,25 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
+def configure_cors(target: FastAPI, origins: list[str]) -> None:
+    """Allow credentialed cross-origin calls only from `origins`.
+
+    The default (empty list) is same-origin only: the bundled web UI is served
+    by this process, so browsers never need CORS for it. `*` with credentials
+    is rejected by browsers and would echo any Origin, so credentials are only
+    enabled for an explicit origin list.
+    """
+    target.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=bool(origins) and "*" not in origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
 app = FastAPI(title="Orbweaver", lifespan=_lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configure_cors(app, settings.cors_origins)
 
 
 _RATE_LIMIT_WINDOW_S = 60.0
@@ -227,8 +267,18 @@ class CancelTurnBody(BaseModel):
     discard: bool = False
 
 
+class ApproveBody(BaseModel):
+    tool_use_id: str
+    decision: str  # allow | deny
+    scope: str = "once"  # once | session
+
+
 class RewindBody(BaseModel):
     from_seq: int
+    # None: restore when a discarded turn called a file-editing tool.
+    restore_files: bool | None = None
+    # Restore even when the workspace HEAD moved since the checkpoint.
+    force: bool = False
 
 
 class JobBody(BaseModel):
@@ -248,15 +298,6 @@ def _user(request: Request) -> dict:
     return require_user(request)
 
 
-@dataclass
-class RunningTurn:
-    cancel: asyncio.Event
-    inject: asyncio.Event = field(default_factory=asyncio.Event)
-    discard: bool = False
-    user_seq: int = 0
-
-
-_running_turns: dict[UUID, RunningTurn] = {}
 _ws_subscribers: dict[UUID, set[WebSocket]] = defaultdict(set)
 _GENERIC_TITLES = {"", "web", "session", "New chat", "vscode"}
 
@@ -619,17 +660,16 @@ async def _run_turn(
     *,
     resume: bool = False,
 ) -> dict[str, Any]:
-    if session_id in _running_turns:
+    state = acquire_turn(session_id, channel=_stored_channel(sess.jsonld) or "web")
+    if state is None:
         raise HTTPException(409, "turn already running")
-    if not resume:
-        await _maybe_autotitle(store, sess, user_text)
-    ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
-    if changed:
-        await store.put_entity(sess)
-    state = RunningTurn(cancel=asyncio.Event())
-    _running_turns[session_id] = state
     result: dict[str, Any] | None = None
     try:
+        if not resume:
+            await _maybe_autotitle(store, sess, user_text)
+        ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
+        if changed:
+            await store.put_entity(sess)
         events = await agent_turn(
             store,
             session_id,
@@ -678,9 +718,7 @@ async def _run_turn(
             raise HTTPException(status_code=502, detail=e.message) from e
         raise
     finally:
-        current = _running_turns.get(session_id)
-        if current is state:
-            _running_turns.pop(session_id, None)
+        release_turn(session_id, state)
         if result is not None:
             _broadcast(
                 session_id,
@@ -708,14 +746,28 @@ async def inject_turn(
     text = body.text.strip()
     if not text:
         raise HTTPException(400, "text is required")
-    state = _running_turns.get(session_id)
+    state = get_running_turn(session_id)
     if not state:
         raise HTTPException(409, "no turn is running")
-    store = get_store()
-    ev = await store.append_event(session_id, "user", {"text": text, "injected": True})
+    ev = await inject_into_turn(get_store(), session_id, state, text)
+    return {"status": "injected", "seq": ev.seq, "event": _event_dict(ev)}
+
+
+async def inject_into_turn(
+    store,
+    session_id: UUID,
+    state: RunningTurn,
+    text: str,
+    images: list[dict[str, str]] | None = None,
+) -> Any:
+    """Append a follow-up user event to a running turn and wake its LLM call."""
+    payload: dict[str, Any] = {"text": text, "injected": True}
+    if images:
+        payload["images"] = images
+    ev = await store.append_event(session_id, "user", payload)
     state.inject.set()
     _broadcast(session_id, _event_dict(ev))
-    return {"status": "injected", "seq": ev.seq, "event": _event_dict(ev)}
+    return ev
 
 
 @app.post("/v1/sessions/{session_id}/turns/continue")
@@ -736,12 +788,39 @@ async def continue_turn(session_id: UUID, _u: dict = Depends(_user)) -> dict[str
 async def cancel_turn(
     session_id: UUID, body: CancelTurnBody, _u: dict = Depends(_user)
 ) -> dict[str, Any]:
-    state = _running_turns.get(session_id)
+    state = get_running_turn(session_id)
     if not state:
         return {"status": "idle"}
     state.discard = body.discard
     state.cancel.set()
     return {"status": "cancelling", "discard": body.discard}
+
+
+def _approve(session_id: UUID, tool_use_id: str, decision: str, scope: str) -> dict[str, Any]:
+    decision = (decision or "").strip().lower()
+    scope = (scope or "once").strip().lower() or "once"
+    if decision not in APPROVAL_DECISIONS:
+        raise HTTPException(400, f"decision must be one of {sorted(APPROVAL_DECISIONS)}")
+    if scope not in APPROVAL_SCOPES:
+        raise HTTPException(400, f"scope must be one of {sorted(APPROVAL_SCOPES)}")
+    if not tool_use_id.strip():
+        raise HTTPException(400, "tool_use_id is required")
+    if not resolve_approval(session_id, tool_use_id, decision, scope):
+        raise HTTPException(404, "no pending approval for that tool_use_id")
+    return {
+        "status": "resolved",
+        "tool_use_id": tool_use_id,
+        "decision": decision,
+        "scope": scope,
+    }
+
+
+@app.post("/v1/sessions/{session_id}/turns/approve")
+async def approve_turn(
+    session_id: UUID, body: ApproveBody, _u: dict = Depends(_user)
+) -> dict[str, Any]:
+    """Answer a held `permission_request` for the running turn."""
+    return _approve(session_id, body.tool_use_id, body.decision, body.scope)
 
 
 @app.post("/v1/sessions/{session_id}/rewind")
@@ -750,7 +829,7 @@ async def rewind(
 ) -> dict[str, Any]:
     if body.from_seq < 1:
         raise HTTPException(400, "from_seq must be >= 1")
-    if session_id in _running_turns:
+    if turn_is_running(session_id):
         raise HTTPException(409, "turn already running")
     store = get_store()
     sess = await store.get_entity(session_id)
@@ -758,12 +837,51 @@ async def rewind(
         raise HTTPException(404, "session not found")
     events = await store.list_events(session_id)
     discarded = next((e for e in events if e.seq == body.from_seq), None)
+    dropped = [e for e in events if e.seq >= body.from_seq]
+    restore = body.restore_files
+    if restore is None:
+        restore = turn_edits_files(dropped)
+    summary = await _restore_workspace(sess, dropped, restore, force=body.force)
     await store.truncate_events(session_id, body.from_seq)
     text = ""
     if discarded and discarded.kind == "user":
         text = str(discarded.payload.get("text") or "")
         await _revert_autotitle_if_needed(store, sess, text)
-    return {"status": "ok", "text": text}
+    out: dict[str, Any] = {"status": "ok", "text": text, "restore_files": restore}
+    if summary is not None:
+        if summary.get("status") == "restored":
+            ev = await store.append_event(session_id, "checkpoint_restore", summary)
+            _broadcast(session_id, _event_dict(ev))
+            summary = {**summary, "seq": ev.seq}
+        out["checkpoint_restore"] = summary
+    return out
+
+
+async def _restore_workspace(
+    sess: Entity, dropped: list, restore: bool, *, force: bool
+) -> dict[str, Any] | None:
+    """Restore files from the first discarded turn's checkpoint, or explain why not."""
+    if not restore:
+        return None
+    checkpoint = find_checkpoint(dropped)
+    if checkpoint is None:
+        note = "no workspace checkpoint was recorded for these turns; files left as they are"
+        for ev in dropped:
+            cp = ev.payload.get("checkpoint") if ev.kind == "user" else None
+            if isinstance(cp, dict) and cp.get("unavailable"):
+                note = str(cp["unavailable"])
+                break
+        return {"status": "skipped", "note": note}
+    ws, _kind, _changed = bind_workspace(sess.jsonld, settings.workspace_root)
+    try:
+        result = await asyncio.to_thread(
+            restore_checkpoint, ws.root, checkpoint, force=force
+        )
+    except CheckpointHeadMismatch as e:
+        raise HTTPException(409, str(e)) from e
+    except CheckpointError as e:
+        raise HTTPException(500, f"checkpoint restore failed: {e}") from e
+    return result.payload()
 
 
 @app.post("/v1/sessions/{session_id}/correction")
@@ -776,17 +894,63 @@ async def correction(session_id: UUID, body: CorrectionBody, _u: dict = Depends(
     return {"status": "ok"}
 
 
-@app.websocket("/v1/sessions/{session_id}/ws")
-async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None = None) -> None:
-    await websocket.accept()
-    if not token:
-        await websocket.close(code=4401)
-        return
-    try:
-        from orbweaver.auth import decode_token
+_WS_AUTH_TIMEOUT_S = 10.0
 
+
+async def _ws_first_frame_token(websocket: WebSocket) -> str | None:
+    """Token from a first-message auth frame: {"type": "auth", "token": "<jwt>"}."""
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=_WS_AUTH_TIMEOUT_S)
+    except TimeoutError:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or str(data.get("type") or "") != "auth":
+        return None
+    tok = data.get("token")
+    return str(tok) if tok else None
+
+
+async def _ws_authenticate(websocket: WebSocket, query_token: str | None) -> bool:
+    """Accept the socket and resolve the bearer token.
+
+    Preferred: `Sec-WebSocket-Protocol: bearer, <jwt>` (echoed back as
+    `bearer`). Also accepted: a first frame `{"type": "auth", "token": ...}`.
+    Deprecated, removed in a future release: `?token=<jwt>` in the URL, which
+    ends up in access logs and proxies.
+    """
+    bearer_offered, sub_token = websocket_subprotocol_token(websocket)
+    await websocket.accept(subprotocol=WS_BEARER_SUBPROTOCOL if bearer_offered else None)
+    token: str | None
+    if bearer_offered:
+        token = sub_token
+    elif query_token:
+        log.warning(
+            "websocket auth via ?token= query parameter is deprecated and will be removed; "
+            "send `Sec-WebSocket-Protocol: bearer, <jwt>` or a first frame "
+            '{"type": "auth", "token": "<jwt>"} instead'
+        )
+        token = query_token
+    else:
+        token = await _ws_first_frame_token(websocket)
+    if not token:
+        return False
+    try:
         decode_token(token)
     except HTTPException:
+        return False
+    return True
+
+
+@app.websocket("/v1/sessions/{session_id}/ws")
+async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None = None) -> None:
+    try:
+        authed = await _ws_authenticate(websocket, token)
+    except WebSocketDisconnect:
+        return
+    if not authed:
         await websocket.close(code=4401)
         return
     store = get_store()
@@ -806,12 +970,12 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
             if not isinstance(data, dict):
                 continue
             typ = str(data.get("type") or "")
-            if typ in {"subscribe", "ping"}:
+            if typ in {"subscribe", "ping", "auth"}:
                 if typ == "ping":
                     await websocket.send_json({"kind": "pong"})
                 continue
             if typ == "cancel":
-                state = _running_turns.get(session_id)
+                state = get_running_turn(session_id)
                 if state:
                     state.discard = bool(data.get("discard"))
                     state.cancel.set()
@@ -820,6 +984,23 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
                     )
                 else:
                     await websocket.send_json({"kind": "idle"})
+                continue
+            if typ == "approve":
+                # Only reachable from a socket that is not itself awaiting a turn
+                # (this loop blocks on _run_turn); the web UI uses the HTTP endpoint.
+                try:
+                    out = _approve(
+                        session_id,
+                        str(data.get("tool_use_id") or ""),
+                        str(data.get("decision") or ""),
+                        str(data.get("scope") or "once"),
+                    )
+                except HTTPException as e:
+                    await websocket.send_json(
+                        {"kind": "approval", "status": e.status_code, "detail": e.detail}
+                    )
+                    continue
+                await websocket.send_json({"kind": "approval", **out})
                 continue
             resume = bool(data.get("resume"))
             text = str(data.get("text") or "")

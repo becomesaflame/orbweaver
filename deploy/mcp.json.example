@@ -1,11 +1,24 @@
 {
+  "envPassthrough": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
   "mcpServers": {
     "example": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-everything"],
       "env": {
-        "API_TOKEN": "set-this-on-the-host-not-in-a-snapshot-pack"
-      }
+        "API_TOKEN": "set-this-on-the-host-not-in-a-snapshot-pack",
+        "GITHUB_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      },
+      "envPassthrough": ["NPM_CONFIG_CACHE"],
+      "timeout_s": 60,
+      "startup_timeout_s": 20
+    },
+    "remote": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${EXAMPLE_MCP_TOKEN}"
+      },
+      "envPassthrough": ["EXAMPLE_MCP_TOKEN"],
+      "timeout_s": 30
     }
   }
 }

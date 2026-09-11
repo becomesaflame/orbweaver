@@ -126,11 +126,28 @@
     #composer-hint { padding:0 1rem 0.75rem; font-size:0.75rem; color:var(--muted); min-height:1.15rem; }
     .msg.injected { border-left-color:#8aa0c8; }
     .msg.ask { border-left-color:#8aa0c8; }
+    .msg.permission { border-left-color:#d9a441; }
+    .msg.permission .perm-title { font-weight:600; }
+    .msg.permission .perm-summary {
+      font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:0.82rem;
+      background:#1f1f1f; border-radius:6px; padding:0.35rem 0.5rem; margin:0.35rem 0;
+      white-space:pre-wrap; word-break:break-word;
+    }
+    .msg.permission .perm-reason { color:var(--muted); font-size:0.8rem; }
+    .msg.permission .perm-outcome { margin-top:0.35rem; font-size:0.85rem; color:#cfcfcf; }
+    .msg.permission.resolved { opacity:0.85; }
+    .msg.permission .perm-actions button { border:1px solid var(--line); }
+    .msg.permission .perm-actions button.allow { color:#8fd18f; }
+    .msg.permission .perm-actions button.deny { color:#e08a8a; }
     .msg-actions { display:flex; gap:0.25rem; margin-top:0.4rem; }
     .msg-actions button {
       font-size:0.75rem; color:var(--muted); padding:0.12rem 0.45rem; border-radius:6px;
     }
     .msg-actions button:hover { color:var(--ink); }
+    .msg-actions .restore-files {
+      display:flex; align-items:center; gap:0.25rem; font-size:0.75rem; color:var(--muted); cursor:pointer;
+    }
+    .msg.checkpoint { border-left-color:#8ac8a0; }
     .btn-new.secondary {
       background:transparent; color:var(--ink); border:1px solid var(--line); font-weight:600;
     }
@@ -354,6 +371,22 @@
       edit.title = pending ? "Pause and edit this prompt" : "Edit this prompt";
       edit.onclick = (ev) => { ev.stopPropagation(); editPrompt(text, seq, el); };
       actions.appendChild(edit);
+      if (!pending && seq != null) {
+        const lab = document.createElement("label");
+        lab.className = "restore-files";
+        lab.title = "Put the workspace back to how it was before this turn (git checkpoint)";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.className = "restore-files-box";
+        box.dataset.auto = "1";
+        box.checked = turnEditsFilesAfter(seq);
+        box.onclick = (ev) => ev.stopPropagation();
+        box.onchange = () => { box.dataset.auto = "0"; };
+        lab.appendChild(box);
+        lab.appendChild(document.createTextNode(" also restore files"));
+        lab.onclick = (ev) => ev.stopPropagation();
+        actions.appendChild(lab);
+      }
       if (pending) {
         const cancel = document.createElement("button");
         cancel.type = "button";
@@ -364,14 +397,55 @@
       }
       el.appendChild(actions);
     }
+    const FILE_EDIT_TOOLS = new Set(["Write", "StrReplace", "Delete", "NotebookEdit", "Bash"]);
+    function turnEditsFilesAfter(seq) {
+      for (const node of $("log").children) {
+        const s = Number(node.dataset.seq);
+        if (Number.isFinite(s) && s >= seq && node.dataset.editsFiles === "1") return true;
+      }
+      return false;
+    }
+    function syncRestoreDefaults() {
+      for (const box of $("log").querySelectorAll(".restore-files-box[data-auto='1']")) {
+        const msg = box.closest(".msg");
+        const seq = msg ? Number(msg.dataset.seq) : NaN;
+        if (Number.isFinite(seq)) box.checked = turnEditsFilesAfter(seq);
+      }
+    }
+    function restoreSummaryText(p) {
+      if (p.status === "skipped") return "files not restored: " + (p.note || "no checkpoint");
+      const restored = p.restored || [], deleted = p.deleted || [];
+      const parts = [];
+      if (restored.length) parts.push("restored " + restored.length + " file" + (restored.length === 1 ? "" : "s"));
+      if (deleted.length) parts.push("deleted " + deleted.length + " file" + (deleted.length === 1 ? "" : "s"));
+      const names = restored.concat(deleted.map((d) => "-" + d));
+      const shown = names.slice(0, 6).join(", ") + (names.length > 6 ? ", …" : "");
+      return "workspace " + (parts.length ? parts.join(", ") : "already matched the checkpoint")
+        + (shown ? " (" + shown + ")" : "");
+    }
     function renderEvent(ev) {
       const p = ev.payload || {};
+      if (ev.kind === "checkpoint_restore") {
+        add("tool", restoreSummaryText(p), { seq: ev.seq, extraClass: "checkpoint" });
+        return;
+      }
+      if (ev.kind === "tool_call" && FILE_EDIT_TOOLS.has(p.name)) {
+        const el = add("tool", ev.kind + " " + JSON.stringify(p).slice(0,400), { seq: ev.seq });
+        el.dataset.editsFiles = "1";
+        return;
+      }
       if (ev.kind === "user" || ev.kind === "assistant") {
-        const extra = p.injected ? "injected" : "";
+        const extra = (p.injected || p.stuck_nudge) ? "injected" : "";
         const el = add(ev.kind, p.text || "", { seq: ev.seq, extraClass: extra });
         if (ev.kind === "user") attachUserActions(el, p.text || "", ev.seq, false);
       } else if (ev.kind === "ask_user") {
         add("assistant", p.question || "Waiting for your answer", { seq: ev.seq, extraClass: "ask" });
+      } else if (ev.kind === "permission_request") {
+        renderPermissionRequest(p, ev.seq);
+      } else if (ev.kind === "permission_response") {
+        resolvePermissionCard(p.tool_use_id, permissionOutcomeLabel(p.decision, p.scope));
+      } else if (ev.kind === "permission_rule_added") {
+        add("tool", "Allowed for this session: " + (p.tool || "") + "(" + (p.subject || "*") + ")", { seq: ev.seq });
       } else if (ev.kind === "turn_aborted") {
         add("assistant", p.text || "Turn aborted", { seq: ev.seq, extraClass: "stopped" });
       } else if (ev.kind === "cron_result") {
@@ -379,8 +453,88 @@
         add("assistant", p.text || "Scheduled task finished.", { seq: ev.seq, extraClass: extra });
       } else if (ev.kind === "turn_interrupted") {
         renderStopped(ev.seq);
+      } else if (ev.kind === "subagent_event") {
+        const inner = p.event || {};
+        const tag = "\u21b3 subagent " + String(p.subagent_id || "").slice(0, 8) + " " + (inner.kind || "");
+        add("tool", tag + " " + JSON.stringify(inner.payload || {}).slice(0, 240), { seq: ev.seq });
       } else {
         add("tool", ev.kind + " " + JSON.stringify(p).slice(0,400), { seq: ev.seq });
+      }
+    }
+    function permissionOutcomeLabel(decision, scope) {
+      if (decision === "allow") return scope === "session" ? "Allowed for this session" : "Allowed";
+      if (decision === "deny") return "Denied";
+      if (decision === "timeout") return "Timed out — not executed";
+      if (decision === "cancelled") return "Cancelled — not executed";
+      return String(decision || "resolved");
+    }
+    function permissionCard(toolUseId) {
+      if (!toolUseId) return null;
+      return $("log").querySelector('.msg.permission[data-tool-use-id="' + String(toolUseId).replace(/"/g, "") + '"]');
+    }
+    function resolvePermissionCard(toolUseId, label) {
+      const card = permissionCard(toolUseId);
+      if (!card) return;
+      card.classList.add("resolved");
+      card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = true; });
+      let out = card.querySelector(".perm-outcome");
+      if (!out) {
+        out = document.createElement("div");
+        out.className = "perm-outcome";
+        card.appendChild(out);
+      }
+      out.textContent = "→ " + label;
+    }
+    function renderPermissionRequest(p, seq) {
+      const d = document.createElement("div");
+      d.className = "msg assistant permission";
+      if (seq != null) d.dataset.seq = String(seq);
+      d.dataset.toolUseId = String(p.tool_use_id || "");
+      const title = document.createElement("div");
+      title.className = "perm-title";
+      title.textContent = "Approval needed: " + (p.name || "tool");
+      d.appendChild(title);
+      const summary = document.createElement("div");
+      summary.className = "perm-summary";
+      summary.textContent = p.summary || JSON.stringify(p.input || {}).slice(0, 400);
+      d.appendChild(summary);
+      if (p.reason) {
+        const why = document.createElement("div");
+        why.className = "perm-reason";
+        why.textContent = "Why: " + p.reason;
+        d.appendChild(why);
+      }
+      const actions = document.createElement("div");
+      actions.className = "msg-actions perm-actions";
+      const sid = currentSid();
+      const mk = (label, decision, scope, cls) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = label;
+        b.className = cls;
+        b.onclick = () => decidePermission(sid, p.tool_use_id, decision, scope, d);
+        actions.appendChild(b);
+      };
+      mk("Allow", "allow", "once", "allow");
+      mk("Allow for session", "allow", "session", "allow");
+      mk("Deny", "deny", "once", "deny");
+      d.appendChild(actions);
+      $("log").appendChild(d);
+      _scrollToBottom();
+      return d;
+    }
+    async function decidePermission(sid, toolUseId, decision, scope, card) {
+      if (!sid || !toolUseId) return;
+      card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = true; });
+      try {
+        await api("/v1/sessions/" + sid + "/turns/approve", {
+          method:"POST", body: JSON.stringify({ tool_use_id: toolUseId, decision, scope })
+        });
+        resolvePermissionCard(toolUseId, permissionOutcomeLabel(decision, scope) + " · waiting for the agent…");
+      } catch (e) {
+        resolvePermissionCard(toolUseId, "Could not send decision: " + String(e));
+        card.classList.remove("resolved");
+        card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = false; });
       }
     }
     function renderStopped(seq) {
@@ -702,10 +856,12 @@
           $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
         } else {
           for (const ev of evs) renderEvent(ev);
+          syncRestoreDefaults();
           if (pendingAskFromEvents(evs)) waitingAskSids.add(sid);
           else {
-            const last = evs[evs.length - 1];
-            if (last.kind !== "assistant") stoppedSids.add(sid);
+            const turns = evs.filter((e) => e.kind !== "checkpoint_restore");
+            const last = turns[turns.length - 1];
+            if (last && last.kind !== "assistant") stoppedSids.add(sid);
           }
         }
         $("status").textContent = "";
@@ -878,11 +1034,17 @@
       }
       stoppedSids.delete(sid);
       if (pending || seq == null) { syncComposer(); return; }
+      const box = el ? el.querySelector(".restore-files-box") : null;
+      const restoreFiles = box ? box.checked : turnEditsFilesAfter(seq);
       try {
-        await api("/v1/sessions/" + sid + "/rewind", {
-          method:"POST", body: JSON.stringify({ from_seq: seq })
+        const r = await api("/v1/sessions/" + sid + "/rewind", {
+          method:"POST", body: JSON.stringify({ from_seq: seq, restore_files: restoreFiles })
         });
         dropFromSeq(seq);
+        if (r.checkpoint_restore) {
+          const cp = r.checkpoint_restore;
+          add("tool", restoreSummaryText(cp), { seq: cp.seq, extraClass: "checkpoint" });
+        }
         ensurePlaceholder();
         await refreshSessions();
       } catch (e) { $("status").textContent = String(e); }
@@ -913,9 +1075,14 @@
       const origin = $("base").value.trim() || window.location.origin;
       const u = new URL("/v1/sessions/" + sid + "/ws", origin);
       u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-      const tok = $("token").value.trim();
-      if (tok) u.searchParams.set("token", tok);
       return u.toString();
+    }
+    function openSessionWs(sid) {
+      // The JWT rides in Sec-WebSocket-Protocol ("bearer, <jwt>") rather than
+      // the URL so it never lands in access logs; the gateway echoes "bearer".
+      const tok = $("token").value.trim();
+      const protocols = tok ? ["bearer", tok] : [];
+      return new WebSocket(sessionWsUrl(sid), protocols);
     }
     function streamTurn(sid, payload, onEvent) {
       return new Promise((resolve, reject) => {
@@ -927,7 +1094,7 @@
           try { if (ws) ws.close(); } catch (e) {}
           fn(val);
         };
-        try { ws = new WebSocket(sessionWsUrl(sid)); }
+        try { ws = openSessionWs(sid); }
         catch (e) { reject(e); return; }
         ws.onopen = () => {
           try { ws.send(JSON.stringify(payload)); }
@@ -937,7 +1104,7 @@
           let msg;
           try { msg = JSON.parse(ev.data); }
           catch (e) { finish(reject, e); return; }
-          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" || msg.kind === "idle") {
+          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" || msg.kind === "idle" || msg.kind === "approval") {
             return;
           }
           if (msg.kind === "error") {
@@ -1056,6 +1223,7 @@
         } else if (stillHere) {
           if (userEl && r.user_seq != null) userEl.dataset.seq = String(r.user_seq);
           if (userEl) attachUserActions(userEl, text, r.user_seq, false);
+          syncRestoreDefaults();
           if (r.status === "waiting_ask") waitingAskSids.add(sid);
           if (r.status === "stopped") stoppedSids.add(sid);
         }
