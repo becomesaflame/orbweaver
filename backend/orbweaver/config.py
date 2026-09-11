@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     orbweaver_sandbox_allowed_domains: str = ""
     orbweaver_sandbox_denied_domains: str = ""
     orbweaver_sandbox_network_default: str = ""
+    orbweaver_sandbox_web_network_default: str = ""
     orbweaver_sandbox_include_default_domains: str = ""
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000

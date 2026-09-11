@@ -80,6 +80,10 @@ class NetworkPolicy:
     include_defaults: bool = True
     allow: tuple[str, ...] = ()
     deny: tuple[str, ...] = ()
+    # Default for host-side web tools (WebFetch, Browser) when no allow/deny
+    # pattern matches. "allow" keeps the public web reachable; the IP blocklist
+    # (loopback, LAN, link-local/metadata) and `deny` patterns always apply.
+    web_default: str = "allow"
 
     def allowed_hosts(self) -> tuple[str, ...]:
         hosts = list(self.allow)
@@ -161,6 +165,12 @@ def _merge_network(base: NetworkPolicy, overlay: dict[str, Any]) -> NetworkPolic
     default = str(overlay.get("default") or base.default).strip().lower() or base.default
     if default not in {"allow", "deny"}:
         default = base.default
+    web_default = (
+        str(overlay.get("webDefault") or overlay.get("web_default") or base.web_default).strip().lower()
+        or base.web_default
+    )
+    if web_default not in {"allow", "deny"}:
+        web_default = base.web_default
     include = overlay.get("includeDefaults", overlay.get("include_defaults", base.include_defaults))
     if isinstance(include, str):
         include = include.strip().lower() in {"1", "true", "yes"}
@@ -181,6 +191,7 @@ def _merge_network(base: NetworkPolicy, overlay: dict[str, Any]) -> NetworkPolic
         include_defaults=include,
         allow=tuple(allow),
         deny=tuple(deny),
+        web_default=web_default,
     )
 
 
@@ -308,6 +319,11 @@ def load_sandbox_policy(
         or getattr(cfg, "orbweaver_sandbox_network_default", "")
         or policy.network.default
     ).strip().lower() or "deny"
+    web_default = (
+        env.get("ORBWEAVER_SANDBOX_WEB_NETWORK_DEFAULT")
+        or getattr(cfg, "orbweaver_sandbox_web_network_default", "")
+        or policy.network.web_default
+    ).strip().lower() or "allow"
     include_raw = env.get("ORBWEAVER_SANDBOX_INCLUDE_DEFAULT_DOMAINS")
     if include_raw is None or include_raw == "":
         include_raw = getattr(cfg, "orbweaver_sandbox_include_default_domains", "")
@@ -335,6 +351,7 @@ def load_sandbox_policy(
             include_defaults=include_defaults,
             allow=tuple(allow),
             deny=tuple(deny_dom),
+            web_default=web_default if web_default in {"allow", "deny"} else "allow",
         ),
     )
     policy = _with_hardcoded_denies(policy, home=home_dir, environ=env)
