@@ -235,7 +235,7 @@ def should_probe(name: str, inp: dict[str, Any] | None, output: str, workspace=N
     supplies the project roots for the trust tier.
     """
     mode = probe_mode()
-    if mode == "off" or not settings.anthropic_api_key:
+    if mode == "off" or not _probe_available():
         return False
     if not is_probe_tool(name):
         return False
@@ -282,17 +282,19 @@ def parse_injection_batch(text: str, n: int) -> list[bool | None]:
     return verdicts
 
 
+def _probe_available() -> bool:
+    from orbweaver.llm import hosted_provider
+
+    return hosted_provider(settings.orbweaver_injection_probe_model) != "none"
+
+
 def _client(client=None):
+    """Claude probe models use Anthropic; catalog names use Earth Runtime."""
     if client is not None:
         return client
-    import anthropic
+    from orbweaver.llm import make_hosted_client
 
-    headers = {}
-    if settings.anthropic_workspace_id.strip():
-        headers["anthropic-workspace-id"] = settings.anthropic_workspace_id.strip()
-    return anthropic.AsyncAnthropic(
-        api_key=settings.anthropic_api_key, default_headers=headers or None
-    )
+    return make_hosted_client(settings.orbweaver_injection_probe_model)
 
 
 def _usage_tokens(resp) -> tuple[int, int]:
@@ -331,9 +333,11 @@ async def probe_tool_output(name: str, output: str, *, client=None) -> dict[str,
     body = output or ""
     if len(body.strip()) < MIN_CHARS:
         return _verdict(False, output, calls=0)
-    if not settings.anthropic_api_key:
+    if not _probe_available():
         return _verdict(False, output, calls=0)
     client = _client(client)
+    if client is None:
+        return _verdict(False, output, calls=0)
     payload = f"tool={name}\n\n{truncate_for_probe(body)}"
     t0 = time.monotonic()
     try:
@@ -365,9 +369,11 @@ async def probe_tool_outputs(items: list[tuple[str, str]], *, client=None) -> li
     if len(items) == 1:
         name, output = items[0]
         return [await probe_tool_output(name, output, client=client)]
-    if not settings.anthropic_api_key:
+    if not _probe_available():
         return [_verdict(False, output, calls=0) for _name, output in items]
     client = _client(client)
+    if client is None:
+        return [_verdict(False, output, calls=0) for _name, output in items]
     parts = []
     for i, (name, output) in enumerate(items, start=1):
         parts.append(

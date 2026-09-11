@@ -24,6 +24,7 @@ from orbweaver.compact.usage import (
     record_compact_success,
 )
 from orbweaver.config import settings
+from orbweaver.llm import compact_llm_client, hosted_provider
 from orbweaver.memory import remember
 from orbweaver.store import Event, Store
 from orbweaver.tokens import estimate_tokens
@@ -83,10 +84,11 @@ async def maybe_compact(
 
     failures = compact_failures(session_id)
     max_fail = int(settings.compact_max_failures)
+    client = compact_llm_client(client)
     allow_llm = (
         source != "overflow"
         and client is not None
-        and bool(settings.anthropic_api_key)
+        and hosted_provider(settings.orbweaver_compact_model) != "none"
         and failures < max_fail
         and system is not None
     )

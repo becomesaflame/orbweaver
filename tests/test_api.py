@@ -186,3 +186,5 @@ async def test_health_includes_version():
         assert r.status_code == 200
         assert r.json()["status"] == "ok"
         assert r.json()["version"] == __version__
+        assert "provider" in r.json()["llm"]
+        assert "model" in r.json()["llm"]

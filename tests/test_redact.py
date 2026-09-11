@@ -15,6 +15,8 @@ def test_secret_name_heuristic():
     assert is_secret_name("DATABASE_URL")
     assert is_secret_name("MY_SERVICE_PASSWORD")
     assert not is_secret_name("ORBWEAVER_PINNED_TOKEN_CAP")
+    assert is_secret_name("OPENROUTER_API_KEY")
+    assert is_secret_name("EARTHRUNTIME_KEY")
     assert not is_secret_name("ORBWEAVER_MODEL")
     assert not is_secret_name("MAX_TOKENS")
 
@@ -57,6 +59,14 @@ def test_redacts_live_settings_value(monkeypatch):
     monkeypatch.setattr(settings, "telegram_bot_token", FAKE_BOT)
     out = redact_secrets(f"printenv said {FAKE_BOT} at the end")
     assert FAKE_BOT not in out
+    assert PLACEHOLDER in out
+
+
+def test_redacts_live_openrouter_key(monkeypatch):
+    key = "pk-prov-fake-earthruntime-key-value"
+    monkeypatch.setattr(settings, "openrouter_api_key", key)
+    out = redact_secrets(f"OPENROUTER_API_KEY={key}")
+    assert key not in out
     assert PLACEHOLDER in out
 
 

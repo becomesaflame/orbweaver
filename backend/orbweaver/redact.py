@@ -35,6 +35,8 @@ _SECRET_SUFFIXES = (
 _EXACT_SECRET_NAMES = frozenset(
     {
         "ANTHROPIC_API_KEY",
+        "EARTHRUNTIME_KEY",
+        "OPENROUTER_API_KEY",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "DATABASE_URL",
@@ -79,6 +81,8 @@ def _live_secret_values() -> list[str]:
 
     raw = [
         settings.anthropic_api_key,
+        settings.openrouter_api_key,
+        settings.earthruntime_api_key,
         settings.orbweaver_jwt_secret,
         settings.telegram_bot_token,
         settings.orbweaver_image_api_key,

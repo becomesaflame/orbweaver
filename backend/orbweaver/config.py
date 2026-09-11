@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     anthropic_workspace_id: str = ""
     ollama_base_url: str = ""
     ollama_model: str = ""
+    # Earth Runtime is OpenAI-compatible; OpenCode uses the OpenRouter env names.
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://api.earthruntime.com/v1"
+    earthruntime_api_key: str = ""
     # Required in production: >= 32 bytes, not the default. `serve` refuses to
     # start otherwise unless ORBWEAVER_DEV_INSECURE=1.
     orbweaver_jwt_secret: str = "dev-secret-change-me"
@@ -181,14 +185,21 @@ class Settings(BaseSettings):
             return "brave"
         return "duckduckgo"
 
+    @property
+    def openrouter_key(self) -> str:
+        return self.openrouter_api_key.strip() or self.earthruntime_api_key.strip()
+
     event_budget_override: int | None = None
 
     @property
     def event_budget(self) -> int:
         if self.event_budget_override is not None:
             return self.event_budget_override
+        from orbweaver.open_models import context_window_for
+
+        window = context_window_for(self.orbweaver_model, self.context_window)
         raw = (
-            self.context_window
+            window
             - self.output_reserve
             - self.static_token_estimate
             - self.orbweaver_pinned_token_cap
