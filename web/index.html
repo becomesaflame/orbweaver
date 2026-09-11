@@ -367,7 +367,7 @@
     function renderEvent(ev) {
       const p = ev.payload || {};
       if (ev.kind === "user" || ev.kind === "assistant") {
-        const extra = p.injected ? "injected" : "";
+        const extra = (p.injected || p.stuck_nudge) ? "injected" : "";
         const el = add(ev.kind, p.text || "", { seq: ev.seq, extraClass: extra });
         if (ev.kind === "user") attachUserActions(el, p.text || "", ev.seq, false);
       } else if (ev.kind === "ask_user") {
@@ -379,6 +379,10 @@
         add("assistant", p.text || "Scheduled task finished.", { seq: ev.seq, extraClass: extra });
       } else if (ev.kind === "turn_interrupted") {
         renderStopped(ev.seq);
+      } else if (ev.kind === "subagent_event") {
+        const inner = p.event || {};
+        const tag = "\u21b3 subagent " + String(p.subagent_id || "").slice(0, 8) + " " + (inner.kind || "");
+        add("tool", tag + " " + JSON.stringify(inner.payload || {}).slice(0, 240), { seq: ev.seq });
       } else {
         add("tool", ev.kind + " " + JSON.stringify(p).slice(0,400), { seq: ev.seq });
       }
@@ -913,9 +917,14 @@
       const origin = $("base").value.trim() || window.location.origin;
       const u = new URL("/v1/sessions/" + sid + "/ws", origin);
       u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-      const tok = $("token").value.trim();
-      if (tok) u.searchParams.set("token", tok);
       return u.toString();
+    }
+    function openSessionWs(sid) {
+      // The JWT rides in Sec-WebSocket-Protocol ("bearer, <jwt>") rather than
+      // the URL so it never lands in access logs; the gateway echoes "bearer".
+      const tok = $("token").value.trim();
+      const protocols = tok ? ["bearer", tok] : [];
+      return new WebSocket(sessionWsUrl(sid), protocols);
     }
     function streamTurn(sid, payload, onEvent) {
       return new Promise((resolve, reject) => {
@@ -927,7 +936,7 @@
           try { if (ws) ws.close(); } catch (e) {}
           fn(val);
         };
-        try { ws = new WebSocket(sessionWsUrl(sid)); }
+        try { ws = openSessionWs(sid); }
         catch (e) { reject(e); return; }
         ws.onopen = () => {
           try { ws.send(JSON.stringify(payload)); }

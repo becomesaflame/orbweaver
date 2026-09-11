@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 
 PROXY_PORT = 19191
@@ -13,28 +14,42 @@ PROXY_PORT = 19191
 SANDBOX_SSH_DIR = "/tmp/ow-ssh"
 SANDBOX_OPENSSH = "/tmp/ow-ssh/openssh"
 
-SSH_IDENTITY_FILES: tuple[str, ...] = (
+# Standard private identity names OpenSSH tries by default. Bound only with bindIdentities.
+SSH_DEFAULT_PRIVATE_KEYS: tuple[str, ...] = (
     "id_ed25519",
-    "id_ed25519.pub",
     "id_rsa",
-    "id_rsa.pub",
     "id_ecdsa",
-    "id_ecdsa.pub",
     "id_ed25519_sk",
-    "id_ed25519_sk.pub",
     "id_ecdsa_sk",
-    "id_ecdsa_sk.pub",
-    "known_hosts",
 )
 
-SSH_SKIP_NAMES: frozenset[str] = frozenset(
+# Non-secret ~/.ssh files re-exposed after the denyRead tmpfs (plus every ``*.pub``).
+SSH_PUBLIC_NAMES: frozenset[str] = frozenset(
     {
         "config",
+        "known_hosts",
+        "known_hosts.old",
         "authorized_keys",
         "authorized_keys2",
-        "known_hosts.old",
     }
 )
+
+
+@dataclass(frozen=True)
+class SshPolicy:
+    """How private keys reach sandboxed ssh.
+
+    Default: they do not. ``SSH_AUTH_SOCK`` is allowlisted by the sandbox policy, so an
+    ssh-agent on the host signs without the key entering the sandbox. ``identities`` binds
+    exactly those files read-only; ``bind_identities`` binds the host config's
+    ``IdentityFile`` entries and the standard ``id_*`` names. Never "every file in ~/.ssh".
+    """
+
+    identities: tuple[Path, ...] = ()
+    bind_identities: bool = False
+
+    def binds_private_keys(self) -> bool:
+        return self.bind_identities or bool(self.identities)
 
 _IDENTITYFILE_RE = re.compile(r"^\s*IdentityFile\s+(\S+)", re.IGNORECASE)
 _LOOPBACK_NS_PREFIX = "127."
@@ -212,8 +227,17 @@ def ssh_helper_dir(tmp: Path) -> Path:
     return tmp.resolve() / "ow-ssh"
 
 
-def ensure_ssh_sandbox(tmp: Path, *, proxied: bool) -> Path:
-    """Write wrapper, configs, resolv.conf, and CONNECT helper under tmp/ow-ssh."""
+def ensure_ssh_sandbox(
+    tmp: Path,
+    *,
+    proxied: bool,
+    identity_files: tuple[Path, ...] | None = None,
+) -> Path:
+    """Write wrapper, configs, resolv.conf, and CONNECT helper under tmp/ow-ssh.
+
+    ``identity_files`` are the private keys the sandbox will bind (see ``SshPolicy``);
+    ``None`` means the default policy, which binds nothing.
+    """
     dest = ssh_helper_dir(tmp)
     dest.mkdir(parents=True, exist_ok=True)
     real = Path(SANDBOX_OPENSSH)
@@ -231,7 +255,9 @@ def ensure_ssh_sandbox(tmp: Path, *, proxied: bool) -> Path:
             proxied=proxied,
             proxycmd=proxycmd,
             known_hosts=known,
-            identity_files=ssh_private_identity_files(),
+            identity_files=(
+                identity_files if identity_files is not None else ssh_private_identity_files()
+            ),
         ),
         encoding="utf-8",
     )
@@ -284,7 +310,7 @@ def _expand_identity_path(raw: str, ssh_dir: Path) -> Path:
 
 
 def _identity_files_from_host_config(ssh_dir: Path) -> tuple[Path, ...]:
-    """Read IdentityFile paths from host config without exposing the file itself."""
+    """IdentityFile paths named by the host ~/.ssh/config (bound only with bindIdentities)."""
     config = ssh_dir / "config"
     out: list[Path] = []
     try:
@@ -306,46 +332,77 @@ def _identity_files_from_host_config(ssh_dir: Path) -> tuple[Path, ...]:
     return tuple(out)
 
 
-def ssh_identity_files(home: Path | None = None) -> tuple[Path, ...]:
-    """Identity files to re-bind. Includes custom names and host-config IdentityFile."""
-    home_dir = (home or Path.home()).resolve()
-    ssh_dir = home_dir / ".ssh"
+def _ssh_dir(home: Path | None) -> Path:
+    return (home or Path.home()).resolve() / ".ssh"
+
+
+def ssh_public_files(home: Path | None = None) -> tuple[Path, ...]:
+    """Non-secret ~/.ssh files: config, known_hosts, authorized_keys, and ``*.pub``."""
+    ssh_dir = _ssh_dir(home)
+    found: list[Path] = []
+    try:
+        entries = sorted(ssh_dir.iterdir())
+    except OSError:
+        return ()
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        if entry.name in SSH_PUBLIC_NAMES or entry.name.endswith(".pub"):
+            found.append(entry)
+    return tuple(found)
+
+
+def ssh_private_identity_files(
+    home: Path | None = None,
+    *,
+    ssh_policy: SshPolicy | None = None,
+) -> tuple[Path, ...]:
+    """Private keys the policy lets into the sandbox. Empty for the default policy."""
+    pol = ssh_policy or SshPolicy()
+    ssh_dir = _ssh_dir(home)
     found: list[Path] = []
     seen: set[Path] = set()
 
-    def add(path: Path, *, require_file: bool) -> None:
+    def add(path: Path) -> None:
         try:
             resolved = path.expanduser()
             resolved = resolved.resolve() if resolved.is_absolute() else (ssh_dir / resolved).resolve()
+            if resolved in seen or not resolved.is_file():
+                return
         except OSError:
             return
-        if resolved in seen:
-            return
-        if require_file and not resolved.is_file():
+        if resolved.name.endswith(".pub") or resolved.name in SSH_PUBLIC_NAMES:
             return
         seen.add(resolved)
         found.append(resolved)
 
-    for name in SSH_IDENTITY_FILES:
-        add(ssh_dir / name, require_file=False)
-    try:
-        for entry in ssh_dir.iterdir():
-            if not entry.is_file() or entry.name in SSH_SKIP_NAMES or entry.name.endswith(".old"):
-                continue
-            add(entry, require_file=True)
-    except OSError:
-        pass
-    for path in _identity_files_from_host_config(ssh_dir):
-        add(path, require_file=True)
+    for path in pol.identities:
+        add(path)
+    if pol.bind_identities:
+        for path in _identity_files_from_host_config(ssh_dir):
+            add(path)
+        for name in SSH_DEFAULT_PRIVATE_KEYS:
+            add(ssh_dir / name)
     return tuple(found)
 
 
-def ssh_private_identity_files(home: Path | None = None) -> tuple[Path, ...]:
-    return tuple(
-        p
-        for p in ssh_identity_files(home)
-        if p.is_file() and p.name != "known_hosts" and not p.name.endswith(".pub")
-    )
+def ssh_identity_files(
+    home: Path | None = None,
+    *,
+    ssh_policy: SshPolicy | None = None,
+) -> tuple[Path, ...]:
+    """Everything re-bound under ~/.ssh: public files plus policy-named private keys."""
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for path in (*ssh_public_files(home), *ssh_private_identity_files(home, ssh_policy=ssh_policy)):
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return tuple(out)
 
 
 def sandbox_resolv_conf_text(raw: str | None = None) -> str:
@@ -420,16 +477,28 @@ def resolv_conf_overlay_args(tmp: Path) -> list[str]:
     return args
 
 
-def ssh_identity_bind_args(home: Path | None = None) -> list[str]:
-    """Re-expose keys after the ~/.ssh denyRead tmpfs. Skip host ssh_config."""
+def ssh_identity_bind_args(
+    home: Path | None = None,
+    *,
+    ssh_policy: SshPolicy | None = None,
+) -> list[str]:
+    """Re-expose ~/.ssh public files (and only policy-named private keys) after the tmpfs.
+
+    Binds land on the tmpfs that hides ``~/.ssh`` so a private key with any other name
+    stays absent inside the sandbox. Symlinked entries bind their resolved target.
+    """
     args: list[str] = []
     seen: set[str] = set()
-    for src in ssh_identity_files(home):
+    for src in ssh_identity_files(home, ssh_policy=ssh_policy):
         dest = str(src)
         if dest in seen:
             continue
         seen.add(dest)
-        args.extend(["--ro-bind-try", dest, dest])
+        try:
+            real = str(src.resolve())
+        except OSError:
+            continue
+        args.extend(["--ro-bind-try", real, dest])
     return args
 
 

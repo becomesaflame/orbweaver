@@ -68,29 +68,176 @@ async def test_compact_keeps_events_and_projects_prompt(monkeypatch):
     assert kinds.count("user") == 40
 
 
+def _result_contents(projected) -> dict[str, str]:
+    return {
+        str(e.payload.get("tool_use_id")): str(e.payload.get("content"))
+        for e in projected
+        if e.kind == "tool_result"
+    }
+
+
+async def _tool_round(store, sid, tid: str, name: str, inp: dict, content: str) -> None:
+    await store.append_event(sid, "tool_call", {"id": tid, "name": name, "input": inp})
+    await store.append_event(
+        sid, "tool_result", {"tool_use_id": tid, "name": name, "content": content}
+    )
+
+
 @pytest.mark.asyncio
-async def test_microcompact_stubs_old_tool_results_not_store():
+async def test_microcompact_stubs_old_tool_results_not_store(monkeypatch):
+    """Over the pressure line the oldest large results are stubbed in the prompt only."""
+    store = reset_store_for_tests()
+    # 8 results of 1200 chars is ~2400 tokens of payload; pressure at 60% of 2000.
+    monkeypatch.setattr(settings, "event_budget_override", 2000)
+    sid = new_uuid()
+    await _session(store, sid)
+    for i in range(8):
+        await _tool_round(store, sid, f"t{i}", "Bash", {"command": "x"}, f"output-{i}-" + "x" * 1200)
+    events = await store.list_events(sid)
+    projected = prompt_events(events)
+    contents = _result_contents(projected)
+    stubs = [tid for tid, c in contents.items() if "cleared" in c]
+    assert stubs
+    assert stubs == [f"t{i}" for i in range(len(stubs))], "oldest first"
+    assert all("cleared" not in contents[f"t{i}"] for i in range(3, 8)), "floor of 5 kept"
+    stored = await store.list_events(sid)
+    assert all("cleared" not in str(e.payload.get("content")) for e in stored if e.kind == "tool_result")
+
+
+@pytest.mark.asyncio
+async def test_microcompact_is_noop_under_pressure_line():
+    """Issue #102: eight Reads under budget keep the first file's content in the prompt."""
     store = reset_store_for_tests()
     sid = new_uuid()
     await _session(store, sid)
     for i in range(8):
-        tid = f"t{i}"
-        await store.append_event(sid, "tool_call", {"id": tid, "name": "Bash", "input": {"command": "x"}})
-        await store.append_event(
-            sid,
-            "tool_result",
-            {"tool_use_id": tid, "name": "Bash", "content": f"output-{i}-" + "x" * 50},
+        await _tool_round(
+            store, sid, f"r{i}", "Read", {"path": f"src/f{i}.py"}, f"# file {i}\n" + f"x{i} = 1\n" * 300
         )
     events = await store.list_events(sid)
     projected = prompt_events(events)
-    stubs = [
-        e
-        for e in projected
-        if e.kind == "tool_result" and "cleared" in str(e.payload.get("content"))
-    ]
-    assert stubs
-    stored = await store.list_events(sid)
-    assert all("cleared" not in str(e.payload.get("content")) for e in stored if e.kind == "tool_result")
+    assert [e.payload for e in projected] == [e.payload for e in events]
+    contents = _result_contents(projected)
+    assert "# file 0" in contents["r0"]
+    assert not any("cleared" in c for c in contents.values())
+
+
+@pytest.mark.asyncio
+async def test_microcompact_under_pressure_keeps_edited_read_and_small_results(monkeypatch):
+    """Over the line: oldest large results go first; a Read of a file edited since stays.
+
+    Production (PR #77): a long turn of Bash after an early Read dropped the
+    file window the model was editing, so it re-Read in tiny slices and never
+    called StrReplace.
+    """
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "event_budget_override", 2000)
+    sid = new_uuid()
+    await _session(store, sid)
+    big = "x" * 1500
+    await _tool_round(store, sid, "r_edit", "Read", {"path": "backend/app.py"}, "class RunningTurn:\n" + big)
+    await _tool_round(store, sid, "r_old", "Read", {"path": "web/index.html"}, "function add()\n" + big)
+    await _tool_round(store, sid, "b_small", "Bash", {"command": "git status"}, "clean")
+    for i in range(6):
+        await _tool_round(store, sid, f"b{i}", "Bash", {"command": "x"}, f"bash-out-{i}\n" + big)
+    await store.append_event(
+        sid,
+        "tool_call",
+        {"id": "e1", "name": "StrReplace", "input": {"path": "./backend/app.py", "old_string": "a"}},
+    )
+    await store.append_event(
+        sid, "tool_result", {"tool_use_id": "e1", "name": "StrReplace", "content": "ok"}
+    )
+    await _tool_round(store, sid, "r_new", "Read", {"path": "backend/app.py", "offset": 590}, "return x\n" + big)
+    events = await store.list_events(sid)
+    contents = _result_contents(prompt_events(events))
+    assert "class RunningTurn" in contents["r_edit"], "Read of a path edited since is kept"
+    assert "cleared" in contents["r_old"], "oldest unprotected large result is stubbed"
+    assert "cleared" in contents["b0"]
+    assert contents["b_small"] == "clean", "small results are not worth a cache miss"
+    assert "return x" in contents["r_new"]
+    assert all("cleared" not in contents[f"b{i}"] for i in range(2, 6)), "newest results kept"
+    assert "cleared" not in contents["e1"]
+
+
+@pytest.mark.asyncio
+async def test_microcompact_stale_rule_clears_old_large_results_without_pressure(monkeypatch):
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "compact_micro_stale_rounds", 2)
+    monkeypatch.setattr(settings, "compact_micro_stale_chars", 1000)
+    monkeypatch.setattr(settings, "compact_micro_keep", 1)
+    sid = new_uuid()
+    await _session(store, sid)
+    await _tool_round(store, sid, "old_big", "Bash", {"command": "x"}, "y" * 1500)
+    await _tool_round(store, sid, "old_small", "Bash", {"command": "x"}, "y" * 200)
+    for i in range(3):
+        await _tool_round(store, sid, f"b{i}", "Bash", {"command": "x"}, f"round {i}")
+    events = await store.list_events(sid)
+    contents = _result_contents(prompt_events(events))
+    assert "cleared" in contents["old_big"]
+    assert contents["old_small"] == "y" * 200
+    assert contents["b2"] == "round 2"
+    monkeypatch.setattr(settings, "compact_micro_stale_rounds", 0)
+    assert "cleared" not in _result_contents(prompt_events(events))["old_big"]
+
+
+@pytest.mark.asyncio
+async def test_microcompact_cleared_set_grows_monotonically(monkeypatch):
+    """Once stubbed, a result stays stubbed as the turn grows (prefix cache stays valid)."""
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "event_budget_override", 3000)
+    sid = new_uuid()
+    await _session(store, sid)
+    previous: set[str] = set()
+    for i in range(14):
+        await _tool_round(store, sid, f"t{i}", "Grep", {"pattern": "x"}, f"hit-{i}\n" + "x" * 1100)
+        contents = _result_contents(prompt_events(await store.list_events(sid)))
+        cleared = {tid for tid, c in contents.items() if "cleared" in c}
+        assert previous <= cleared
+        previous = cleared
+    assert previous
+    assert f"t{13}" not in previous
+
+
+def test_microcompact_stub_keeps_persisted_path_hint(monkeypatch):
+    from orbweaver.compact.project import microcompact_events
+    from orbweaver.store import Event
+
+    monkeypatch.setattr(settings, "event_budget_override", 1000)
+    monkeypatch.setattr(settings, "compact_micro_keep", 1)
+    sid = uuid4()
+    events = []
+    for i in range(3):
+        events.append(
+            Event(
+                id=uuid4(),
+                session_id=sid,
+                seq=2 * i + 1,
+                kind="tool_call",
+                payload={"id": f"t{i}", "name": "Bash", "input": {"command": "x"}},
+            )
+        )
+        events.append(
+            Event(
+                id=uuid4(),
+                session_id=sid,
+                seq=2 * i + 2,
+                kind="tool_result",
+                payload={
+                    "tool_use_id": f"t{i}",
+                    "name": "Bash",
+                    "content": "z" * 2000,
+                    "persisted_path": f".orbweaver/tool-results/t{i}.txt",
+                },
+            )
+        )
+    out = microcompact_events(events)
+    first = out[1].payload
+    assert first["content"] == (
+        "[Old tool result content cleared] Full output: .orbweaver/tool-results/t0.txt"
+    )
+    assert first["persisted_path"] == ".orbweaver/tool-results/t0.txt"
+    assert events[1].payload["content"] == "z" * 2000
 
 
 def test_persist_writes_preview_and_file(tmp_path, monkeypatch):

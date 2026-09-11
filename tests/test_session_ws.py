@@ -1,6 +1,5 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import quote
 from uuid import uuid4
 
 import pytest
@@ -34,11 +33,15 @@ def _open_session(client: TestClient, **extra) -> str:
     return sess.json()["id"]
 
 
-def _ws_url(sid: str, token: str | None = None) -> str:
-    url = f"/v1/sessions/{sid}/ws"
-    if token is not None:
-        url += f"?token={quote(token)}"
-    return url
+def _ws_url(sid: str) -> str:
+    return f"/v1/sessions/{sid}/ws"
+
+
+def _ws_connect(client: TestClient, sid: str, token: str | None = None):
+    """Open the session socket with the JWT in Sec-WebSocket-Protocol."""
+    if token is None:
+        return client.websocket_connect(_ws_url(sid))
+    return client.websocket_connect(_ws_url(sid), subprotocols=["bearer", token])
 
 
 def _collect_until_done(ws) -> list[dict]:
@@ -85,8 +88,10 @@ def test_ws_rejects_missing_token():
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect) as exc,
-        client.websocket_connect(_ws_url(str(uuid4()))) as ws,
+        _ws_connect(client, str(uuid4())) as ws,
     ):
+        # No subprotocol token and the first frame is not an auth frame.
+        ws.send_json({"text": "hello"})
         ws.receive_text()
     assert exc.value.code == 4401
 
@@ -95,7 +100,7 @@ def test_ws_rejects_invalid_token():
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect) as exc,
-        client.websocket_connect(_ws_url(str(uuid4()), "not-a-jwt")) as ws,
+        _ws_connect(client, str(uuid4()), "not-a-jwt") as ws,
     ):
         ws.receive_text()
     assert exc.value.code == 4401
@@ -105,7 +110,7 @@ def test_ws_rejects_unknown_session():
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect) as exc,
-        client.websocket_connect(_ws_url(str(uuid4()), _token())) as ws,
+        _ws_connect(client, str(uuid4()), _token()) as ws,
     ):
         ws.receive_text()
     assert exc.value.code == 4404
@@ -120,7 +125,7 @@ def test_ws_event_order(tmp_path, monkeypatch):
     token = _token()
     with TestClient(app) as client:
         sid = _open_session(client)
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             ws.send_json({"text": "hello stream"})
             msgs = _collect_until_done(ws)
@@ -144,7 +149,7 @@ def test_ws_cancel_stops_streaming(tmp_path, monkeypatch):
     headers = _auth()
     with TestClient(app) as client:
         sid = _open_session(client)
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             ws.send_json({"text": "keep this"})
             first = ws.receive_json()
@@ -177,7 +182,7 @@ def test_ws_inject_during_stream(tmp_path, monkeypatch):
     headers = _auth()
     with TestClient(app) as client:
         sid = _open_session(client)
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             ws.send_json({"text": "first prompt"})
             assert ws.receive_json()["kind"] == "user"
@@ -225,7 +230,7 @@ def ws_session(tmp_path, monkeypatch):
 
 def test_ws_streams_turn_events(ws_session):
     client, token, _headers, sid = ws_session
-    with client.websocket_connect(f"/v1/sessions/{sid}/ws?token={token}") as ws:
+    with _ws_connect(client, sid, token) as ws:
         hello = ws.receive_json()
         assert hello["kind"] == "subscribed"
         assert hello["session_id"] == sid
@@ -244,7 +249,7 @@ def test_ws_streams_turn_events(ws_session):
 
 def test_ws_broadcasts_http_turn(ws_session):
     client, token, headers, sid = ws_session
-    with client.websocket_connect(f"/v1/sessions/{sid}/ws?token={token}") as ws:
+    with _ws_connect(client, sid, token) as ws:
         assert ws.receive_json()["kind"] == "subscribed"
 
         def post_turn():
