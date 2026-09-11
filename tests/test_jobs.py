@@ -5,7 +5,7 @@ from uuid import uuid4
 import pytest
 
 from orbweaver.agent import run_tools
-from orbweaver.channels.cron import _parse_recurrence, sweep
+from orbweaver.channels.cron import _parse_recurrence, sweep_and_wait
 from orbweaver.config import settings
 from orbweaver.store import (
     SESSION_TYPE,
@@ -89,7 +89,7 @@ async def test_sweep_runs_due_job(tmp_path: Path, monkeypatch):
         session_id=sid,
     )
     await store.put_job(job)
-    await sweep()
+    await sweep_and_wait()
     events = await store.list_events(sid)
     assert any(e.kind == "cron" for e in events)
     assert any(e.kind == "assistant" for e in events)
@@ -123,7 +123,7 @@ async def test_sweep_migrates_telegram_docker_workspace(tmp_path: Path, monkeypa
         session_id=sid,
     )
     await store.put_job(job)
-    await sweep()
+    await sweep_and_wait()
     sess = await store.get_entity(sid)
     assert sess is not None
     assert sess.jsonld["workspace_kind"] == "local"
@@ -199,7 +199,7 @@ async def test_sweep_notifies_telegram_on_success(tmp_path: Path, monkeypatch):
         session_id=sid,
     )
     await store.put_job(job)
-    await sweep()
+    await sweep_and_wait()
     assert sent
     assert sent[0][0] == 99
     assert "check CI" in sent[0][1]
@@ -219,7 +219,7 @@ async def test_sweep_deletes_finished_oneshot():
         payload={"message": "once"},
     )
     await store.put_job(job)
-    await sweep()
+    await sweep_and_wait()
     assert job.id not in store.jobs
     assert await store.due_jobs(datetime.now(UTC) + timedelta(days=40000)) == []
 
@@ -252,7 +252,7 @@ async def test_sweep_reschedules_daily(tmp_path: Path, monkeypatch):
         session_id=sid,
     )
     await store.put_job(job)
-    await sweep()
+    await sweep_and_wait()
     kept = store.jobs[job.id]
     assert kept.due_at > datetime.now(UTC)
     assert kept.due_at >= due + timedelta(days=1) - timedelta(seconds=2)
