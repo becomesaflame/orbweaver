@@ -124,7 +124,8 @@ TOOL_SPEC = [
             "to find a symbol; do not take tiny windows, and do not re-Read a path "
             "already in this turn unless its result was truncated or cleared. Once you "
             "have the numbered lines, edit with StrReplace. The result says how to "
-            "continue when truncated."
+            "continue when truncated. Text files larger than 10 MB, or with a NUL in "
+            "the first 8 KiB, are rejected."
         ),
         "input_schema": {
             "type": "object",
@@ -1198,7 +1199,7 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         if is_image_path(path):
             return await asyncio.to_thread(format_image_read, ws, path)
         try:
-            raw = await asyncio.to_thread(ws.read, path)
+            raw = await asyncio.to_thread(ws.read_text_for_tool, path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
         _note_read(ctx, ws, path)

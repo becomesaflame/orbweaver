@@ -1,3 +1,4 @@
+import os
 import shutil
 from uuid import uuid4
 
@@ -7,7 +8,7 @@ from orbweaver.agent import run_tools
 from orbweaver.compact.persist import persist_tool_result
 from orbweaver.config import settings
 from orbweaver.tooltext import format_read, format_webfetch, grep_regex, html_to_text
-from orbweaver.workspace import LocalWorkspace
+from orbweaver.workspace import MAX_READ_SIZE, LocalWorkspace
 
 
 def test_format_read_pages_with_next_offset():
@@ -152,6 +153,32 @@ async def test_run_tools_read_uses_offset(tmp_path):
     assert "10|L10" in out
     assert "14|L14" in out
     assert "9|L9" not in out
+    assert "Read offset=15" in out
+
+
+@pytest.mark.asyncio
+async def test_run_tools_read_rejects_oversized(tmp_path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    huge = tmp_path / "huge.log"
+    huge.write_bytes(b"line-1\n")
+    os.truncate(huge, MAX_READ_SIZE + 1)
+    ctx = {"workspace": ws, "store": None, "session_id": uuid4(), "workspace_kind": "local"}
+    out = await run_tools("Read", {"path": "huge.log"}, ctx)
+    assert "error reading huge.log" in out
+    assert "too large" in out
+    assert str(MAX_READ_SIZE + 1) in out
+    assert "1|line-1" not in out
+
+
+@pytest.mark.asyncio
+async def test_run_tools_read_rejects_nul_in_first_chunk(tmp_path):
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write_bytes("blob.bin", b"hello\x00world" + b"x" * 100)
+    ctx = {"workspace": ws, "store": None, "session_id": uuid4(), "workspace_kind": "local"}
+    out = await run_tools("Read", {"path": "blob.bin"}, ctx)
+    assert "error reading blob.bin" in out
+    assert "appears to be binary" in out
+    assert "hello" not in out
 
 
 @pytest.mark.asyncio

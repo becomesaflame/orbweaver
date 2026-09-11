@@ -50,6 +50,8 @@ GREP_HIT_CAP = 50
 GLOB_HIT_CAP = 200
 GREP_LINE_CAP = 200
 RG_TIMEOUT_SEC = 30
+MAX_READ_SIZE = 10 * 1024 * 1024
+BINARY_PROBE_BYTES = 8192
 _JOB_POLL_S = 0.2
 _SHELL_POLL_SLICE_S = 1.0
 _CANCEL_DRAIN_S = 5.0
@@ -457,6 +459,30 @@ class LocalWorkspace:
     def read(self, path: str) -> str:
         return self._resolve(path).read_text(encoding="utf-8")
 
+    def stat_size(self, path: str) -> int:
+        """Byte size after workspace path resolution. Directories raise IsADirectoryError."""
+        target = self._resolve(path)
+        if target.is_dir():
+            raise IsADirectoryError(f"[Errno 21] Is a directory: '{target}'")
+        return target.stat().st_size
+
+    def read_prefix(self, path: str, n: int = BINARY_PROBE_BYTES) -> bytes:
+        """First n bytes after workspace path resolution."""
+        target = self._resolve(path)
+        if target.is_dir():
+            raise IsADirectoryError(f"[Errno 21] Is a directory: '{target}'")
+        with target.open("rb") as handle:
+            return handle.read(n)
+
+    def read_text_for_tool(self, path: str, *, max_size: int = MAX_READ_SIZE) -> str:
+        """Stat, reject oversized or NUL-prefixed binary files, then decode UTF-8."""
+        size = self.stat_size(path)
+        if size > max_size:
+            raise OSError(f"file too large ({size} bytes; max {max_size})")
+        probe = self.read_prefix(path, BINARY_PROBE_BYTES)
+        if b"\x00" in probe:
+            raise OSError("appears to be binary")
+        return self.read(path)
     def edit_target(self, path: str) -> Path:
         """Resolved path an edit tool would touch (write-side policy applied)."""
         return self._resolve(path, write=True)
