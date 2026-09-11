@@ -10,6 +10,7 @@ export interface SessionRow {
   workspace_kind?: string;
   status?: string;
   channel?: string;
+  model?: string;
   created_at?: string;
   last_event_at?: string;
   event_count?: number;
@@ -30,6 +31,20 @@ export interface GatewayConfig {
   gateway: string;
   token: string;
   workspaceUri: string;
+  /** Model for new chats; "" lets the gateway apply ORBWEAVER_VSCODE_MODEL. */
+  model: string;
+}
+
+export interface ModelRow {
+  id: string;
+  provider?: string;
+  available?: boolean;
+  context_window?: number;
+}
+
+export interface ModelCatalog {
+  models: ModelRow[];
+  defaults: Record<string, string>;
 }
 
 export function readConfig(): GatewayConfig {
@@ -38,6 +53,7 @@ export function readConfig(): GatewayConfig {
     gateway: String(c.get("gatewayUrl") || "http://127.0.0.1:8080").replace(/\/$/, ""),
     token: String(c.get("token") || ""),
     workspaceUri: String(c.get("workspaceUri") || "workspace:default").trim() || "workspace:default",
+    model: String(c.get("model") || "").trim(),
   };
 }
 
@@ -109,8 +125,11 @@ export class SessionSocket {
     this.sock.send({ type: "subscribe" });
   }
 
-  sendTurn(text: string): void {
-    this.sock.send({ text });
+  /** `model` (when set) is stored on the session by the gateway and used for this turn. */
+  sendTurn(text: string, model?: string): void {
+    const frame: Record<string, unknown> = { text };
+    if (model) frame.model = model;
+    this.sock.send(frame);
   }
 
   close(): void {
@@ -119,23 +138,39 @@ export class SessionSocket {
   }
 }
 
-export async function createSession(title?: string): Promise<SessionRow> {
-  const { token, workspaceUri } = readConfig();
+export async function createSession(title?: string, model?: string): Promise<SessionRow> {
+  const { token, workspaceUri, model: configured } = readConfig();
   if (!token) {
     throw new Error("Set orbweaver.token to a JWT from `python -m orbweaver.cli mint` on the gateway host");
   }
-  const created = await request("POST", "/v1/sessions", {
+  // Picker choice first; the orbweaver.model setting seeds chats left on "default".
+  const chosen = (model || configured).trim();
+  const body: Record<string, unknown> = {
     workspace_uri: workspaceUri,
     workspace_kind: "local",
     title: title || vscode.workspace.name || "vscode",
     channel: "vscode",
-  });
+  };
+  if (chosen) body.model = chosen;
+  const created = await request("POST", "/v1/sessions", body);
   return {
     id: created.id,
     title: created.title || title || "vscode",
     workspace_uri: created.workspace_uri || workspaceUri,
     channel: created.channel || "vscode",
+    model: created.model || chosen || "",
   };
+}
+
+export async function listModels(): Promise<ModelCatalog> {
+  const r = await request("GET", "/v1/models");
+  return { models: (r.models || []) as ModelRow[], defaults: (r.defaults || {}) as Record<string, string> };
+}
+
+/** Empty `model` clears the session override so the channel default applies. */
+export async function setSessionModel(sessionId: string, model: string): Promise<string> {
+  const r = await request("PATCH", `/v1/sessions/${sessionId}`, { model });
+  return String(r.model || "");
 }
 
 export async function listSessions(): Promise<SessionRow[]> {

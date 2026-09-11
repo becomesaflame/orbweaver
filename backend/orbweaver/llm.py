@@ -93,8 +93,8 @@ def hosted_provider(model: str | None = None) -> str:
     return "none"
 
 
-def no_llm_echo(user_text: str) -> str:
-    model = settings.orbweaver_model.strip()
+def no_llm_echo(user_text: str, model: str | None = None) -> str:
+    model = (model or settings.orbweaver_model).strip()
     echo = (user_text or "")[:500]
     if is_open_model(model) and not openrouter_configured():
         return (

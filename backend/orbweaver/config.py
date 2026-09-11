@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     # served from the gateway itself and needs nothing here.
     orbweaver_cors_origins: str = ""
     orbweaver_model: str = "claude-sonnet-4-6"
+    # Per-channel agent defaults (#137); empty falls back to ORBWEAVER_MODEL.
+    # Cron, subagents and unknown channels always use ORBWEAVER_MODEL.
+    orbweaver_web_model: str = ""
+    orbweaver_vscode_model: str = ""
+    orbweaver_telegram_model: str = ""
     orbweaver_classifier_model: str = "claude-sonnet-4-6"
     orbweaver_injection_probe_model: str = "claude-haiku-4-5"
     # off | scoped | all. scoped skips in-project Read/Grep/Glob/WorkspaceSearch and
@@ -193,11 +198,16 @@ class Settings(BaseSettings):
 
     @property
     def event_budget(self) -> int:
+        """Prompt budget for the model of the running turn (see model_routing)."""
+        return self.event_budget_for(None)
+
+    def event_budget_for(self, model: str | None) -> int:
         if self.event_budget_override is not None:
             return self.event_budget_override
+        from orbweaver.model_routing import current_model
         from orbweaver.open_models import context_window_for
 
-        window = context_window_for(self.orbweaver_model, self.context_window)
+        window = context_window_for(model or current_model(), self.context_window)
         raw = (
             window
             - self.output_reserve

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import {
+  ModelCatalog,
   SessionEvent,
   SessionRow,
   SessionSocket,
@@ -8,9 +9,11 @@ import {
   createSession,
   injectTurn,
   listEvents,
+  listModels,
   listSessions,
   readConfig,
   renameSession,
+  setSessionModel,
 } from "./client";
 import { DiffManager, PatchProposal } from "./diffs";
 import { PlanManager } from "./plans";
@@ -48,10 +51,15 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
   private busy = false;
   private stopped = false;
 
+  private catalog: ModelCatalog | undefined;
+  /** Session model override shown in the picker ("" = channel default). */
+  private model = "";
+
   constructor(
     private readonly ctx: vscode.ExtensionContext,
     private readonly getSessionId: () => string | undefined,
-    private readonly diffs: DiffManager
+    private readonly diffs: DiffManager,
+    private readonly onModelPicked: (model: string) => Promise<void>
   ) {}
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -63,6 +71,14 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
       try {
         if (msg.type === "ready") {
           this.post({ type: "patches", patches: this.diffs.list().map((p) => p.path) });
+          await this.loadModels();
+          return;
+        }
+        if (msg.type === "setModel") {
+          const model = String(msg.model || "").trim();
+          this.model = model;
+          await this.onModelPicked(model);
+          this.postModels();
           return;
         }
         if (msg.type === "send") {
@@ -131,6 +147,35 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "patches", patches: paths });
   }
 
+  /** Current session's stored model ("" = gateway default for vscode). */
+  setModel(model: string): void {
+    this.model = model || "";
+    this.postModels();
+  }
+
+  get pickedModel(): string {
+    return this.model;
+  }
+
+  async loadModels(): Promise<void> {
+    try {
+      this.catalog = await listModels();
+    } catch {
+      /* no token yet or old gateway: the picker keeps only the current value */
+    }
+    this.postModels();
+  }
+
+  private postModels(): void {
+    const defaults: Record<string, string> = this.catalog?.defaults || {};
+    this.post({
+      type: "models",
+      models: this.catalog?.models || [],
+      current: this.model,
+      default: defaults.vscode || defaults.fallback || "",
+    });
+  }
+
   private post(msg: unknown): void {
     this.view?.webview.postMessage(msg);
   }
@@ -142,7 +187,17 @@ export function activate(context: vscode.ExtensionContext): void {
   let sessionId: string | undefined = context.workspaceState.get("orbweaver.sessionId");
   let sessions: SessionRow[] = [];
   const tree = new SessionTree(() => sessionId);
-  const chat = new ChatViewProvider(context, () => sessionId, diffs);
+  // Picker choice for a chat that does not exist yet; consumed by ensureSession.
+  let pendingModel: string | undefined;
+  const chat = new ChatViewProvider(context, () => sessionId, diffs, async (model) => {
+    if (!sessionId) {
+      pendingModel = model;
+      return;
+    }
+    const stored = await setSessionModel(sessionId, model);
+    const row = sessions.find((s) => s.id === sessionId);
+    if (row) row.model = stored;
+  });
   diffs.onPendingChange = (pending) => chat.setPatches(pending.map((p) => p.path));
 
   const socket = new SessionSocket(
@@ -184,6 +239,7 @@ export function activate(context: vscode.ExtensionContext): void {
     await context.workspaceState.update("orbweaver.sessionId", id);
     const row = sessions.find((s) => s.id === id);
     chat.setTitle(row?.title || "Chat", row?.workspace_uri || readConfig().workspaceUri);
+    chat.setModel(row?.model || "");
     tree.refresh(sessions);
     try {
       await socket.connect(id);
@@ -199,7 +255,8 @@ export function activate(context: vscode.ExtensionContext): void {
 
   async function ensureSession(): Promise<string> {
     if (sessionId) return sessionId;
-    const created = await createSession();
+    const created = await createSession(undefined, pendingModel);
+    pendingModel = undefined;
     sessions = [created, ...sessions.filter((s) => s.id !== created.id)];
     tree.refresh(sessions);
     await bindSession(created.id, { history: false });
@@ -233,7 +290,9 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("orbweaver.newSession", async () => {
       try {
-        const created = await createSession();
+        // A new chat keeps the model picked in the view; else orbweaver.model.
+        const created = await createSession(undefined, pendingModel ?? chat.pickedModel);
+        pendingModel = undefined;
         sessions = [created, ...sessions.filter((s) => s.id !== created.id)];
         tree.refresh(sessions);
         await bindSession(created.id, { history: false });
@@ -285,7 +344,7 @@ export function activate(context: vscode.ExtensionContext): void {
         chat.setStopped(false);
         chat.showEvent({ kind: "user", payload: { text: body } });
         if (socket.sessionId !== sid) await socket.connect(sid);
-        socket.sendTurn(body);
+        socket.sendTurn(body, chat.pickedModel);
       } catch (e) {
         chat.setBusy(false);
         chat.showError(String(e));
@@ -360,6 +419,9 @@ function chatHtml(): string {
   button.ghost { background: transparent; color: var(--vscode-foreground);
     border: 1px solid var(--vscode-widget-border); }
   button:disabled { opacity: 0.45; }
+  #model { font: inherit; font-size: 0.8rem; max-width: 12rem; margin-left: auto;
+    background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground);
+    border: 1px solid var(--vscode-dropdown-border); border-radius: 4px; padding: 0.2rem 0.3rem; }
 </style>
 </head>
 <body>
@@ -373,6 +435,9 @@ function chatHtml(): string {
       <button id="stop" class="ghost" disabled>Stop</button>
       <button id="inject" class="ghost" disabled>Add to turn</button>
       <button id="cont" class="ghost" disabled>Continue</button>
+      <select id="model" title="Model for this chat (default follows ORBWEAVER_VSCODE_MODEL)">
+        <option value="">default model</option>
+      </select>
     </div>
   </div>
 <script>
@@ -381,8 +446,36 @@ const log = document.getElementById("log");
 const meta = document.getElementById("meta");
 const patches = document.getElementById("patches");
 const t = document.getElementById("t");
+const modelSel = document.getElementById("model");
 let busy = false;
 let stopped = false;
+function paintModels(m) {
+  const want = String(m.current || "");
+  modelSel.replaceChildren();
+  const def = document.createElement("option");
+  def.value = "";
+  def.textContent = m.default ? "default (" + m.default + ")" : "default model";
+  modelSel.appendChild(def);
+  const seen = new Set();
+  for (const row of m.models || []) {
+    if (!row || !row.id || seen.has(row.id)) continue;
+    seen.add(row.id);
+    const o = document.createElement("option");
+    o.value = row.id;
+    o.textContent = row.available === false ? row.id + " (no key)" : row.id;
+    o.disabled = row.available === false;
+    modelSel.appendChild(o);
+  }
+  if (want && !seen.has(want)) {
+    const o = document.createElement("option");
+    o.value = want;
+    o.textContent = want;
+    modelSel.appendChild(o);
+  }
+  modelSel.value = want;
+  if (modelSel.value !== want) modelSel.value = "";
+}
+modelSel.onchange = () => vscode.postMessage({ type: "setModel", model: modelSel.value });
 function add(kind, text) {
   const d = document.createElement("div");
   d.className = "msg " + kind;
@@ -462,6 +555,7 @@ window.addEventListener("message", (e) => {
   else if (m.type === "busy") { busy = !!m.busy; stopped = !!m.stopped; sync(); }
   else if (m.type === "meta") meta.textContent = (m.title || "Chat") + " · " + (m.workspaceUri || "");
   else if (m.type === "patches") paintPatches(m.patches || []);
+  else if (m.type === "models") paintModels(m);
 });
 vscode.postMessage({ type: "ready" });
 sync();

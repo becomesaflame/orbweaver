@@ -1825,8 +1825,9 @@ async def _create_agent_message(
     """LLM call (streamed when the client supports it) with a per-model output
     budget; re-ask once, larger, when a tool_use was cut off by max_tokens (#80)."""
     from orbweaver.llm import completion_max_tokens, max_tokens_for_model
+    from orbweaver.model_routing import current_model
 
-    model = model or settings.orbweaver_model
+    model = model or current_model()
     budget = max_tokens if max_tokens is not None else completion_max_tokens(model)
     kwargs = {
         "model": model,
@@ -1876,7 +1877,14 @@ async def agent_turn(
     subagent_depth: int = 0,
     images: list[dict[str, str]] | None = None,
     channel: str | None = None,
+    model: str | None = None,
 ) -> list[Event]:
+    """Run one agent turn.
+
+    ``model`` overrides the session's stored model and the channel default
+    (``ORBWEAVER_WEB_MODEL`` / ``_VSCODE_MODEL`` / ``_TELEGRAM_MODEL``); see
+    ``model_routing.resolve_turn_model``.
+    """
     _raise_if_cancelled(cancel)
     wait_ok = interactive if interactive is not None else not headless
     prior = await store.list_events(session_id)
@@ -2034,18 +2042,29 @@ async def agent_turn(
 
     check()
     from orbweaver.llm import make_agent_client, no_llm_echo
+    from orbweaver.model_routing import (
+        reset_current_model,
+        resolve_turn_model,
+        set_current_model,
+    )
 
-    client = make_agent_client()
+    sess = await store.get_entity(session_id)
+    resolved_channel = resolve_channel(sess.jsonld if sess else None, channel=channel)
+    turn_model = resolve_turn_model(
+        override=model, session=sess.jsonld if sess else None, channel=resolved_channel
+    )
+    # Published for the turn so event_budget / compact follow this model.
+    model_token = set_current_model(turn_model)
+    client = make_agent_client(model=turn_model)
     if client is None:
         ev = await store.append_event(
             session_id,
             "assistant",
-            {"text": no_llm_echo(user_text or "")},
+            {"text": no_llm_echo(user_text or "", turn_model)},
         )
         fire(ev)
+        reset_current_model(model_token)
         return produced
-    sess = await store.get_entity(session_id)
-    resolved_channel = resolve_channel(sess.jsonld if sess else None, channel=channel)
     denial_state = denial_state_for(session_id)
     ctx = {
         "workspace": workspace,
@@ -2307,7 +2326,7 @@ async def agent_turn(
                     workspace=workspace,
                     system=system,
                     user_text=user_text,
-                    model=settings.orbweaver_model,
+                    model=turn_model,
                     tools=active_tools,
                     cancel=cancel,
                     produced=produced,
@@ -2534,7 +2553,7 @@ async def agent_turn(
                     workspace=workspace,
                     system=system,
                     user_text=user_text,
-                    model=settings.orbweaver_model,
+                    model=turn_model,
                     tools=[],
                     cancel=cancel,
                     produced=produced,
@@ -2584,6 +2603,7 @@ async def agent_turn(
         from orbweaver.hindsight import retain_turn
         from orbweaver.subagent import settle_children
 
+        reset_current_model(model_token)
         if ctx.get("children"):
             try:
                 await settle_children(

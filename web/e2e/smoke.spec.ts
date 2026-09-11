@@ -7,6 +7,13 @@ test("web chat shell loads health version and composer", async ({ page }) => {
   await expect(page.locator("#status")).toHaveText("disconnected");
   await expect(page.locator("#text")).toBeVisible();
   await expect(page.locator("#send")).toHaveText("Send");
+  // Model picker (#137): the composer select exists and defaults to the
+  // channel default reported by /health before any JWT is pasted.
+  const model = page.locator("#model");
+  await expect(model).toBeVisible();
+  await expect(model).toHaveValue("");
+  await expect(model.locator("option").first()).toHaveText(/^default/);
+  await expect(page.locator("#app-model")).toHaveText(/^· \S+$/);
   await expect(page.locator("#settings")).toBeVisible();
   await expect(page.locator("#token")).toBeVisible();
 });

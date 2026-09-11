@@ -112,6 +112,12 @@
     .q-item button { color:var(--muted); padding:0.1rem 0.4rem; }
     #composer { display:flex; gap:0.5rem; padding:0.75rem 1rem 0.35rem; border-top:0; }
     .composer-btns { display:flex; flex-direction:column; gap:0.35rem; justify-content:flex-end; }
+    #model {
+      width:100%; max-width:6.6rem; min-width:6.6rem; background:#1f1f1f; color:var(--muted); font:inherit;
+      font-size:0.75rem; border:1px solid var(--line); border-radius:8px; padding:0.3rem 0.35rem; cursor:pointer;
+    }
+    #model:hover { color:var(--ink); }
+    #model option:disabled { color:#666; }
     #send { width:auto; background:var(--accent); color:#111; font-weight:650; padding:0.55rem 0.9rem; min-width:6.6rem; }
     #send:hover { background:var(--accent); filter:brightness(1.05); }
     #send.stop { background:#6a4040; color:#f2f2f2; }
@@ -403,6 +409,9 @@
       <div id="composer">
         <textarea id="text" placeholder="Message (Shift+Enter for newline)"></textarea>
         <div class="composer-btns">
+          <select id="model" title="Model for this chat (default follows ORBWEAVER_WEB_MODEL)" aria-label="Model">
+            <option value="">default model</option>
+          </select>
           <button type="button" id="queue-btn" class="ghost hidden" title="Run after this turn finishes">Queue</button>
           <button type="button" id="inject" class="ghost hidden" title="Fold into the live turn (Ctrl+Enter)">Add to turn</button>
           <button type="button" id="continue" class="ghost hidden" title="Resume the stopped turn">Continue</button>
@@ -429,13 +438,68 @@
     let collapsed = new Set(JSON.parse(localStorage.getItem(LS.collapsed) || "[]"));
     let expandedExtra = new Set(JSON.parse(localStorage.getItem(LS.expanded) || "[]"));
     $("base").value = location.origin;
+    // Model picker (#137). "" = the channel default (ORBWEAVER_WEB_MODEL, else
+    // ORBWEAVER_MODEL); anything else is stored on the session by the gateway.
+    let modelDefaults = {};
+    let modelCatalog = [];
+    let modelsLoaded = false;
+    function defaultWebModel() {
+      return String(modelDefaults.web || modelDefaults.fallback || "");
+    }
+    function pickedModel() { return $("model").value.trim(); }
+    function effectiveModel() { return pickedModel() || defaultWebModel(); }
+    function paintModelHeader() {
+      const m = effectiveModel();
+      $("app-model").textContent = m ? "\u00b7 " + m : "";
+    }
+    function paintModelPicker() {
+      const sel = $("model");
+      const cur = currentSession();
+      const want = cur ? String(cur.model || "") : (sel.dataset.pending || "");
+      sel.replaceChildren();
+      const def = document.createElement("option");
+      def.value = "";
+      def.textContent = defaultWebModel() ? "default (" + defaultWebModel() + ")" : "default model";
+      sel.appendChild(def);
+      const ids = new Set();
+      for (const m of modelCatalog) {
+        if (!m || !m.id || ids.has(m.id)) continue;
+        ids.add(m.id);
+        const o = document.createElement("option");
+        o.value = m.id;
+        o.textContent = m.available === false ? m.id + " (no key)" : m.id;
+        o.disabled = m.available === false;
+        sel.appendChild(o);
+      }
+      if (want && !ids.has(want)) {
+        const o = document.createElement("option");
+        o.value = want;
+        o.textContent = want;
+        sel.appendChild(o);
+      }
+      sel.value = want;
+      if (sel.value !== want) sel.value = "";
+      paintModelHeader();
+    }
+    async function loadModels() {
+      if (!$("token").value.trim()) return;
+      try {
+        const r = await api("/v1/models");
+        modelCatalog = r.models || [];
+        modelDefaults = r.defaults || modelDefaults;
+        modelsLoaded = true;
+      } catch (e) { /* header keeps the /health default */ }
+      paintModelPicker();
+    }
     async function pingVersion() {
       try {
         const r = await fetch($("base").value.replace(/\/$/, "") + "/health");
         const j = await r.json();
         $("app-ver").textContent = j.version ? "v" + j.version : "";
-        const model = j.llm && j.llm.model ? String(j.llm.model) : "";
-        $("app-model").textContent = model ? "\u00b7 " + model : "";
+        const llm = j.llm || {};
+        if (llm.defaults) modelDefaults = llm.defaults;
+        else if (llm.model) modelDefaults = { web: String(llm.model), fallback: String(llm.model) };
+        paintModelPicker();
       } catch {
         $("app-ver").textContent = "";
         $("app-model").textContent = "";
@@ -471,7 +535,20 @@
     }
     $("token").addEventListener("input", () => {
       localStorage.setItem(LS.jwt, $("token").value.trim());
+      modelsLoaded = false;
       refreshSessions();
+    });
+    $("model").addEventListener("change", async () => {
+      const model = pickedModel();
+      const sid = currentSid();
+      paintModelHeader();
+      if (!sid) { $("model").dataset.pending = model; return; }
+      delete $("model").dataset.pending;
+      try {
+        await api("/v1/sessions/" + sid, { method:"PATCH", body: JSON.stringify({ model }) });
+        const cur = currentSession();
+        if (cur) cur.model = model;
+      } catch (e) { $("status").textContent = String(e); }
     });
     $("base").addEventListener("change", pingVersion);
     $("wuri").addEventListener("input", persistWorkspace);
@@ -1450,6 +1527,7 @@
       $("chat-title").textContent = session.title || "New chat";
       history.replaceState(null, "", "#/s/" + session.id);
       paintSessions();
+      paintModelPicker();
       setBusy(false);
       if (!opts.skipHistory) loadHistory();
     }
@@ -1582,6 +1660,7 @@
         const cur = currentSession();
         if (cur) $("chat-title").textContent = cur.title || "New chat";
         paintSessions();
+        if (!modelsLoaded) await loadModels(); else paintModelPicker();
       } catch (e) {
         $("conn-dot").classList.remove("ok");
         $("status").textContent = String(e);
@@ -1636,20 +1715,22 @@
         return;
       }
       persistWorkspace();
-      const r = await api("/v1/sessions", {
-        method:"POST",
-        body: JSON.stringify({
-          workspace_uri: uri || $("wuri").value,
-          workspace_kind: "local",
-          title: "New chat",
-          channel: "web"
-        })
-      });
+      const model = pickedModel();
+      const body = {
+        workspace_uri: uri || $("wuri").value,
+        workspace_kind: "local",
+        title: "New chat",
+        channel: "web"
+      };
+      if (model) body.model = model;
+      const r = await api("/v1/sessions", { method:"POST", body: JSON.stringify(body) });
+      delete $("model").dataset.pending;
       const session = {
         id: r.id,
         title: r.title || "New chat",
         workspace_uri: r.workspace_uri || uri || $("wuri").value,
         workspace_kind: "local",
+        model: r.model || model || "",
         created_at: new Date().toISOString(),
         last_event_at: "",
         event_count: 0
@@ -2044,8 +2125,10 @@
       inFlight = { sid, text, userEl, workingEl, done };
       syncComposer();
       $("status").textContent = "working…";
+      const turnPayload = { text };
+      if (pickedModel()) turnPayload.model = pickedModel();
       try {
-        const r = await streamTurn(sid, { text }, (ev) => {
+        const r = await streamTurn(sid, turnPayload, (ev) => {
           if (currentSid() !== sid) return;
           if (ev.kind === "user" && !(ev.payload && ev.payload.injected)) {
             if (userEl) {
