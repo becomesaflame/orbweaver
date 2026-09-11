@@ -376,6 +376,16 @@ def _tool_result_id_set(msg: dict[str, Any] | None) -> set[str]:
     }
 
 
+def _is_tool_result_message(msg: dict[str, Any] | None) -> bool:
+    """User message made only of tool_result blocks (results of one assistant round)."""
+    if not msg or msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    return all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+
+
 def _stub_tool_result(tool_use_id: str) -> dict[str, Any]:
     return {
         "type": "tool_result",
@@ -471,18 +481,19 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                 if content:
                     blocks.append({"type": "text", "text": str(content)})
                 content = blocks or content
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": p.get("tool_use_id") or p.get("id") or "unknown",
-                            "content": content,
-                        }
-                    ],
-                }
-            )
+            block: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": p.get("tool_use_id") or p.get("id") or "unknown",
+                "content": content,
+            }
+            if p.get("is_error"):
+                block["is_error"] = True
+            # A parallel round records tool_call, tool_call, result, result: all
+            # results for one assistant message belong in one user message.
+            if _is_tool_result_message(messages[-1] if messages else None):
+                messages[-1]["content"].append(block)
+            else:
+                messages.append({"role": "user", "content": [block]})
         elif k in STOP_KINDS:
             _flush_pending_tools(messages, pending_tool, stub_results=True)
         elif k == "UserCorrection":
@@ -493,6 +504,12 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                     "content": f"User correction: {p.get('text') or json.dumps(p)}",
                 }
             )
+        elif k == "subagent_result":
+            # Background child finished: user-side note, like an injected follow-up.
+            from orbweaver.subagent import format_subagent_result
+
+            _flush_pending_tools(messages, pending_tool, stub_results=True)
+            _append_user_content(messages, format_subagent_result(p))
         elif k in BOUNDARY_KINDS:
             _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append(
