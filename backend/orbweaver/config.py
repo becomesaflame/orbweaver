@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     orbweaver_sandbox_seccomp: str = "auto"
     orbweaver_sandbox_hide_sys: bool = True
     orbweaver_sandbox_env_allow: str = ""  # extra env names/globs passed into sandboxed Bash
+    orbweaver_checkpoints: bool = True  # per-turn git tree of the workspace for rewind
+    orbweaver_checkpoint_keep_days: int = 14  # prune refs/orbweaver/checkpoints older than this
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
     context_window: int = 200_000

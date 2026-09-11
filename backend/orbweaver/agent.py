@@ -14,6 +14,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from orbweaver import __version__
+from orbweaver.checkpoints import checkpoint_user_turn, pin_user_turn
 from orbweaver.compact import (
     CONTEXT_FULL_MESSAGE,
     ContextFullError,
@@ -1329,7 +1330,16 @@ async def agent_turn(
             payload["ask_answer"] = True
         if images:
             payload["images"] = images
+        checkpoint: dict[str, Any] | None = None
+        if subagent_depth == 0:
+            checkpoint = await asyncio.to_thread(checkpoint_user_turn, workspace)
+            if checkpoint is not None:
+                payload["checkpoint"] = checkpoint
         user_ev = await store.append_event(session_id, "user", payload)
+        if checkpoint is not None:
+            await asyncio.to_thread(
+                pin_user_turn, workspace, checkpoint, session_id, user_ev.seq
+            )
         if turn_state is not None:
             turn_state.user_seq = user_ev.seq
         if emit:
