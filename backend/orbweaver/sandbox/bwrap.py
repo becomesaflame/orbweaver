@@ -9,11 +9,13 @@ import resource
 import shutil
 import signal
 import subprocess
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
 from orbweaver.config import settings
+from orbweaver.sandbox.environment import build_sandbox_env, setenv_args
 from orbweaver.sandbox.errors import label_sandbox_output
 from orbweaver.sandbox.policy import (
     PROTECTED_WRITE_REL,
@@ -30,6 +32,7 @@ from orbweaver.sandbox.ssh import (
     resolv_conf_overlay_args,
     ssh_config_overlay_args,
     ssh_identity_bind_args,
+    ssh_private_identity_files,
 )
 
 log = logging.getLogger(__name__)
@@ -207,18 +210,105 @@ def seccomp_enabled(exe: str | None = None) -> bool:
 
 
 def _deny_read_overlay_args(hidden: Path) -> list[str]:
-    """Hide an existing denyRead path. Skip missing ones: bwrap cannot mkdir on a ro-bind."""
+    """Hide an existing denyRead path. Skip missing ones: bwrap cannot mkdir on a ro-bind.
+
+    Directories get an empty ``--tmpfs``; files get ``/dev/null`` bound over them. bwrap
+    refuses to mount on a symlink ("Can't create file"), so a symlinked entry (dotfiles
+    manager) masks its resolved target instead; the link then points at the mask.
+    """
     try:
         if not hidden.exists():
             return []
-        dest = str(hidden)
-        if hidden.is_dir():
+        target = hidden.resolve() if hidden.is_symlink() else hidden
+        dest = str(target)
+        if target.is_dir():
             return ["--tmpfs", dest]
-        if hidden.is_file():
+        if target.is_file():
             return ["--ro-bind", "/dev/null", dest]
     except OSError:
         return []
     return []
+
+
+def deny_read_overlay_args(policy: SandboxPolicy) -> list[str]:
+    """bwrap mount args that mask every ``policy.deny_read`` entry that exists."""
+    args: list[str] = []
+    seen: set[str] = set()
+    for hidden in policy.deny_read:
+        chunk = _deny_read_overlay_args(hidden)
+        if not chunk:
+            continue
+        dest = chunk[-1]
+        if dest in seen:
+            continue
+        seen.add(dest)
+        args.extend(chunk)
+    return args
+# A writable root is `--bind` rw, but files that execute host commands when git
+# runs must stay read-only: `.git/config` (core.fsmonitor, core.sshCommand,
+# aliases, …), `.git/hooks/*`, and `.gitmodules`. The rest of `.git` stays
+# writable so `git add`/`git commit` still work in the sandbox (issue #94).
+# Discovery is a bounded walk; repos nested deeper than this are not protected
+# (matches sandbox-runtime's --max-depth cap and keeps per-command cost cheap).
+GIT_SCAN_MAX_DEPTH = 4
+_GIT_SCAN_PRUNE = {
+    ".git",
+    "node_modules",
+    ".orbweaver-tmp",
+    ".venv",
+    "venv",
+    "__pycache__",
+}
+
+
+def git_protected_paths(
+    root: Path,
+    max_depth: int = GIT_SCAN_MAX_DEPTH,
+    *,
+    allow_git_config: bool = False,
+) -> list[Path]:
+    """`.git/config`, `.git/hooks`, and `.gitmodules` for every repo at or under
+    `root`, up to `max_depth` directories deep. Missing paths are fine: the caller
+    uses `--ro-bind-try`, which skips them (and skips `.git/hooks` for worktrees
+    where `.git` is a file). With `allow_git_config`, `.git/config` stays writable
+    (hooks and .gitmodules do not)."""
+    out: list[Path] = []
+    try:
+        base = root.resolve()
+    except OSError:
+        return out
+    stack: list[tuple[Path, int]] = [(base, 0)]
+    while stack:
+        directory, depth = stack.pop()
+        git_dir = directory / ".git"
+        try:
+            if git_dir.is_dir():
+                if not allow_git_config:
+                    out.append(git_dir / "config")
+                out.append(git_dir / "hooks")
+        except OSError:
+            pass
+        gitmodules = directory / ".gitmodules"
+        try:
+            if gitmodules.is_file():
+                out.append(gitmodules)
+        except OSError:
+            pass
+        if depth >= max_depth:
+            continue
+        try:
+            for child in os.scandir(directory):
+                if child.name in _GIT_SCAN_PRUNE:
+                    continue
+                try:
+                    is_dir = child.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_dir:
+                    stack.append((Path(child.path), depth + 1))
+        except OSError:
+            continue
+    return out
 
 
 def _dir_chain(path: Path) -> list[str]:
@@ -251,6 +341,7 @@ def build_bwrap_argv(
     host_root: bool = True,
     seccomp_fd: int | None = None,
     limits: dict[str, int] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Argv for one sandboxed `bash -lc command`.
 
@@ -294,12 +385,16 @@ def build_bwrap_argv(
         )
     # After the host bind: a private /dev (so /dev/null is writable), /proc, and /tmp.
     argv.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
-    ensure_ssh_sandbox(tmp, proxied=not full_network)
+    private_keys = ssh_private_identity_files(ssh_policy=pol.ssh)
+    ensure_ssh_sandbox(tmp, proxied=not full_network, identity_files=private_keys)
     argv.extend(ssh_config_overlay_args(tmp))
     argv.extend(["--tmpfs", "/run"])
     if not _is_run_symlink():
         argv.extend(["--tmpfs", "/var/run"])
     argv.extend(resolv_conf_overlay_args(tmp))
+    # Credential masks first, then the allowlisted sockets and the ~/.ssh public files go
+    # back on top: an SSH_AUTH_SOCK under a hidden directory must survive the tmpfs.
+    argv.extend(deny_read_overlay_args(pol))
     seen_dirs: set[str] = set()
     for sock in pol.allow_unix_sockets:
         sock_p = Path(sock)
@@ -309,16 +404,32 @@ def build_bwrap_argv(
             seen_dirs.add(d)
             argv.extend(["--dir", d])
         argv.extend(["--ro-bind-try", str(sock_p), str(sock_p)])
-    for hidden in pol.deny_read:
-        argv.extend(_deny_read_overlay_args(hidden))
-    argv.extend(ssh_identity_bind_args())
-    for rw in pol.readwrite_roots(root, tmp):
+    argv.extend(ssh_identity_bind_args(ssh_policy=pol.ssh))
+    writable_roots = pol.readwrite_roots(root, tmp)
+    for rw in writable_roots:
         argv.extend(["--bind", str(rw), str(rw)])
     for rel in PROTECTED_WRITE_REL:
         protected = root / rel
         argv.extend(["--ro-bind-try", str(protected), str(protected)])
+    seen_git: set[str] = set()
+    for rw in writable_roots:
+        for git_path in git_protected_paths(rw, allow_git_config=pol.allow_git_config):
+            dest = str(git_path)
+            if dest in seen_git:
+                continue
+            seen_git.add(dest)
+            argv.extend(["--ro-bind-try", dest, dest])
+    # Do not inherit the gateway environment (API keys, JWT secret, bot token,
+    # DATABASE_URL). Clear it and set an explicit allowlist (#93).
+    env = build_sandbox_env(
+        environ if environ is not None else os.environ,
+        allow=pol.env_allow,
+        granted_sockets=pol.allow_unix_sockets,
+    )
+    env["TMPDIR"] = str(tmp)
+    argv.extend(setenv_args(env))
     script = rlimit_prologue(limits) + command
-    argv.extend(["--setenv", "TMPDIR", str(tmp), "--chdir", str(root), "--", "bash", "-lc", script])
+    argv.extend(["--chdir", str(root), "--", "bash", "-lc", script])
     return argv
 
 

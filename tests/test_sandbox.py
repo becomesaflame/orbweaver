@@ -142,18 +142,168 @@ def test_sandbox_available_in_container(monkeypatch):
     assert sandbox_available() is True
 
 
-def test_bwrap_does_not_ro_bind_git_metadata(tmp_path: Path):
-    """Workspace .git is working-set writeable so clone/init/fetch can run."""
+def _setenv_map(argv: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for i, a in enumerate(argv):
+        if a == "--setenv":
+            out[argv[i + 1]] = argv[i + 2]
+    return out
+
+
+_GATEWAY_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/home/gw",
+    "USER": "gw",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "ANTHROPIC_API_KEY": "sk-ant-FAKE",
+    "OPENROUTER_API_KEY": "sk-or-FAKE",
+    "ORBWEAVER_JWT_SECRET": "x",
+    "TELEGRAM_BOT_TOKEN": "123:abc",
+    "DATABASE_URL": "postgresql://u:p@localhost/db",
+    "HINDSIGHT_API_KEY": "hs-FAKE",
+    "MY_PASSWORD": "hunter2",
+    "PGHOST": "localhost",
+}
+
+
+def test_bwrap_clears_env_and_sets_allowlist(tmp_path: Path):
+    """#93: sandboxed Bash inherited ANTHROPIC_API_KEY, the JWT secret, and the bot token."""
+    argv = build_bwrap_argv("env", tmp_path, tmp_path / "tmp", environ=_GATEWAY_ENV)
+    assert "--clearenv" in argv
+    assert argv.index("--clearenv") < argv.index("--setenv")
+    env = _setenv_map(argv)
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["HOME"] == "/home/gw"
+    assert env["LC_ALL"] == "C.UTF-8"
+    assert env["TMPDIR"] == str((tmp_path / "tmp").resolve())
+    for secret in (
+        "ANTHROPIC_API_KEY",
+        "OPENROUTER_API_KEY",
+        "ORBWEAVER_JWT_SECRET",
+        "TELEGRAM_BOT_TOKEN",
+        "DATABASE_URL",
+        "HINDSIGHT_API_KEY",
+        "MY_PASSWORD",
+        "PGHOST",
+    ):
+        assert secret not in env
+    joined = " ".join(argv)
+    assert "sk-ant-FAKE" not in joined
+    assert "hunter2" not in joined
+
+
+def test_bwrap_env_allow_passes_names_but_excludes_win(tmp_path: Path):
+    policy = SandboxPolicy(env_allow=("PGHOST", "ANTHROPIC_API_KEY", "MY_PASSWORD", "ORBWEAVER_JWT_SECRET"))
+    argv = build_bwrap_argv("env", tmp_path, tmp_path / "tmp", policy=policy, environ=_GATEWAY_ENV)
+    env = _setenv_map(argv)
+    assert env["PGHOST"] == "localhost"
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "MY_PASSWORD" not in env
+    assert "ORBWEAVER_JWT_SECRET" not in env
+
+
+def test_bwrap_ssh_auth_sock_only_when_socket_granted(tmp_path: Path):
+    sock = tmp_path / "agent.sock"
+    environ = {**_GATEWAY_ENV, "SSH_AUTH_SOCK": str(sock)}
+    argv = build_bwrap_argv("env", tmp_path, tmp_path / "tmp", environ=environ)
+    assert "SSH_AUTH_SOCK" not in _setenv_map(argv)
+    granted = SandboxPolicy(allow_unix_sockets=(sock,))
+    argv = build_bwrap_argv("env", tmp_path, tmp_path / "tmp", policy=granted, environ=environ)
+    assert _setenv_map(argv)["SSH_AUTH_SOCK"] == str(sock)
+
+
+def _ro_bind_dests(argv: list[str]) -> set[str]:
+    dests: set[str] = set()
+    i = 0
+    while i < len(argv):
+        if argv[i] in {"--ro-bind", "--ro-bind-try"} and i + 2 < len(argv):
+            dests.add(argv[i + 2])
+            i += 3
+            continue
+        i += 1
+    return dests
+
+
+def _bind_dests(argv: list[str]) -> set[str]:
+    dests: set[str] = set()
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--bind" and i + 2 < len(argv):
+            dests.add(argv[i + 2])
+            i += 3
+            continue
+        i += 1
+    return dests
+
+
+def test_bwrap_ro_binds_git_config_hooks_gitmodules(tmp_path: Path):
+    """Issue #94: .git/config, .git/hooks, and .gitmodules stay read-only inside a
+    writable root so a hostile config cannot execute host commands."""
     hooks = tmp_path / ".git" / "hooks"
     hooks.mkdir(parents=True)
     config = tmp_path / ".git" / "config"
     config.write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+    gitmodules = tmp_path / ".gitmodules"
+    gitmodules.write_text("[submodule \"x\"]\n", encoding="utf-8")
     argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp")
-    protected = {str(hooks.resolve()), str(config.resolve())}
-    i = 0
-    while i < len(argv):
-        if argv[i] in {"--ro-bind", "--ro-bind-try"} and i + 2 < len(argv):
-            assert argv[i + 2] not in protected
-            i += 3
-            continue
-        i += 1
+    ro = _ro_bind_dests(argv)
+    assert str(config.resolve()) in ro
+    assert str(hooks.resolve()) in ro
+    assert str(gitmodules.resolve()) in ro
+    # The workspace itself and the rest of .git stay writable.
+    assert str(tmp_path.resolve()) in _bind_dests(argv)
+    assert str((tmp_path / ".git").resolve()) not in ro
+    # The git ro-binds come after the workspace rw --bind so they win.
+    joined = argv.index(str(config.resolve()))
+    bind_i = next(
+        i for i, a in enumerate(argv)
+        if a == "--bind" and argv[i + 1] == str(tmp_path.resolve())
+    )
+    assert bind_i < joined
+
+
+def test_bwrap_ro_binds_nested_repo_git_metadata(tmp_path: Path):
+    nested = tmp_path / "sub" / "pkg"
+    (nested / ".git" / "hooks").mkdir(parents=True)
+    (nested / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp")
+    ro = _ro_bind_dests(argv)
+    assert str((nested / ".git" / "config").resolve()) in ro
+    assert str((nested / ".git" / "hooks").resolve()) in ro
+
+
+def test_bwrap_allow_git_config_keeps_config_writable(tmp_path: Path):
+    hooks = tmp_path / ".git" / "hooks"
+    hooks.mkdir(parents=True)
+    config = tmp_path / ".git" / "config"
+    config.write_text("[core]\n", encoding="utf-8")
+    policy = SandboxPolicy(allow_git_config=True)
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp", policy=policy)
+    ro = _ro_bind_dests(argv)
+    assert str(config.resolve()) not in ro
+    # Hooks stay read-only regardless of allowGitConfig.
+    assert str(hooks.resolve()) in ro
+
+
+def test_git_protected_paths_respects_depth_and_worktree(tmp_path: Path):
+    from orbweaver.sandbox.bwrap import GIT_SCAN_MAX_DEPTH, git_protected_paths
+
+    (tmp_path / ".git" / "hooks").mkdir(parents=True)
+    (tmp_path / ".git" / "config").write_text("x", encoding="utf-8")
+    # A worktree: .git is a file, so hooks/config never exist there.
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+    # Too deep to be scanned.
+    deep = tmp_path
+    for part in ["a", "b", "c", "d", "e", "f"][: GIT_SCAN_MAX_DEPTH + 2]:
+        deep = deep / part
+    (deep / ".git").mkdir(parents=True)
+    (deep / ".git" / "config").write_text("x", encoding="utf-8")
+
+    found = {str(p) for p in git_protected_paths(tmp_path)}
+    assert str(tmp_path / ".git" / "config") in found
+    assert str(tmp_path / ".git" / "hooks") in found
+    assert str(worktree / ".git" / "config") not in found
+    assert str(deep / ".git" / "config") not in found

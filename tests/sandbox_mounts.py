@@ -13,6 +13,7 @@ _ZERO = {
     "--unshare-cgroup-try",
     "--new-session",
     "--die-with-parent",
+    "--clearenv",
 }
 _ONE = {"--tmpfs", "--dir", "--dev", "--proc", "--chdir", "--cap-drop", "--seccomp"}
 _TWO = {"--ro-bind", "--ro-bind-try", "--bind", "--setenv"}

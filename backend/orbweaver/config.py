@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     orbweaver_sandbox_additional_readonly: str = ""
     orbweaver_sandbox_additional_readwrite: str = ""
     orbweaver_sandbox_deny_read: str = ""
+    orbweaver_sandbox_allow_read: str = ""
+    orbweaver_sandbox_ssh_identities: str = ""
+    orbweaver_sandbox_ssh_bind_identities: str = ""
     orbweaver_sandbox_unix_sockets: str = ""
     orbweaver_sandbox_allowed_domains: str = ""
     orbweaver_sandbox_denied_domains: str = ""
@@ -42,6 +45,7 @@ class Settings(BaseSettings):
     orbweaver_sandbox_max_open_files: int = 4096
     orbweaver_sandbox_seccomp: str = "auto"
     orbweaver_sandbox_hide_sys: bool = True
+    orbweaver_sandbox_env_allow: str = ""  # extra env names/globs passed into sandboxed Bash
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
     context_window: int = 200_000
