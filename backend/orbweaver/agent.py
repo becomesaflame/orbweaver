@@ -7,6 +7,7 @@ import json
 import logging
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -37,6 +38,12 @@ from orbweaver.lints import read_lints
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
+from orbweaver.permissions.pipeline import summarize_input
+from orbweaver.permissions.session_rules import (
+    add_session_rule,
+    make_session_rule,
+    session_rules_from,
+)
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.todos import inject_session_todos, persist_todos
@@ -747,6 +754,114 @@ def _blocked_tool_result(decision) -> str:
     )
 
 
+APPROVAL_DECISIONS = frozenset({"allow", "deny"})
+APPROVAL_SCOPES = frozenset({"once", "session"})
+APPROVAL_TIMEOUT_NOTICE = (
+    "The approval request timed out and the action was not executed. "
+    "Reply to continue."
+)
+
+
+def _denied_tool_result(reason: str) -> str:
+    return (
+        f"Denied by user. This action needed approval ({reason}) and the user declined. "
+        "Do not retry the same action; adapt or ask what they want instead."
+    )
+
+
+def _approval_timeout_result(reason: str, timeout: float) -> str:
+    return (
+        f"Not executed: no approval decision within {timeout:g}s "
+        f"(needed approval: {reason})."
+    )
+
+
+def _approval_cancelled_result(reason: str) -> str:
+    return f"Not executed: the turn was cancelled while waiting for approval ({reason})."
+
+
+@dataclass
+class PendingApproval:
+    """A held tool call waiting for the user's allow / deny."""
+
+    session_id: UUID
+    tool_use_id: str
+    name: str
+    input: dict[str, Any]
+    reason: str
+    future: asyncio.Future[tuple[str, str]]
+
+
+# session_id -> tool_use_id -> pending approval. One turn runs per session, so the
+# session is the natural key for the HTTP/WS/Telegram decision transports.
+_pending_approvals: dict[UUID, dict[str, PendingApproval]] = {}
+
+
+def pending_approvals(session_id: UUID) -> list[PendingApproval]:
+    return [p for p in _pending_approvals.get(session_id, {}).values() if not p.future.done()]
+
+
+def resolve_approval(
+    session_id: UUID, tool_use_id: str, decision: str, scope: str = "once"
+) -> bool:
+    """Deliver a decision to a held tool call. False when nothing is waiting for it."""
+    decision = str(decision or "").strip().lower()
+    scope = str(scope or "once").strip().lower() or "once"
+    if decision not in APPROVAL_DECISIONS:
+        raise ValueError(f"decision must be one of {sorted(APPROVAL_DECISIONS)}")
+    if scope not in APPROVAL_SCOPES:
+        raise ValueError(f"scope must be one of {sorted(APPROVAL_SCOPES)}")
+    pend = _pending_approvals.get(session_id, {}).get(str(tool_use_id))
+    if pend is None or pend.future.done():
+        return False
+    pend.future.set_result((decision, scope))
+    return True
+
+
+def reset_pending_approvals_for_tests() -> None:
+    _pending_approvals.clear()
+
+
+def _register_approval(pend: PendingApproval) -> None:
+    _pending_approvals.setdefault(pend.session_id, {})[pend.tool_use_id] = pend
+
+
+def _unregister_approval(pend: PendingApproval) -> None:
+    bucket = _pending_approvals.get(pend.session_id)
+    if bucket is None:
+        return
+    bucket.pop(pend.tool_use_id, None)
+    if not bucket:
+        _pending_approvals.pop(pend.session_id, None)
+
+
+async def _wait_for_approval(
+    pend: PendingApproval,
+    cancel: asyncio.Event | None,
+    timeout: float,
+) -> tuple[str, str] | None:
+    """(decision, scope) once the user answers; None on timeout or cancel."""
+    watchers: set[asyncio.Future[Any]] = {pend.future}
+    cancel_task: asyncio.Task[Any] | None = None
+    if cancel is not None:
+        if cancel.is_set():
+            return None
+        cancel_task = asyncio.create_task(cancel.wait())
+        watchers.add(cancel_task)
+    try:
+        done, _pending = await asyncio.wait(
+            watchers, timeout=max(0.0, timeout), return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        if cancel_task is not None:
+            cancel_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cancel_task
+    if pend.future in done:
+        return pend.future.result()
+    return None
+
+
 def can_wait_for_user(ctx: dict[str, Any]) -> bool:
     """Web and Telegram can pause for a reply; cron/subagent/other headless cannot."""
     if ctx.get("interactive"):
@@ -1250,6 +1365,24 @@ async def agent_turn(
         fire(await store.append_event(session_id, "turn_aborted", payload))
         fire(await store.append_event(session_id, "assistant", {"text": exc.message}))
 
+    async def execute_tool(block: Any, inp: dict[str, Any]) -> tuple[str, str | None]:
+        """Run an allowed tool call and post-process its output (persist, probe)."""
+        result = await run_tools(block.name, inp, ctx)
+        result, persisted_path = persist_tool_result(
+            workspace, str(block.id), block.name, result
+        )
+        probed = await probe_tool_output(block.name, result)
+        result = probed["output"]
+        if probed.get("flagged"):
+            fire(
+                await store.append_event(
+                    session_id,
+                    "injection_warning",
+                    {"tool_use_id": block.id, "name": block.name},
+                )
+            )
+        return result, persisted_path
+
     if answering and pending is not None:
         uid = str((pending.payload or {}).get("id") or pending.id)
         fire(
@@ -1293,6 +1426,7 @@ async def agent_turn(
         "fire": fire,
         "subagent_depth": subagent_depth,
         "channel": resolved_channel,
+        "session_rules": session_rules_from(sess.jsonld if sess else None),
     }
     pins = await pinned_prompt(store)
     system = build_agent_system(
@@ -1367,7 +1501,7 @@ async def agent_turn(
                     ctx["git_not_done_nudge_pending"] = True
                     continue
                 break
-            stop_after_ask = False
+            approval_timed_out = False
             waiting_ask = False
             for block in tool_uses:
                 check()
@@ -1408,10 +1542,101 @@ async def agent_turn(
                     )
                 )
                 persisted_path = None
-                if decision.behavior != "allow":
+                is_error = False
+                approval_cancelled = False
+                executed = decision.behavior == "allow"
+                if decision.behavior == "ask":
+                    if not can_wait_for_user(ctx):
+                        # The pipeline aborts headless asks before this; keep the old
+                        # message as a fallback so nothing runs unapproved.
+                        result = _blocked_tool_result(decision)
+                        is_error = True
+                    else:
+                        recorded_input = dict(block.input)
+                        pend = PendingApproval(
+                            session_id=session_id,
+                            tool_use_id=str(block.id),
+                            name=block.name,
+                            input=recorded_input,
+                            reason=decision.reason,
+                            future=asyncio.get_running_loop().create_future(),
+                        )
+                        _register_approval(pend)
+                        try:
+                            fire(
+                                await store.append_event(
+                                    session_id,
+                                    "permission_request",
+                                    {
+                                        "tool_use_id": block.id,
+                                        "name": block.name,
+                                        "input": recorded_input,
+                                        "reason": decision.reason,
+                                        "summary": summarize_input(block.name, recorded_input),
+                                    },
+                                )
+                            )
+                            timeout = float(settings.orbweaver_approval_timeout_s)
+                            verdict = await _wait_for_approval(pend, cancel, timeout)
+                        finally:
+                            _unregister_approval(pend)
+                        if verdict is None:
+                            cancelled = cancel is not None and cancel.is_set()
+                            outcome = "cancelled" if cancelled else "timeout"
+                            result = (
+                                _approval_cancelled_result(decision.reason)
+                                if cancelled
+                                else _approval_timeout_result(decision.reason, timeout)
+                            )
+                            is_error = True
+                            approval_timed_out = not cancelled
+                            approval_cancelled = cancelled
+                            scope = "once"
+                        else:
+                            outcome, scope = verdict
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "permission_response",
+                                {
+                                    "tool_use_id": block.id,
+                                    "name": block.name,
+                                    "decision": outcome,
+                                    "scope": scope,
+                                },
+                            )
+                        )
+                        if outcome == "allow":
+                            if scope == "session":
+                                rule = make_session_rule(block.name, recorded_input)
+                                rules = ctx.setdefault("session_rules", [])
+                                if add_session_rule(rules, rule):
+                                    current = await store.get_entity(session_id)
+                                    if current is not None:
+                                        current.jsonld["permission_rules"] = list(rules)
+                                        await store.put_entity(current)
+                                    fire(
+                                        await store.append_event(
+                                            session_id,
+                                            "permission_rule_added",
+                                            {
+                                                "tool_use_id": block.id,
+                                                "tool": rule["tool"],
+                                                "subject": rule["subject"],
+                                                "permissions": rule.get("permissions") or [],
+                                            },
+                                        )
+                                    )
+                            check()
+                            # Execute exactly the input the user saw, not a re-issued call.
+                            result, persisted_path = await execute_tool(block, recorded_input)
+                            executed = True
+                        elif outcome == "deny":
+                            result = _denied_tool_result(decision.reason)
+                            is_error = True
+                elif decision.behavior != "allow":
                     result = _blocked_tool_result(decision)
-                    if decision.behavior == "ask":
-                        stop_after_ask = True
+                    is_error = True
                 elif block.name == "AskUser":
                     question = str(dict(block.input).get("question") or "").strip()
                     if not question:
@@ -1434,24 +1659,14 @@ async def agent_turn(
                         waiting_ask = True
                         break
                 else:
-                    result = await run_tools(block.name, dict(block.input), ctx)
-                    result, persisted_path = persist_tool_result(
-                        workspace, str(block.id), block.name, result
-                    )
-                    probed = await probe_tool_output(block.name, result)
-                    result = probed["output"]
-                    if probed.get("flagged"):
-                        fire(
-                            await store.append_event(
-                                session_id,
-                                "injection_warning",
-                                {"tool_use_id": block.id, "name": block.name},
-                            )
-                        )
-                check()
+                    result, persisted_path = await execute_tool(block, dict(block.input))
+                if not approval_cancelled:
+                    check()
                 kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
                 payload = {"tool_use_id": block.id, "name": block.name, "content": result}
-                if decision.behavior == "allow" and persisted_path:
+                if is_error:
+                    payload["is_error"] = True
+                if executed and persisted_path:
                     payload["persisted_path"] = persisted_path
                 if kind == "MemoryRecall":
                     try:
@@ -1462,31 +1677,30 @@ async def agent_turn(
                         payload["text"] = result
                 res_ev = await store.append_event(session_id, kind, payload)
                 fire(res_ev)
-                if block.name == "ProposePatch" and decision.behavior == "allow":
+                if approval_cancelled:
+                    # The is_error result is on record; now stop like any other cancel.
+                    check()
+                if block.name == "ProposePatch" and executed:
                     fire(
                         await store.append_event(
                             session_id, "patch_proposal", {"tool_use_id": block.id, "content": result}
                         )
                     )
-                if block.name == "ScheduleTask" and decision.behavior == "allow":
+                if block.name == "ScheduleTask" and executed:
                     fire(
                         await store.append_event(
                             session_id, "schedule_request", {"input": dict(block.input)}
                         )
                     )
+                if approval_timed_out:
+                    # Later tool_uses in this round never ran; the model re-plans next turn.
+                    break
             if waiting_ask:
                 break
-            if stop_after_ask:
+            if approval_timed_out:
                 fire(
                     await store.append_event(
-                        session_id,
-                        "assistant",
-                        {
-                            "text": (
-                                "I need your approval before continuing. "
-                                "Reply with what you want done."
-                            )
-                        },
+                        session_id, "assistant", {"text": APPROVAL_TIMEOUT_NOTICE}
                     )
                 )
                 break

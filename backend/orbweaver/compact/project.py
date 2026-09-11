@@ -22,6 +22,9 @@ PAIR_KINDS = frozenset(
         "tool_result",
         "MemoryRecall",
         "permission_decision",
+        "permission_request",
+        "permission_response",
+        "permission_rule_added",
         "injection_warning",
         "patch_proposal",
         "schedule_request",
@@ -345,18 +348,14 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
                 if content:
                     blocks.append({"type": "text", "text": str(content)})
                 content = blocks or content
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": p.get("tool_use_id") or p.get("id") or "unknown",
-                            "content": content,
-                        }
-                    ],
-                }
-            )
+            block: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": p.get("tool_use_id") or p.get("id") or "unknown",
+                "content": content,
+            }
+            if p.get("is_error"):
+                block["is_error"] = True
+            messages.append({"role": "user", "content": [block]})
         elif k in STOP_KINDS:
             _flush_pending_tools(messages, pending_tool, stub_results=True)
         elif k == "UserCorrection":

@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     orbweaver_permission_deny: str = ""
     orbweaver_permission_ask: str = ""
     orbweaver_permission_allow: str = ""
+    # How long a held `ask` tool call waits for the user's allow/deny before it
+    # is recorded as an error and the turn ends (seconds).
+    orbweaver_approval_timeout_s: float = 600.0
     orbweaver_automode_environment: str = "$defaults"
     orbweaver_automode_soft_deny: str = "$defaults"
     orbweaver_automode_hard_deny: str = "$defaults"

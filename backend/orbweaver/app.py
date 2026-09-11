@@ -29,7 +29,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from orbweaver import __version__
-from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel, pending_ask_user
+from orbweaver.agent import (
+    APPROVAL_DECISIONS,
+    APPROVAL_SCOPES,
+    TurnCancelled,
+    agent_turn,
+    normalize_channel,
+    pending_ask_user,
+    resolve_approval,
+)
 from orbweaver.auth import mint_token, require_user
 from orbweaver.config import settings
 from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
@@ -225,6 +233,12 @@ class TurnBody(BaseModel):
 
 class CancelTurnBody(BaseModel):
     discard: bool = False
+
+
+class ApproveBody(BaseModel):
+    tool_use_id: str
+    decision: str  # allow | deny
+    scope: str = "once"  # once | session
 
 
 class RewindBody(BaseModel):
@@ -744,6 +758,33 @@ async def cancel_turn(
     return {"status": "cancelling", "discard": body.discard}
 
 
+def _approve(session_id: UUID, tool_use_id: str, decision: str, scope: str) -> dict[str, Any]:
+    decision = (decision or "").strip().lower()
+    scope = (scope or "once").strip().lower() or "once"
+    if decision not in APPROVAL_DECISIONS:
+        raise HTTPException(400, f"decision must be one of {sorted(APPROVAL_DECISIONS)}")
+    if scope not in APPROVAL_SCOPES:
+        raise HTTPException(400, f"scope must be one of {sorted(APPROVAL_SCOPES)}")
+    if not tool_use_id.strip():
+        raise HTTPException(400, "tool_use_id is required")
+    if not resolve_approval(session_id, tool_use_id, decision, scope):
+        raise HTTPException(404, "no pending approval for that tool_use_id")
+    return {
+        "status": "resolved",
+        "tool_use_id": tool_use_id,
+        "decision": decision,
+        "scope": scope,
+    }
+
+
+@app.post("/v1/sessions/{session_id}/turns/approve")
+async def approve_turn(
+    session_id: UUID, body: ApproveBody, _u: dict = Depends(_user)
+) -> dict[str, Any]:
+    """Answer a held `permission_request` for the running turn."""
+    return _approve(session_id, body.tool_use_id, body.decision, body.scope)
+
+
 @app.post("/v1/sessions/{session_id}/rewind")
 async def rewind(
     session_id: UUID, body: RewindBody, _u: dict = Depends(_user)
@@ -820,6 +861,23 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
                     )
                 else:
                     await websocket.send_json({"kind": "idle"})
+                continue
+            if typ == "approve":
+                # Only reachable from a socket that is not itself awaiting a turn
+                # (this loop blocks on _run_turn); the web UI uses the HTTP endpoint.
+                try:
+                    out = _approve(
+                        session_id,
+                        str(data.get("tool_use_id") or ""),
+                        str(data.get("decision") or ""),
+                        str(data.get("scope") or "once"),
+                    )
+                except HTTPException as e:
+                    await websocket.send_json(
+                        {"kind": "approval", "status": e.status_code, "detail": e.detail}
+                    )
+                    continue
+                await websocket.send_json({"kind": "approval", **out})
                 continue
             resume = bool(data.get("resume"))
             text = str(data.get("text") or "")

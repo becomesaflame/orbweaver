@@ -22,6 +22,7 @@ from orbweaver.permissions.rules import (
     matching_rule,
     path_is_always_denied,
 )
+from orbweaver.permissions.session_rules import matching_session_rule
 from orbweaver.sandbox.bwrap import sandbox_available
 from orbweaver.store import Event
 
@@ -142,7 +143,9 @@ def bash_sandboxable(inp: dict[str, Any], workspace_kind: str) -> bool:
 async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> PermissionDecision:
     workspace = ctx.get("workspace")
     workspace_kind = str(ctx.get("workspace_kind") or "local")
-    headless = bool(ctx.get("headless"))
+    # `ask` can only be held for a human who can answer: web, or Telegram (which runs
+    # headless=True but interactive=True). Cron and subagents abort instead.
+    headless = bool(ctx.get("headless")) and not bool(ctx.get("interactive"))
     events: list[Event] = ctx.get("events") or []
     mode = (settings.orbweaver_permission_mode or "auto").strip().lower()
 
@@ -242,6 +245,14 @@ async def can_use_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> P
             "deny",
             "sandbox_unavailable: bwrap missing or blocked; bash refused",
             "sandbox",
+        )
+
+    session_hit = matching_session_rule(ctx.get("session_rules"), name, inp)
+    if session_hit:
+        return PermissionDecision(
+            "allow",
+            f"session rule {name}({session_hit.get('subject') or '*'})",
+            "session_rule",
         )
 
     extra = DELEGATION_FRAMING if name == "SpawnSubagent" else ""

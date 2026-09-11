@@ -126,6 +126,19 @@
     #composer-hint { padding:0 1rem 0.75rem; font-size:0.75rem; color:var(--muted); min-height:1.15rem; }
     .msg.injected { border-left-color:#8aa0c8; }
     .msg.ask { border-left-color:#8aa0c8; }
+    .msg.permission { border-left-color:#d9a441; }
+    .msg.permission .perm-title { font-weight:600; }
+    .msg.permission .perm-summary {
+      font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:0.82rem;
+      background:#1f1f1f; border-radius:6px; padding:0.35rem 0.5rem; margin:0.35rem 0;
+      white-space:pre-wrap; word-break:break-word;
+    }
+    .msg.permission .perm-reason { color:var(--muted); font-size:0.8rem; }
+    .msg.permission .perm-outcome { margin-top:0.35rem; font-size:0.85rem; color:#cfcfcf; }
+    .msg.permission.resolved { opacity:0.85; }
+    .msg.permission .perm-actions button { border:1px solid var(--line); }
+    .msg.permission .perm-actions button.allow { color:#8fd18f; }
+    .msg.permission .perm-actions button.deny { color:#e08a8a; }
     .msg-actions { display:flex; gap:0.25rem; margin-top:0.4rem; }
     .msg-actions button {
       font-size:0.75rem; color:var(--muted); padding:0.12rem 0.45rem; border-radius:6px;
@@ -372,6 +385,12 @@
         if (ev.kind === "user") attachUserActions(el, p.text || "", ev.seq, false);
       } else if (ev.kind === "ask_user") {
         add("assistant", p.question || "Waiting for your answer", { seq: ev.seq, extraClass: "ask" });
+      } else if (ev.kind === "permission_request") {
+        renderPermissionRequest(p, ev.seq);
+      } else if (ev.kind === "permission_response") {
+        resolvePermissionCard(p.tool_use_id, permissionOutcomeLabel(p.decision, p.scope));
+      } else if (ev.kind === "permission_rule_added") {
+        add("tool", "Allowed for this session: " + (p.tool || "") + "(" + (p.subject || "*") + ")", { seq: ev.seq });
       } else if (ev.kind === "turn_aborted") {
         add("assistant", p.text || "Turn aborted", { seq: ev.seq, extraClass: "stopped" });
       } else if (ev.kind === "cron_result") {
@@ -381,6 +400,82 @@
         renderStopped(ev.seq);
       } else {
         add("tool", ev.kind + " " + JSON.stringify(p).slice(0,400), { seq: ev.seq });
+      }
+    }
+    function permissionOutcomeLabel(decision, scope) {
+      if (decision === "allow") return scope === "session" ? "Allowed for this session" : "Allowed";
+      if (decision === "deny") return "Denied";
+      if (decision === "timeout") return "Timed out — not executed";
+      if (decision === "cancelled") return "Cancelled — not executed";
+      return String(decision || "resolved");
+    }
+    function permissionCard(toolUseId) {
+      if (!toolUseId) return null;
+      return $("log").querySelector('.msg.permission[data-tool-use-id="' + String(toolUseId).replace(/"/g, "") + '"]');
+    }
+    function resolvePermissionCard(toolUseId, label) {
+      const card = permissionCard(toolUseId);
+      if (!card) return;
+      card.classList.add("resolved");
+      card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = true; });
+      let out = card.querySelector(".perm-outcome");
+      if (!out) {
+        out = document.createElement("div");
+        out.className = "perm-outcome";
+        card.appendChild(out);
+      }
+      out.textContent = "→ " + label;
+    }
+    function renderPermissionRequest(p, seq) {
+      const d = document.createElement("div");
+      d.className = "msg assistant permission";
+      if (seq != null) d.dataset.seq = String(seq);
+      d.dataset.toolUseId = String(p.tool_use_id || "");
+      const title = document.createElement("div");
+      title.className = "perm-title";
+      title.textContent = "Approval needed: " + (p.name || "tool");
+      d.appendChild(title);
+      const summary = document.createElement("div");
+      summary.className = "perm-summary";
+      summary.textContent = p.summary || JSON.stringify(p.input || {}).slice(0, 400);
+      d.appendChild(summary);
+      if (p.reason) {
+        const why = document.createElement("div");
+        why.className = "perm-reason";
+        why.textContent = "Why: " + p.reason;
+        d.appendChild(why);
+      }
+      const actions = document.createElement("div");
+      actions.className = "msg-actions perm-actions";
+      const sid = currentSid();
+      const mk = (label, decision, scope, cls) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = label;
+        b.className = cls;
+        b.onclick = () => decidePermission(sid, p.tool_use_id, decision, scope, d);
+        actions.appendChild(b);
+      };
+      mk("Allow", "allow", "once", "allow");
+      mk("Allow for session", "allow", "session", "allow");
+      mk("Deny", "deny", "once", "deny");
+      d.appendChild(actions);
+      $("log").appendChild(d);
+      _scrollToBottom();
+      return d;
+    }
+    async function decidePermission(sid, toolUseId, decision, scope, card) {
+      if (!sid || !toolUseId) return;
+      card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = true; });
+      try {
+        await api("/v1/sessions/" + sid + "/turns/approve", {
+          method:"POST", body: JSON.stringify({ tool_use_id: toolUseId, decision, scope })
+        });
+        resolvePermissionCard(toolUseId, permissionOutcomeLabel(decision, scope) + " · waiting for the agent…");
+      } catch (e) {
+        resolvePermissionCard(toolUseId, "Could not send decision: " + String(e));
+        card.classList.remove("resolved");
+        card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = false; });
       }
     }
     function renderStopped(seq) {
@@ -937,7 +1032,7 @@
           let msg;
           try { msg = JSON.parse(ev.data); }
           catch (e) { finish(reject, e); return; }
-          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" || msg.kind === "idle") {
+          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" || msg.kind === "idle" || msg.kind === "approval") {
             return;
           }
           if (msg.kind === "error") {
