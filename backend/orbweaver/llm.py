@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 from uuid import uuid4
 
@@ -13,6 +14,45 @@ from orbweaver.open_models import (
     is_open_model,
     max_tokens_for,
 )
+
+log = logging.getLogger(__name__)
+
+# WebSocket progress kinds. Not persisted; the UI may ignore them.
+ASSISTANT_DELTA = "assistant_delta"
+TOOL_USE_PROGRESS = "tool_use_progress"
+
+# Raw Anthropic SSE types. The SDK also yields derived `text` / `input_json`
+# events for the same deltas — ignore those so we do not double-count.
+_STREAM_EVENT_TYPES = frozenset(
+    {
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    }
+)
+
+SONNET_MAX_TOKENS = 64_000
+OPUS_MAX_TOKENS = 32_000
+DEFAULT_MAX_TOKENS = 8_192
+
+
+def max_tokens_for_model(model: str) -> int:
+    """Output budget for a model id (Claw Code: Sonnet 64k, Opus 32k)."""
+    name = (model or "").lower()
+    if "opus" in name:
+        return OPUS_MAX_TOKENS
+    if "sonnet" in name:
+        return SONNET_MAX_TOKENS
+    return DEFAULT_MAX_TOKENS
+
+
+def completion_max_tokens(model: str | None = None) -> int:
+    """Tokens to request; stay at or under output_reserve so compact math holds."""
+    raw = max_tokens_for_model(model or settings.orbweaver_model)
+    return max(1, min(raw, settings.output_reserve))
 
 
 def _ollama_configured() -> bool:
@@ -68,6 +108,57 @@ def no_llm_echo(user_text: str) -> str:
         + "\nSet ANTHROPIC_API_KEY for Claude, OPENROUTER_API_KEY for Earth Runtime "
         "open models, or OLLAMA_BASE_URL and OLLAMA_MODEL for a local Ollama fallback."
     )
+
+
+CACHE_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
+# Mark the tools array as a cache prefix only when it is big enough to matter.
+CACHE_TOOLS_MIN = 8
+
+
+def prompt_cache_supported(client: Any) -> bool:
+    """Anthropic honours ``cache_control``; the Ollama and OpenAI-compatible shims
+    rebuild messages without it."""
+    return not isinstance(client, (OllamaMessagesClient, OpenAICompatClient))
+
+
+def with_message_cache_breakpoint(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy ``messages`` with ``cache_control`` on the last block of the final user message.
+
+    Tool results are appended each round, so the previous breakpoint's prefix is
+    a prefix of this round's request and Anthropic serves it as a cache read.
+    String user content becomes a single text block on every user message so
+    the message that carried last round's breakpoint is byte-identical this
+    round. Never mutates the input (blocks may be shared with event payloads).
+    """
+    if not messages:
+        return messages
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        msg = dict(m)
+        content = msg.get("content")
+        if msg.get("role") == "user" and isinstance(content, str) and content:
+            msg["content"] = [{"type": "text", "text": content}]
+        out.append(msg)
+    for i in range(len(out) - 1, -1, -1):
+        msg = out[i]
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list) and content and isinstance(content[-1], dict):
+            blocks = list(content)
+            blocks[-1] = {**blocks[-1], "cache_control": dict(CACHE_EPHEMERAL)}
+            msg["content"] = blocks
+        break
+    return out
+
+
+def with_tool_cache_breakpoint(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Copy ``tools`` with ``cache_control`` on the last definition when the list is large."""
+    if not tools or len(tools) < CACHE_TOOLS_MIN or not isinstance(tools[-1], dict):
+        return tools
+    out = list(tools)
+    out[-1] = {**out[-1], "cache_control": dict(CACHE_EPHEMERAL)}
+    return out
 
 
 def make_anthropic_client() -> Any | None:
@@ -550,3 +641,193 @@ def _from_openai_completion(data: dict[str, Any]) -> _Response:
     )
     return _Response(content, usage)
 
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _event_type(event: Any) -> str:
+    return str(_field(event, "type") or "")
+
+
+def _try_json(raw: str) -> dict[str, Any] | None:
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else {"raw": parsed}
+
+
+class StreamAssembler:
+    """Accumulate Anthropic SSE events into a create-shaped response."""
+
+    def __init__(self) -> None:
+        self._blocks: dict[int, dict[str, Any]] = {}
+        self.usage = _Usage()
+        self.stop_reason: str | None = None
+        self.started = False
+
+    def apply(self, event: Any) -> list[tuple[str, dict[str, Any]]]:
+        typ = _event_type(event)
+        if typ not in _STREAM_EVENT_TYPES:
+            return []
+        self.started = True
+        if typ == "message_start":
+            self._note_usage(_field(_field(event, "message"), "usage"))
+            return []
+        if typ == "content_block_start":
+            return self._start_block(event)
+        if typ == "content_block_delta":
+            return self._delta_block(event)
+        if typ == "content_block_stop":
+            self._stop_block(event)
+            return []
+        if typ == "message_delta":
+            self._note_usage(_field(event, "usage"))
+            delta = _field(event, "delta")
+            reason = _field(delta, "stop_reason")
+            if reason:
+                self.stop_reason = str(reason)
+            return []
+        return []
+
+    def _note_usage(self, usage: Any) -> None:
+        if usage is None:
+            return
+        inp = int(_field(usage, "input_tokens", 0) or 0)
+        if inp:
+            self.usage.input_tokens = inp
+
+    def _index(self, event: Any) -> int:
+        return int(_field(event, "index", 0) or 0)
+
+    def _start_block(self, event: Any) -> list[tuple[str, dict[str, Any]]]:
+        idx = self._index(event)
+        block = _field(event, "content_block")
+        btype = str(_field(block, "type") or "text")
+        if btype == "tool_use":
+            uid = str(_field(block, "id") or uuid4())
+            name = str(_field(block, "name") or "unknown")
+            raw_inp = _field(block, "input") or {}
+            inp = raw_inp if isinstance(raw_inp, dict) else {}
+            self._blocks[idx] = {
+                "type": "tool_use",
+                "id": uid,
+                "name": name,
+                "json_buf": "",
+                "input": inp,
+            }
+            return [(TOOL_USE_PROGRESS, {"id": uid, "name": name, "input": dict(inp)})]
+        text = str(_field(block, "text") or "")
+        self._blocks[idx] = {"type": "text", "text": text}
+        if text:
+            return [(ASSISTANT_DELTA, {"text": text})]
+        return []
+
+    def _delta_block(self, event: Any) -> list[tuple[str, dict[str, Any]]]:
+        idx = self._index(event)
+        delta = _field(event, "delta")
+        dtype = str(_field(delta, "type") or "")
+        if dtype == "text_delta":
+            chunk = str(_field(delta, "text") or "")
+            slot = self._blocks.setdefault(idx, {"type": "text", "text": ""})
+            if slot.get("type") != "text":
+                slot = {"type": "text", "text": ""}
+                self._blocks[idx] = slot
+            slot["text"] = str(slot.get("text") or "") + chunk
+            if chunk:
+                return [(ASSISTANT_DELTA, {"text": chunk})]
+            return []
+        if dtype == "input_json_delta":
+            partial = str(_field(delta, "partial_json") or "")
+            slot = self._blocks.setdefault(
+                idx,
+                {
+                    "type": "tool_use",
+                    "id": str(uuid4()),
+                    "name": "unknown",
+                    "json_buf": "",
+                    "input": {},
+                },
+            )
+            if slot.get("type") != "tool_use":
+                return []
+            slot["json_buf"] = str(slot.get("json_buf") or "") + partial
+            parsed = _try_json(slot["json_buf"])
+            if parsed is not None:
+                slot["input"] = parsed
+            return [
+                (
+                    TOOL_USE_PROGRESS,
+                    {
+                        "id": slot["id"],
+                        "name": slot["name"],
+                        "input": dict(slot.get("input") or {}),
+                    },
+                )
+            ]
+        return []
+
+    def _stop_block(self, event: Any) -> None:
+        idx = self._index(event)
+        slot = self._blocks.get(idx)
+        if not slot or slot.get("type") != "tool_use":
+            return
+        parsed = _try_json(str(slot.get("json_buf") or ""))
+        if parsed is not None:
+            slot["input"] = parsed
+
+    def text(self) -> str:
+        parts = [
+            str(b.get("text") or "")
+            for i, b in sorted(self._blocks.items())
+            if b.get("type") == "text"
+        ]
+        return "\n".join(p for p in parts if p)
+
+    def tool_use_blocks(self) -> list[_ToolUseBlock]:
+        out: list[_ToolUseBlock] = []
+        for _i, b in sorted(self._blocks.items()):
+            if b.get("type") != "tool_use" or not b.get("id"):
+                continue
+            inp = b.get("input")
+            if not isinstance(inp, dict):
+                parsed = _try_json(str(b.get("json_buf") or ""))
+                inp = parsed if isinstance(parsed, dict) else {}
+            out.append(_ToolUseBlock(str(b["id"]), str(b.get("name") or "unknown"), inp))
+        return out
+
+    def response(self) -> _Response:
+        content: list[Any] = []
+        for _i, b in sorted(self._blocks.items()):
+            if b.get("type") == "text":
+                text = str(b.get("text") or "")
+                if text:
+                    content.append(_TextBlock(text))
+            elif b.get("type") == "tool_use" and b.get("id"):
+                inp = b.get("input")
+                if not isinstance(inp, dict):
+                    parsed = _try_json(str(b.get("json_buf") or ""))
+                    inp = parsed if isinstance(parsed, dict) else {}
+                content.append(
+                    _ToolUseBlock(str(b["id"]), str(b.get("name") or "unknown"), inp)
+                )
+        return _Response(content, self.usage)
+
+
+def message_stream(client: Any, **kwargs: Any) -> Any | None:
+    """Return a stream context manager, or None if the client cannot stream."""
+    stream_fn = getattr(getattr(client, "messages", None), "stream", None)
+    if not callable(stream_fn):
+        return None
+    try:
+        return stream_fn(**kwargs)
+    except Exception:
+        log.warning("messages.stream() failed to open", exc_info=True)
+        return None

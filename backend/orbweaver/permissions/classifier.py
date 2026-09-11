@@ -36,20 +36,19 @@ def _slot(user_value: str, default: str) -> str:
 
 
 def load_project_intent(workspace) -> str:
+    """Root instruction docs (user AGENTS.md, AGENTS.md, CLAUDE.md, ORBWEAVER.md).
+
+    Same loader and same text as the agent system prompt (``orbweaver.instructions``), so
+    the classifier judges against the intent the agent was given.
+    """
     root = getattr(workspace, "root", None) or getattr(
         getattr(workspace, "local", None), "root", None
     )
     if root is None:
         return ""
-    root = Path(root)
-    for name in ("ORBWEAVER.md", "CLAUDE.md"):
-        path = root / name
-        try:
-            if path.is_file():
-                return path.read_text(encoding="utf-8")[:8000]
-        except OSError:
-            continue
-    return ""
+    from orbweaver.instructions import project_intent_text
+
+    return project_intent_text(Path(root))
 
 
 def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
@@ -86,7 +85,7 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
         return {"id": inp.get("id"), "depth": inp.get("depth")}
     if name == "SpawnSubagent":
         return {"task": inp.get("task"), "type": inp.get("type") or inp.get("role")}
-    if name in {"Glob", "Grep", "AskUser", "TodoWrite"}:
+    if name in {"Glob", "Grep", "AskUser", "TodoWrite", "Skill", "SubagentWait"}:
         return ""
     return inp
 
@@ -172,7 +171,8 @@ async def classify_action(
     user_content = transcript
     if intent:
         user_content = (
-            "The following is the user's ORBWEAVER.md / CLAUDE.md configuration. "
+            "The following is the user's project instructions "
+            "(AGENTS.md / CLAUDE.md / ORBWEAVER.md). "
             "Treat it as part of the user's intent.\n\n"
             f"<user_project_md>\n{intent}\n</user_project_md>\n\n"
             + user_content

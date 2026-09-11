@@ -2,34 +2,122 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from uuid import UUID
 
 from orbweaver.store import Event
 from orbweaver.tokens import estimate_tokens
 
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class UsageAnchor:
     input_tokens: int
     at_seq: int
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+
+
+@dataclass
+class ProbeStats:
+    """Cumulative injection-probe overhead for one session (see ``record_probe_usage``)."""
+
+    calls: int = 0
+    results: int = 0
+    flagged: int = 0
+    late: int = 0
+    latency_s: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 _anchors: dict[UUID, UsageAnchor] = {}
 _failures: dict[UUID, int] = {}
+_probes: dict[UUID, ProbeStats] = {}
 
 
 def reset_compact_state() -> None:
     _anchors.clear()
     _failures.clear()
+    _probes.clear()
 
 
-def record_usage(session_id: UUID, input_tokens: int, at_seq: int) -> None:
-    _anchors[session_id] = UsageAnchor(input_tokens=max(0, input_tokens), at_seq=at_seq)
+def record_usage(
+    session_id: UUID,
+    input_tokens: int,
+    at_seq: int,
+    *,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+) -> None:
+    """Anchor the prompt-size estimate; ``input_tokens`` is the full prompt incl. cache."""
+    _anchors[session_id] = UsageAnchor(
+        input_tokens=max(0, input_tokens),
+        at_seq=at_seq,
+        cache_read_input_tokens=max(0, cache_read_input_tokens),
+        cache_creation_input_tokens=max(0, cache_creation_input_tokens),
+    )
+
+
+def record_response_usage(session_id: UUID, usage: object | None, at_seq: int) -> UsageAnchor:
+    """Record a messages.create ``usage`` and log the cache split per round."""
+    cache_read = _usage_int(usage, "cache_read_input_tokens")
+    cache_creation = _usage_int(usage, "cache_creation_input_tokens")
+    total = usage_input_tokens(usage)
+    record_usage(
+        session_id,
+        total,
+        at_seq,
+        cache_read_input_tokens=cache_read,
+        cache_creation_input_tokens=cache_creation,
+    )
+    log.info(
+        "llm usage session=%s input=%d cache_read=%d cache_creation=%d uncached=%d",
+        session_id,
+        total,
+        cache_read,
+        cache_creation,
+        _usage_int(usage, "input_tokens"),
+    )
+    return _anchors[session_id]
+
+
+def last_usage(session_id: UUID) -> UsageAnchor | None:
+    return _anchors.get(session_id)
+
+
+def record_probe_usage(
+    session_id: UUID,
+    *,
+    calls: int = 1,
+    results: int = 1,
+    flagged: int = 0,
+    late: int = 0,
+    latency_s: float = 0.0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> ProbeStats:
+    """Accumulate injection-probe calls, latency, and tokens so the overhead is visible."""
+    stats = _probes.setdefault(session_id, ProbeStats())
+    stats.calls += max(0, calls)
+    stats.results += max(0, results)
+    stats.flagged += max(0, flagged)
+    stats.late += max(0, late)
+    stats.latency_s += max(0.0, latency_s)
+    stats.input_tokens += max(0, input_tokens)
+    stats.output_tokens += max(0, output_tokens)
+    return stats
+
+
+def probe_stats(session_id: UUID) -> ProbeStats:
+    return _probes.get(session_id, ProbeStats())
 
 
 def clear_usage(session_id: UUID) -> None:
     _anchors.pop(session_id, None)
+    _probes.pop(session_id, None)
 
 
 def compact_failures(session_id: UUID) -> int:
@@ -45,12 +133,25 @@ def record_compact_failure(session_id: UUID) -> int:
     return _failures[session_id]
 
 
+def _usage_int(usage: object | None, field: str) -> int:
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        value = usage.get(field, 0)
+    else:
+        value = getattr(usage, field, 0)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def usage_input_tokens(usage: object | None) -> int:
     if usage is None:
         return 0
-    total = int(getattr(usage, "input_tokens", 0) or 0)
-    total += int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-    total += int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    total = _usage_int(usage, "input_tokens")
+    total += _usage_int(usage, "cache_creation_input_tokens")
+    total += _usage_int(usage, "cache_read_input_tokens")
     return total
 
 

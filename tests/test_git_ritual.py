@@ -141,6 +141,39 @@ def test_annotate_follows_cd_into_nested_repo(tmp_path: Path):
     assert repo_for_command(tmp_path, f"cd {nested} && git status") == nested.resolve()
 
 
+def test_hostile_git_config_does_not_execute_on_host(tmp_path: Path):
+    """Issue #94 regression: a repo's .git/config core.fsmonitor must not run a
+    host command when the ritual invokes git status/rev-parse."""
+    repo = _init_repo(tmp_path)
+    marker = tmp_path / "MARKER"
+    config = repo / ".git" / "config"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + f"[core]\n\tfsmonitor = touch {marker}\n",
+        encoding="utf-8",
+    )
+    assert not marker.exists()
+    out = annotate_bash_output(repo, "git status", "")
+    assert RITUAL_MARK in out
+    assert not marker.exists(), "git_ritual executed the repo's core.fsmonitor hook"
+
+
+def test_repo_for_command_refuses_cd_outside_working_set(tmp_path: Path):
+    """A `cd` into a repo outside the working-set roots must not be honored."""
+    outside = _init_repo(tmp_path / "attacker")
+    root = tmp_path / "ws"
+    _init_repo(root)
+    assert repo_for_command(root, f"cd {outside} && git status") == root.resolve()
+    marker = tmp_path / "OUTSIDE_MARKER"
+    cfg = outside / ".git" / "config"
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8") + f"[core]\n\tfsmonitor = touch {marker}\n",
+        encoding="utf-8",
+    )
+    annotate_bash_output(root, f"cd {outside} && git log", "")
+    assert not marker.exists()
+
+
 def test_rebase_in_progress_and_detached_head(tmp_path: Path):
     repo = _start_conflicted_rebase(tmp_path)
     out = annotate_bash_output(
@@ -206,7 +239,9 @@ async def test_run_tools_bash_echo_has_no_ritual(tmp_path: Path, monkeypatch):
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     ctx = {"workspace": ws, "store": reset_store_for_tests(), "session_id": uuid4()}
     result = await run_tools("Bash", {"command": "echo hi"}, ctx)
-    assert result.strip() == "hi"
+    header, body = result.strip().split("\n", 1)
+    assert header.startswith(f"[cwd {tmp_path.resolve()} | exit 0 in ")
+    assert body == "hi"
     assert RITUAL_MARK not in result
 
 
