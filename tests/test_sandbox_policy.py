@@ -86,6 +86,37 @@ def test_env_and_config_file_union(tmp_path: Path, monkeypatch):
     assert "pypi.org" not in policy.network.allowed_hosts()
 
 
+def test_allow_git_config_defaults_false_and_parses(tmp_path: Path):
+    root = tmp_path / "ws"
+    (root / ".orbweaver").mkdir(parents=True)
+    default = load_sandbox_policy(root, environ={}, home=tmp_path / "h")
+    assert default.allow_git_config is False
+    (root / ".orbweaver" / "sandbox.json").write_text(
+        '{"allowGitConfig": true}', encoding="utf-8"
+    )
+    on = load_sandbox_policy(root, environ={}, home=tmp_path / "h")
+    assert on.allow_git_config is True
+    env_on = load_sandbox_policy(
+        root,
+        environ={"ORBWEAVER_SANDBOX_ALLOW_GIT_CONFIG": "0"},
+        home=tmp_path / "h",
+    )
+    assert env_on.allow_git_config is False
+def test_env_allow_from_sandbox_json_and_env(tmp_path: Path):
+    home = tmp_path / "home"
+    root = tmp_path / "ws"
+    (home / ".orbweaver").mkdir(parents=True)
+    (root / ".orbweaver").mkdir(parents=True)
+    (home / ".orbweaver" / "sandbox.json").write_text('{"env": {"allow": ["PGHOST", "PG*"]}}', encoding="utf-8")
+    (root / ".orbweaver" / "sandbox.json").write_text('{"env": {"allow": ["CARGO_HOME"]}}', encoding="utf-8")
+    policy = load_sandbox_policy(
+        root,
+        environ={"ORBWEAVER_SANDBOX_ENV_ALLOW": "GOPATH,PGHOST"},
+        home=home,
+    )
+    assert policy.env_allow == ("PGHOST", "PG*", "CARGO_HOME", "GOPATH")
+
+
 def test_include_defaults_on(tmp_path: Path):
     policy = load_sandbox_policy(tmp_path, environ={}, home=tmp_path / "h")
     hosts = policy.network.allowed_hosts()

@@ -1,8 +1,7 @@
 import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import quote
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,11 +34,15 @@ def _open_session(client: TestClient, **extra) -> str:
     return sess.json()["id"]
 
 
-def _ws_url(sid: str, token: str | None = None) -> str:
-    url = f"/v1/sessions/{sid}/ws"
-    if token is not None:
-        url += f"?token={quote(token)}"
-    return url
+def _ws_url(sid: str) -> str:
+    return f"/v1/sessions/{sid}/ws"
+
+
+def _ws_connect(client: TestClient, sid: str, token: str | None = None):
+    """Open the session socket with the JWT in Sec-WebSocket-Protocol."""
+    if token is None:
+        return client.websocket_connect(_ws_url(sid))
+    return client.websocket_connect(_ws_url(sid), subprotocols=["bearer", token])
 
 
 def _collect_until_done(ws) -> list[dict]:
@@ -159,8 +162,10 @@ def test_ws_rejects_missing_token():
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect) as exc,
-        client.websocket_connect(_ws_url(str(uuid4()))) as ws,
+        _ws_connect(client, str(uuid4())) as ws,
     ):
+        # No subprotocol token and the first frame is not an auth frame.
+        ws.send_json({"text": "hello"})
         ws.receive_text()
     assert exc.value.code == 4401
 
@@ -169,7 +174,7 @@ def test_ws_rejects_invalid_token():
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect) as exc,
-        client.websocket_connect(_ws_url(str(uuid4()), "not-a-jwt")) as ws,
+        _ws_connect(client, str(uuid4()), "not-a-jwt") as ws,
     ):
         ws.receive_text()
     assert exc.value.code == 4401
@@ -179,7 +184,7 @@ def test_ws_rejects_unknown_session():
     with (
         TestClient(app) as client,
         pytest.raises(WebSocketDisconnect) as exc,
-        client.websocket_connect(_ws_url(str(uuid4()), _token())) as ws,
+        _ws_connect(client, str(uuid4()), _token()) as ws,
     ):
         ws.receive_text()
     assert exc.value.code == 4404
@@ -194,7 +199,7 @@ def test_ws_event_order(tmp_path, monkeypatch):
     token = _token()
     with TestClient(app) as client:
         sid = _open_session(client)
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             ws.send_json({"text": "hello stream"})
             msgs = _collect_until_done(ws)
@@ -218,7 +223,7 @@ def test_ws_cancel_stops_streaming(tmp_path, monkeypatch):
     headers = _auth()
     with TestClient(app) as client:
         sid = _open_session(client)
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             ws.send_json({"text": "keep this"})
             first = ws.receive_json()
@@ -251,7 +256,7 @@ def test_ws_inject_during_stream(tmp_path, monkeypatch):
     headers = _auth()
     with TestClient(app) as client:
         sid = _open_session(client)
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             ws.send_json({"text": "first prompt"})
             assert ws.receive_json()["kind"] == "user"
@@ -291,7 +296,7 @@ def test_ws_cancel_and_ping_frames_work_during_turn(slow_turn):
     token = _token()
     with TestClient(app) as client:
         sid = _open_session(client)
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             ws.send_json({"text": "keep this"})
             assert ws.receive_json()["kind"] == "user"
@@ -325,7 +330,7 @@ def test_ws_reconnect_replays_gap_exactly_once(slow_turn):
     headers = _auth()
     with TestClient(app) as client:
         sid = _open_session(client)
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             ws.send_json({"text": "long task"})
             first = ws.receive_json()
@@ -335,7 +340,7 @@ def test_ws_reconnect_replays_gap_exactly_once(slow_turn):
         # Socket is gone; the turn keeps running and producing events.
         events = _wait_for_events(client, sid, headers, at_least=last_seen + 3)
         assert len(events) >= last_seen + 3
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             # The new socket is live immediately. Take a frame before asking
             # for the replay so the server must skip what it already sent.
@@ -378,8 +383,8 @@ def test_ws_reconnect_replays_gap_exactly_once(slow_turn):
 
 def test_ws_reconnect_after_turn_finished_reports_idle(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
-    from orbweaver.app import _running_turns
     from orbweaver.config import settings
+    from orbweaver.turns import is_running
 
     monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
     monkeypatch.setattr("orbweaver.app.agent_turn", _finishing_turn)
@@ -387,7 +392,7 @@ def test_ws_reconnect_after_turn_finished_reports_idle(tmp_path, monkeypatch):
     headers = _auth()
     with TestClient(app) as client:
         sid = _open_session(client)
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             ws.send_json({"text": "finish without me"})
             user = ws.receive_json()
@@ -396,10 +401,10 @@ def test_ws_reconnect_after_turn_finished_reports_idle(tmp_path, monkeypatch):
         events = _wait_for_events(client, sid, headers, at_least=3)
         assert [e["payload"]["text"] for e in events[1:]] == ["partial", "final"]
         deadline = time.monotonic() + 3
-        while _running_turns and time.monotonic() < deadline:
+        while is_running(UUID(sid)) and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert not _running_turns
-        with client.websocket_connect(_ws_url(sid, token)) as ws:
+        assert not is_running(UUID(sid))
+        with _ws_connect(client, sid, token) as ws:
             assert ws.receive_json()["kind"] == "subscribed"
             ws.send_json({"type": "subscribe", "after_seq": partial["seq"]})
             final = ws.receive_json()
@@ -415,7 +420,7 @@ def test_ws_reconnect_after_turn_finished_reports_idle(tmp_path, monkeypatch):
 
 def test_ws_subscribe_without_after_seq_stays_silent(ws_session):
     client, token, _headers, sid = ws_session
-    with client.websocket_connect(f"/v1/sessions/{sid}/ws?token={token}") as ws:
+    with _ws_connect(client, sid, token) as ws:
         assert ws.receive_json()["kind"] == "subscribed"
         ws.send_json({"type": "subscribe"})
         ws.send_json({"type": "ping"})
@@ -443,7 +448,7 @@ def ws_session(tmp_path, monkeypatch):
 
 def test_ws_streams_turn_events(ws_session):
     client, token, _headers, sid = ws_session
-    with client.websocket_connect(f"/v1/sessions/{sid}/ws?token={token}") as ws:
+    with _ws_connect(client, sid, token) as ws:
         hello = ws.receive_json()
         assert hello["kind"] == "subscribed"
         assert hello["session_id"] == sid
@@ -462,7 +467,7 @@ def test_ws_streams_turn_events(ws_session):
 
 def test_ws_broadcasts_http_turn(ws_session):
     client, token, headers, sid = ws_session
-    with client.websocket_connect(f"/v1/sessions/{sid}/ws?token={token}") as ws:
+    with _ws_connect(client, sid, token) as ws:
         assert ws.receive_json()["kind"] == "subscribed"
 
         def post_turn():

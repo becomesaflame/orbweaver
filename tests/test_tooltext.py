@@ -75,6 +75,66 @@ def test_webfetch_extracted_text_is_not_persisted(tmp_path, monkeypatch):
     assert "Bedrock max iterations is five." in stored
 
 
+def test_truncate_head_tail_keeps_both_ends_within_budget():
+    from orbweaver.tooltext import truncate_head_tail
+
+    body = "".join(f"line {i} " + ("x" * 60) + "\n" for i in range(4000)) + "FAILED tests/x.py::test_y"
+    out = truncate_head_tail(body, max_chars=8000, path="out.txt")
+    assert len(out) <= 8000
+    assert out.startswith("line 0 ")
+    assert out.endswith("FAILED tests/x.py::test_y")
+    marker = next(ln for ln in out.splitlines() if ln.startswith("[... "))
+    assert "chars omitted (" in marker
+    assert marker.endswith("lines); full output saved to out.txt ...]")
+    head, _, tail = out.partition(marker)
+    assert head.endswith("\n")
+    assert tail.startswith("\n")
+    # Cuts land on line boundaries: no partial line on either side of the marker.
+    assert head.splitlines()[-1].startswith("line ")
+    assert tail.lstrip("\n").splitlines()[0].startswith("line ")
+    # Tail gets the larger share.
+    assert len(tail) > len(head)
+
+
+def test_truncate_head_tail_single_line_and_small():
+    from orbweaver.tooltext import truncate_head_tail
+
+    one = "y" * 300_000
+    out = truncate_head_tail(one, max_chars=8000)
+    assert len(out) <= 8000
+    assert out.startswith("yyy") and out.endswith("yyy")
+    assert "[... 292" in out and "chars omitted ...]" in out
+    small = "hello\nworld\n"
+    assert truncate_head_tail(small, max_chars=8000) == small
+
+
+def test_truncate_head_tail_line_cap():
+    from orbweaver.tooltext import truncate_head_tail
+
+    lines = "\n".join(f"L{i}" for i in range(5000))
+    out = truncate_head_tail(lines, max_chars=1_000_000, max_lines=2000)
+    assert out.startswith("L0\nL1\n")
+    assert out.endswith("\nL4998\nL4999")
+    assert len(out.splitlines()) <= 2000
+    exact = "\n".join(f"L{i}" for i in range(2000))
+    assert truncate_head_tail(exact, max_chars=1_000_000, max_lines=2000) == exact
+
+
+def test_format_bash_result_header():
+    from orbweaver.tooltext import format_bash_result
+
+    assert format_bash_result("hi\n", returncode=1, elapsed_s=42.31) == "exit 1 in 42.3s\nhi\n"
+    assert format_bash_result("", returncode=0, elapsed_s=0.0123) == "exit 0 in 0.01s"
+    assert format_bash_result("x", returncode=-15, elapsed_s=3).startswith(
+        "interrupted by signal 15 in 3.00s\n"
+    )
+    assert format_bash_result("x", returncode=None, elapsed_s=3).startswith("interrupted in ")
+    assert format_bash_result("x", returncode=None, elapsed_s=30, timed_out_after=30) == (
+        "timed out after 30s\nx"
+    )
+    assert len(format_bash_result("z" * 300_000, returncode=0, elapsed_s=1)) <= 200_000 + 40
+
+
 def test_grep_regex_unwraps_escaped_pipes():
     rx = grep_regex(r"record_usage\|estimate_prompt_tokens\|context_window")
     assert rx is not None
@@ -94,21 +154,16 @@ async def test_run_tools_read_uses_offset(tmp_path):
     assert "9|L9" not in out
 
 
-class _Resp:
-    def __init__(self, status, ctype, text):
-        self.status_code = status
-        self.headers = {"content-type": ctype}
-        self.text = text
-
-
 @pytest.mark.asyncio
 async def test_run_tools_webfetch_extracts(monkeypatch, tmp_path):
+    from orbweaver.webfetch import FetchResult
+
     html = "<html><body><h1>Hello</h1><p>Comparable tools use 50+ steps.</p></body></html>"
 
-    def fake_get(url, **_k):
-        return _Resp(200, "text/html", html)
+    async def fake_fetch(url, network, **_k):
+        return FetchResult(url, url, 200, "text/html", html)
 
-    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr("orbweaver.webfetch.fetch_url", fake_fetch)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     out = await run_tools(
         "WebFetch",

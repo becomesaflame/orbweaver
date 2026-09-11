@@ -11,7 +11,7 @@ from orbweaver.agent import (
     tools_for_channel,
 )
 from orbweaver.app import app
-from orbweaver.channels.cron import sweep
+from orbweaver.channels.cron import sweep_and_wait
 from orbweaver.channels.telegram import session_for_telegram_user
 from orbweaver.config import settings
 from orbweaver.permissions.pipeline import can_use_tool
@@ -187,7 +187,7 @@ async def test_cron_sweep_passes_cron_channel(tmp_path, monkeypatch):
             session_id=sid,
         )
     )
-    await sweep()
+    await sweep_and_wait()
     assert captured["channel"] == "cron"
     names = {t["name"] for t in tools_for_channel(captured["channel"])}
     assert "ProposePatch" not in names
