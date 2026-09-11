@@ -5,7 +5,7 @@ import ipaddress
 import json
 import logging
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -256,13 +256,53 @@ class RunningTurn:
     user_seq: int = 0
 
 
+@dataclass(eq=False)
+class _WsSubscriber:
+    """One WebSocket client of a session.
+
+    Frames are queued in ``pending`` and written by a single writer task so
+    live broadcasts, replies, and replayed history never interleave. Every
+    ``seq`` delivered live is recorded in ``sent_seqs`` so a later
+    ``subscribe`` with ``after_seq`` does not replay it again.
+    """
+
+    ws: WebSocket
+    pending: deque[dict[str, Any]] = field(default_factory=deque)
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    sent_seqs: set[int] = field(default_factory=set)
+
+    def send(self, msg: dict[str, Any]) -> None:
+        self.pending.append(msg)
+        self.wake.set()
+
+    def replay(self, frames: list[dict[str, Any]], top: int) -> None:
+        """Queue ``frames`` ahead of live frames still waiting to be written.
+
+        Live frames with ``seq <= top`` are already covered by the replay and
+        are dropped; anything else queued (``turn_done``, ``pong``) stays
+        behind the replayed history so ordering matches the store.
+        """
+        kept = [
+            m
+            for m in self.pending
+            if not (isinstance(m.get("seq"), int) and m["seq"] <= top)
+        ]
+        self.pending.clear()
+        self.pending.extend(frames)
+        self.pending.extend(kept)
+        self.wake.set()
+
+
 _running_turns: dict[UUID, RunningTurn] = {}
-_ws_subscribers: dict[UUID, set[WebSocket]] = defaultdict(set)
+_last_turn_done: dict[UUID, dict[str, Any]] = {}
+_ws_subscribers: dict[UUID, set[_WsSubscriber]] = defaultdict(set)
+_detached_turns: set[asyncio.Task[Any]] = set()
 _GENERIC_TITLES = {"", "web", "session", "New chat", "vscode"}
 
 
 def reset_ws_subscribers_for_tests() -> None:
     _ws_subscribers.clear()
+    _last_turn_done.clear()
 
 
 def _stored_channel(jsonld: dict[str, Any]) -> str:
@@ -270,19 +310,27 @@ def _stored_channel(jsonld: dict[str, Any]) -> str:
 
 
 def _broadcast(session_id: UUID, msg: dict[str, Any]) -> None:
-    sockets = list(_ws_subscribers.get(session_id) or ())
-    if not sockets:
-        return
-    loop = asyncio.get_running_loop()
+    for sub in list(_ws_subscribers.get(session_id) or ()):
+        sub.send(msg)
 
-    async def send_one(ws: WebSocket) -> None:
-        try:
-            await ws.send_json(msg)
-        except Exception:
-            _ws_subscribers[session_id].discard(ws)
 
-    for ws in sockets:
-        loop.create_task(send_one(ws))
+async def _ws_writer(session_id: UUID, sub: _WsSubscriber) -> None:
+    try:
+        while True:
+            while sub.pending:
+                msg = sub.pending.popleft()
+                seq = msg.get("seq")
+                if isinstance(seq, int):
+                    sub.sent_seqs.add(seq)
+                await sub.ws.send_json(msg)
+            sub.wake.clear()
+            await sub.wake.wait()
+    except Exception as e:
+        # The peer is gone (or mid-close); the receive loop sees the
+        # disconnect and unwinds. Nothing to send it anymore.
+        log.debug("websocket writer for %s stopped: %s", session_id, e)
+    finally:
+        _ws_subscribers[session_id].discard(sub)
 
 
 def _event_dict(e) -> dict[str, Any]:
@@ -628,7 +676,9 @@ async def _run_turn(
         await store.put_entity(sess)
     state = RunningTurn(cancel=asyncio.Event())
     _running_turns[session_id] = state
+    _last_turn_done.pop(session_id, None)
     result: dict[str, Any] | None = None
+    failure: str | None = None
     try:
         events = await agent_turn(
             store,
@@ -672,6 +722,7 @@ async def _run_turn(
 
         from orbweaver.compact import ContextFullError
 
+        failure = str(getattr(e, "message", None) or e) or type(e).__name__
         if isinstance(e, ContextFullError):
             raise HTTPException(status_code=502, detail=e.message) from e
         if isinstance(e, anthropic.APIStatusError):
@@ -682,14 +733,15 @@ async def _run_turn(
         if current is state:
             _running_turns.pop(session_id, None)
         if result is not None:
-            _broadcast(
-                session_id,
-                {
-                    "kind": "turn_done",
-                    "status": result.get("status"),
-                    "user_seq": result.get("user_seq"),
-                },
-            )
+            done = {"status": result.get("status"), "user_seq": result.get("user_seq")}
+            _last_turn_done[session_id] = done
+            _broadcast(session_id, {"kind": "turn_done", **done})
+        else:
+            _last_turn_done[session_id] = {
+                "status": "error",
+                "user_seq": state.user_seq,
+                "detail": failure or "turn failed",
+            }
 
 
 @app.post("/v1/sessions/{session_id}/turns")
@@ -794,9 +846,16 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
     if not sess:
         await websocket.close(code=4404)
         return
-    _ws_subscribers[session_id].add(websocket)
+    sub = _WsSubscriber(ws=websocket)
+    _ws_subscribers[session_id].add(sub)
+    writer = asyncio.create_task(_ws_writer(session_id, sub))
+    turn_task: asyncio.Task[Any] | None = None
+
+    def error(status: int, detail: Any) -> None:
+        sub.send({"kind": "error", "status": status, "status_code": status, "detail": detail})
+
     try:
-        await websocket.send_json({"kind": "subscribed", "session_id": str(session_id)})
+        sub.send({"kind": "subscribed", "session_id": str(session_id)})
         while True:
             raw = await websocket.receive_text()
             try:
@@ -806,20 +865,37 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
             if not isinstance(data, dict):
                 continue
             typ = str(data.get("type") or "")
-            if typ in {"subscribe", "ping"}:
-                if typ == "ping":
-                    await websocket.send_json({"kind": "pong"})
+            if typ == "ping":
+                sub.send({"kind": "pong"})
+                continue
+            if typ == "subscribe":
+                after_seq = data.get("after_seq")
+                if isinstance(after_seq, int) and not isinstance(after_seq, bool):
+                    await _ws_resubscribe(store, session_id, sub, after_seq)
                 continue
             if typ == "cancel":
                 state = _running_turns.get(session_id)
                 if state:
                     state.discard = bool(data.get("discard"))
                     state.cancel.set()
-                    await websocket.send_json(
-                        {"kind": "cancelling", "discard": state.discard}
-                    )
+                    sub.send({"kind": "cancelling", "discard": state.discard})
                 else:
-                    await websocket.send_json({"kind": "idle"})
+                    sub.send({"kind": "idle"})
+                continue
+            if typ == "inject":
+                text = str(data.get("text") or "").strip()
+                state = _running_turns.get(session_id)
+                if not text:
+                    error(400, "text is required")
+                elif not state:
+                    error(409, "no turn is running")
+                else:
+                    ev = await store.append_event(
+                        session_id, "user", {"text": text, "injected": True}
+                    )
+                    state.inject.set()
+                    _broadcast(session_id, _event_dict(ev))
+                    sub.send({"kind": "injected", "seq": ev.seq})
                 continue
             resume = bool(data.get("resume"))
             text = str(data.get("text") or "")
@@ -828,30 +904,73 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
             if resume:
                 existing = await store.list_events(session_id)
                 if not existing:
-                    await websocket.send_json(
-                        {
-                            "kind": "error",
-                            "detail": "nothing to continue",
-                            "status": 400,
-                            "status_code": 400,
-                        }
-                    )
+                    error(400, "nothing to continue")
                     continue
-            try:
-                await _run_turn(store, sess, session_id, text, resume=resume)
-            except HTTPException as e:
-                await websocket.send_json(
-                    {
-                        "kind": "error",
-                        "status": e.status_code,
-                        "status_code": e.status_code,
-                        "detail": e.detail,
-                    }
-                )
+            if turn_task is not None and not turn_task.done():
+                error(409, "turn already running")
+                continue
+            # Run the turn as its own task so this loop keeps reading frames:
+            # cancel / ping / inject / subscribe work while the agent is busy,
+            # and the turn survives this socket closing.
+            turn_task = asyncio.create_task(
+                _ws_turn(sub, store, sess, session_id, text, resume=resume)
+            )
+            _detached_turns.add(turn_task)
+            turn_task.add_done_callback(_detached_turns.discard)
     except WebSocketDisconnect:
         return
     finally:
-        _ws_subscribers[session_id].discard(websocket)
+        _ws_subscribers[session_id].discard(sub)
+        writer.cancel()
+
+
+async def _ws_turn(
+    sub: _WsSubscriber,
+    store,
+    sess,
+    session_id: UUID,
+    text: str,
+    *,
+    resume: bool,
+) -> None:
+    try:
+        await _run_turn(store, sess, session_id, text, resume=resume)
+    except HTTPException as e:
+        sub.send(
+            {
+                "kind": "error",
+                "status": e.status_code,
+                "status_code": e.status_code,
+                "detail": e.detail,
+            }
+        )
+    except Exception as e:
+        log.exception("websocket turn failed for %s", session_id)
+        sub.send({"kind": "error", "status": 500, "status_code": 500, "detail": str(e)})
+
+
+async def _ws_resubscribe(store, session_id: UUID, sub: _WsSubscriber, after_seq: int) -> None:
+    """Replay stored events with ``seq > after_seq`` then report turn status.
+
+    ``sub`` has been a live subscriber since the socket was accepted, so every
+    event is either already sent (``sent_seqs``), waiting in ``sub.pending``
+    (dropped by ``replay`` because the stored copy is newer), or in the store
+    snapshot read here. Nothing after the snapshot can carry ``seq <= top``,
+    so the replay attaches to the live stream with no gap and no duplicate.
+    """
+    events = await store.list_events(session_id)
+    top = max((e.seq for e in events), default=after_seq)
+    frames = [
+        _event_dict(e) for e in events if e.seq > after_seq and e.seq not in sub.sent_seqs
+    ]
+    status: dict[str, Any] = {
+        "kind": "turn_status",
+        "running": session_id in _running_turns,
+        "seq": top,
+        "last_turn_done": _last_turn_done.get(session_id),
+    }
+    frames.append(status)
+    sub.replay(frames, top)
 
 
 @app.post("/v1/stt")
