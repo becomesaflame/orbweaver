@@ -132,16 +132,32 @@ def _working_set_roots(root: Path) -> tuple[Path, ...]:
         return (root,)
 
 
-def repo_for_command(workspace_root: Path, command: str) -> Path | None:
+def repo_for_command(
+    workspace_root: Path, command: str, cwd: Path | str | None = None
+) -> Path | None:
+    """Repo the command ran in.
+
+    ``cwd`` is the persisted session cwd the command started from. It is only
+    honoured when it lies inside the working-set roots; otherwise the workspace
+    root is the base, exactly as for ``cd`` targets.
+    """
     root = Path(workspace_root).resolve()
     from orbweaver.sandbox.policy import in_roots
 
     roots = _working_set_roots(root)
+    base = root
+    if cwd:
+        try:
+            candidate = Path(cwd).expanduser().resolve()
+            if candidate.is_dir() and in_roots(candidate, roots):
+                base = candidate
+        except OSError:
+            pass
     candidates: list[Path] = []
     for raw in cd_targets(command):
         path = Path(raw).expanduser()
         if not path.is_absolute():
-            path = (root / path)
+            path = (base / path)
         try:
             resolved = path.resolve()
         except OSError:
@@ -149,13 +165,14 @@ def repo_for_command(workspace_root: Path, command: str) -> Path | None:
         if not in_roots(resolved, roots):
             continue
         candidates.append(resolved)
+    candidates.append(base)
     candidates.append(root)
     seen: set[Path] = set()
-    for cwd in candidates:
-        if cwd in seen:
+    for candidate in candidates:
+        if candidate in seen:
             continue
-        seen.add(cwd)
-        top = git_toplevel(cwd)
+        seen.add(candidate)
+        top = git_toplevel(candidate)
         if top is not None:
             return top
     return None
@@ -218,10 +235,12 @@ def git_snapshot(repo: Path) -> tuple[str, bool, bool, str]:
     return "\n".join(lines), rebase, detached, status_text
 
 
-def annotate_bash_output(workspace_root: Path, command: str, output: str) -> str:
+def annotate_bash_output(
+    workspace_root: Path, command: str, output: str, *, cwd: Path | str | None = None
+) -> str:
     if not command_uses_git(command):
         return output
-    repo = repo_for_command(workspace_root, command)
+    repo = repo_for_command(workspace_root, command, cwd=cwd)
     if repo is None:
         return output
     try:

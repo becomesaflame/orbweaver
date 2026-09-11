@@ -44,3 +44,12 @@ def _isolated_turn_registry():
     reset_turns_for_tests()
     yield
     reset_turns_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _reap_session_shells():
+    """Persistent sandbox shells started by a test must not outlive it."""
+    yield
+    from orbweaver.sandbox.shell import close_all_session_shells
+
+    close_all_session_shells()

@@ -142,13 +142,14 @@ async def test_workspace_bash_async_raises_interrupted(tmp_path: Path, monkeypat
 async def test_bash_async_timeout_and_output(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox", False)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
-    lines = (await ws.bash_async("echo hi; echo err 1>&2")).strip().splitlines()
-    assert lines[0].startswith("exit 0 in ")
-    assert lines[1:] == ["hi", "err"]
+    out = await ws.bash_async("echo hi; echo err 1>&2")
+    header, *body = out.strip().splitlines()
+    assert header.startswith(f"[cwd {tmp_path.resolve()} | exit 0 in ")  # cwd + exit header (#105/#104)
+    assert body == ["hi", "err"]
     started = time.monotonic()
     out = await ws.bash_async("echo partial; sleep 5", timeout=1)
     assert time.monotonic() - started < 4
-    assert out.startswith("timed out after 1s")
+    assert out.splitlines()[0].endswith("| timed out after 1s]")
     assert "partial" in out
 
 
@@ -304,6 +305,6 @@ async def test_sync_workspace_api_still_works(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox", False)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     ws.write("a.txt", "x\n")
-    lines = ws.bash("echo sync").strip().splitlines()
-    assert lines[0].startswith("exit 0 in ") and lines[1:] == ["sync"]
+    header, *body = ws.bash("echo sync").strip().splitlines()
+    assert header.startswith(f"[cwd {tmp_path.resolve()} | exit 0 in ") and body == ["sync"]
     assert ws.glob("*.txt") == ["a.txt"]

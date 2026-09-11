@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -194,7 +195,7 @@ def test_write_and_read_bytes(tmp_path: Path):
 
 def test_resolve_bash_timeout_default_and_cap():
     assert resolve_bash_timeout() == DEFAULT_BASH_TIMEOUT_S
-    assert resolve_bash_timeout(None, None) == 30
+    assert resolve_bash_timeout(None, None) == 120
     assert resolve_bash_timeout(45) == 45
     assert resolve_bash_timeout(block_until_ms=90_000) == 90
     assert resolve_bash_timeout(9999) == MAX_BASH_TIMEOUT_S
@@ -219,14 +220,14 @@ def test_bash_result_has_exit_header(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox", False)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     ok = ws.bash("echo hi")
-    assert ok.splitlines()[0].startswith("exit 0 in ")
-    assert ok.splitlines()[0].endswith("s")
+    assert re.match(r"\[cwd .* \| exit 0 in [0-9.]+s\]$", ok.splitlines()[0])
+    assert ok.splitlines()[0].endswith("s]")
     assert ok.splitlines()[1] == "hi"
     failed = ws.bash("echo boom >&2; exit 3")
-    assert failed.startswith("exit 3 in ")
+    assert re.match(r"\[cwd .* \| exit 3 in [0-9.]+s\]$", failed.splitlines()[0])
     assert "boom" in failed
     empty = ws.bash("true")
-    assert empty.startswith("exit 0 in ") and "\n" not in empty
+    assert re.match(r"\[cwd .* \| exit 0 in [0-9.]+s\]$", empty) and "\n" not in empty
 
 
 def test_bash_job_snapshot_previews_oversized_output(tmp_path: Path, monkeypatch):
@@ -317,7 +318,7 @@ def test_bash_tool_schema_documents_timeout_and_background():
     assert "background" in props
     assert "job_id" in props
     desc = bash["description"]
-    assert "30" in desc
+    assert "120" in desc
     assert "600" in desc
     assert "background" in desc.lower()
     assert "job_id" in desc

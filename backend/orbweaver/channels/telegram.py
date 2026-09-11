@@ -298,11 +298,17 @@ async def _session_workspace(update, context):
         if sess.jsonld.get("channel") != "telegram":
             sess.jsonld["channel"] = "telegram"
             changed = True
-        ws, kind, kind_changed = bind_workspace(sess.jsonld, settings.workspace_root)
+        ws, kind, kind_changed = bind_workspace(
+            sess.jsonld, settings.workspace_root, session_key=str(session_id)
+        )
         if changed or kind_changed:
             await store.put_entity(sess)
     else:
-        ws, kind, _ = bind_workspace({"workspace_uri": "workspace:default"}, settings.workspace_root)
+        ws, kind, _ = bind_workspace(
+            {"workspace_uri": "workspace:default"},
+            settings.workspace_root,
+            session_key=str(session_id),
+        )
     return store, session_id, ws, kind
 
 

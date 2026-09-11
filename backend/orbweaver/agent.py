@@ -307,11 +307,17 @@ TOOL_SPEC = [
     {
         "name": "Bash",
         "description": (
-            "Run a shell command in the workspace. Default timeout is 30 seconds if unspecified; "
-            "pass timeout (seconds, max 600) or block_until_ms for long commands such as pytest "
-            "or installs. Set background true to start a job and return a job_id immediately; "
-            "later call Bash with that job_id (optional timeout to wait) to poll or collect "
-            "output when it finishes. Sandboxed by default: host files are readable, "
+            "Run a shell command in the workspace. The working directory persists between "
+            "commands, and so do exported environment variables (cd once; source a venv "
+            "once); shell functions, aliases, and unexported variables do not. The result "
+            "header shows the cwd and a nonzero exit code. Default timeout is 120 seconds if "
+            "unspecified; pass timeout (seconds, max 600) or block_until_ms for long commands "
+            "such as pytest or installs. Set background true to start a job and return a "
+            "job_id immediately; later call Bash with that job_id (optional timeout to wait) "
+            "to poll or collect output when it finishes. Background jobs run in the same "
+            "sandbox as later commands, so a dev server started with background true is "
+            "reachable at localhost from the next command. Sandboxed by default: host files "
+            "are readable, "
             "writes stay in the working set, network uses a domain allowlist, Unix sockets are "
             "denied unless granted. Host reads and allowlisted sockets/domains do not need "
             "escalation. If the sandbox blocks the command, ask the user before setting "
@@ -332,7 +338,7 @@ TOOL_SPEC = [
                 },
                 "timeout": {
                     "type": "number",
-                    "description": "Seconds to wait (default 30, max 600). Job lifetime when background.",
+                    "description": "Seconds to wait (default 120, max 600). Job lifetime when background.",
                 },
                 "block_until_ms": {
                     "type": "integer",
@@ -1242,12 +1248,17 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
                 job_id=job_id,
                 unsandboxed=bool(inp.get("unsandboxed")),
                 permissions=perms,
+                session_key=str(session_id),
             )
         except BashInterrupted as e:
             raise ToolInterrupted() from e
         if not background and not job_id:
             result = await asyncio.to_thread(
-                annotate_bash_output, Path(ws.root), command, result
+                annotate_bash_output,
+                Path(ws.root),
+                command,
+                result,
+                cwd=getattr(ws, "last_command_cwd", None),
             )
             ctx["git_not_done"] = ritual_says_not_done(result)
         return result

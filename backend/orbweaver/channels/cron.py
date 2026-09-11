@@ -123,7 +123,9 @@ def _slots() -> asyncio.Semaphore:
 async def _run_job_turn(store, sess, session_id: UUID, job: Job, message: str) -> None:
     """One cron turn under the per-session lock. Raises TurnBusy if the session is mid-turn."""
     async with running_turn(session_id, channel="cron") as state:
-        ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
+        ws, kind, changed = bind_workspace(
+            sess.jsonld, settings.workspace_root, session_key=str(session_id)
+        )
         if changed:
             await store.put_entity(sess)
         await store.append_event(session_id, "cron", {"job_id": str(job.id)})

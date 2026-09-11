@@ -120,7 +120,9 @@ def test_local_bash_fail_closed_without_bwrap(tmp_path: Path, monkeypatch):
 
 
 def test_workspace_bash_forwards_timeout_to_sandbox(tmp_path: Path, monkeypatch):
+    """One-shot path (persistent shell off): timeout reaches run_sandboxed unchanged."""
     monkeypatch.setattr(settings, "orbweaver_sandbox", True)
+    monkeypatch.setattr(settings, "orbweaver_persistent_shell", False)
     monkeypatch.setattr("orbweaver.sandbox.bwrap.is_containerized", lambda: False)
     seen = {}
 
@@ -131,9 +133,36 @@ def test_workspace_bash_forwards_timeout_to_sandbox(tmp_path: Path, monkeypatch)
 
     monkeypatch.setattr("orbweaver.sandbox.bwrap.run_sandboxed", fake_run)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
-    assert ws.bash("sleep 31", timeout=45) == "ok"
+    # The fake runner returns bare output (no exit line, no cwd sentinel): only the cwd is known.
+    header, body = ws.bash("sleep 31", timeout=45).split("\n", 1)
+    assert header == f"[cwd {tmp_path.resolve()}]" and body == "ok"
     assert seen["timeout"] == 45
-    assert seen["command"] == "sleep 31"
+    assert "sleep 31\n" in seen["command"]  # wrapped with the cwd sentinel trap
+
+
+def test_workspace_bash_forwards_timeout_to_session_shell(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(settings, "orbweaver_sandbox", True)
+    monkeypatch.setattr(settings, "orbweaver_persistent_shell", True)
+    monkeypatch.setattr("orbweaver.sandbox.bwrap.is_containerized", lambda: False)
+    from orbweaver.sandbox.shell import ShellResult
+
+    seen = {}
+
+    class FakeShell:
+        def run(self, command, timeout, *, cwd=None):
+            seen["timeout"] = timeout
+            seen["command"] = command
+            seen["cwd"] = cwd
+            return ShellResult("exited", 0, "ok\n", "/tmp/elsewhere")
+
+    monkeypatch.setattr(
+        "orbweaver.sandbox.shell.get_session_shell", lambda *a, **k: FakeShell()
+    )
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    header, body = ws.bash("sleep 31", timeout=45).split("\n", 1)
+    assert header.startswith("[cwd /tmp/elsewhere | exit 0 in ") and body == "ok\n"
+    assert seen == {"timeout": 45, "command": "sleep 31", "cwd": None}
+    assert ws.current_cwd() == "/tmp/elsewhere"
 
 
 def test_sandbox_available_in_container(monkeypatch):
