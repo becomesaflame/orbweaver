@@ -46,6 +46,7 @@ from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.procs import BashInterrupted
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
+from orbweaver.stuck import NUDGE_KIND, StuckDetector
 from orbweaver.todos import inject_session_todos, persist_todos
 from orbweaver.tools import partition_tool_calls
 from orbweaver.tooltext import format_read
@@ -1341,6 +1342,27 @@ async def agent_turn(
         fire(await store.append_event(session_id, "turn_aborted", payload))
         fire(await store.append_event(session_id, "assistant", {"text": exc.message}))
 
+    stuck_detector = StuckDetector()
+
+    async def check_stuck() -> None:
+        """Nudge once per loop streak; raise TurnAborted when the streak outlives the nudge."""
+        verdict = stuck_detector.check(await store.list_events(session_id))
+        if verdict is None:
+            return
+        if verdict.action == "abort":
+            log.warning(
+                "stuck: %s loop on %s x%d, ending turn", verdict.pattern, verdict.tool, verdict.count
+            )
+            raise TurnAborted(verdict.text, verdict.abort_payload())
+        log.info("stuck: %s loop on %s x%d, nudging", verdict.pattern, verdict.tool, verdict.count)
+        fire(await store.append_event(session_id, NUDGE_KIND, verdict.nudge_payload()))
+        # Same kind as injected follow-ups so events_to_messages renders it as a user turn.
+        fire(
+            await store.append_event(
+                session_id, "user", {"text": verdict.text, NUDGE_KIND: True}
+            )
+        )
+
     if answering and pending is not None:
         uid = str((pending.payload or {}).get("id") or pending.id)
         fire(
@@ -1636,6 +1658,7 @@ async def agent_turn(
                     )
                 )
                 break
+            await check_stuck()
             await maybe_compact(
                 store, session_id, client=client, workspace=workspace, system=system
             )
