@@ -395,6 +395,7 @@ function renderEvent(ev) {
   if (ev.kind === "user" || ev.kind === "assistant") add(ev.kind, p.text || "");
   else if (ev.kind === "turn_aborted" || ev.kind === "cron_result") add("assistant", p.text || JSON.stringify(p));
   else if (ev.kind === "turn_interrupted") add("assistant", "Stopped");
+  else if (ev.kind === "assistant_delta" || ev.kind === "tool_use_progress") return;
   else if (ev.kind === "tool_call") add("tool", (p.name || "tool") + " " + JSON.stringify(p.input || {}).slice(0, 240));
   else if (ev.kind === "patch_proposal") add("tool", "patch " + ((typeof p.content === "string" ? "" : (p.content || {}).path) || ""));
   else if (ev.kind === "subscribed" || ev.kind === "turn_done") return;

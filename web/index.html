@@ -1198,6 +1198,8 @@
         add("assistant", p.text || "Scheduled task finished.", { seq: ev.seq, extraClass: extra });
       } else if (kind === "turn_interrupted") {
         renderStopped(ev.seq);
+      } else if (ev.kind === "assistant_delta" || ev.kind === "tool_use_progress") {
+        return;
       } else if (ev.kind === "subagent_event") {
         const inner = p.event || {};
         const tag = "\u21b3 subagent " + String(p.subagent_id || "").slice(0, 8) + " " + (inner.kind || "");

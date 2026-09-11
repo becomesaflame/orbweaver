@@ -42,6 +42,8 @@ from orbweaver.image import format_image_read, hydrate_workspace_images, is_imag
 from orbweaver.instructions import instruction_blocks_for_call, seen_instruction_keys
 from orbweaver.lints import read_lints
 from orbweaver.llm import (
+    StreamAssembler,
+    message_stream,
     prompt_cache_supported,
     with_message_cache_breakpoint,
     with_tool_cache_breakpoint,
@@ -1570,9 +1572,10 @@ async def _create_with_overflow_retry(
     produced: list[Event],
     inject: asyncio.Event | None,
     fire: Callable[[Event], None],
+    emit: Callable[[dict[str, Any]], None] | None = None,
     nudge: str | None = None,
 ) -> Any:
-    """Call messages.create; on context overflow, compact and retry."""
+    """Call the LLM (stream when available); on context overflow, compact and retry."""
     last_error: BaseException | None = None
     retries = max(0, int(settings.compact_overflow_retries))
     for attempt in range(retries + 1):
@@ -1599,6 +1602,10 @@ async def _create_with_overflow_retry(
                 cancel=cancel,
                 produced=produced,
                 inject=inject,
+                emit=emit,
+                store=store,
+                session_id=session_id,
+                fire=fire,
             )
         except TurnInjected:
             raise
@@ -1676,6 +1683,129 @@ async def _await_or_cancel(
         raise
 
 
+async def _flush_stream_interrupt(
+    store: Store,
+    session_id: UUID,
+    fire: Callable[[Event], None],
+    assembler: StreamAssembler,
+) -> None:
+    """Persist partial stream text and pair any open tool_use with interrupted stubs."""
+    text = assembler.text().strip()
+    if text:
+        fire(await store.append_event(session_id, "assistant", {"text": text}))
+    for block in assembler.tool_use_blocks():
+        fire(
+            await store.append_event(
+                session_id,
+                "tool_call",
+                {"id": block.id, "name": block.name, "input": block.input},
+            )
+        )
+        fire(
+            await store.append_event(
+                session_id,
+                "tool_result",
+                {
+                    "tool_use_id": block.id,
+                    "name": block.name,
+                    "content": INTERRUPTED_TOOL,
+                    "is_error": True,
+                },
+            )
+        )
+
+
+def _emit_progress(
+    emit: Callable[[dict[str, Any]], None] | None, kind: str, payload: dict[str, Any]
+) -> None:
+    if emit:
+        emit({"kind": kind, "payload": payload})
+
+
+async def _read_message_stream(
+    stream_cm: Any,
+    *,
+    cancel: asyncio.Event | None,
+    inject: asyncio.Event | None,
+    produced: list[Event],
+    emit: Callable[[dict[str, Any]], None] | None,
+    store: Store | None,
+    session_id: UUID | None,
+    fire: Callable[[Event], None] | None,
+) -> Any:
+    assembler = StreamAssembler()
+    entered = False
+    stream: Any = stream_cm
+    try:
+        if hasattr(stream_cm, "__aenter__"):
+            stream = await stream_cm.__aenter__()
+            entered = True
+        aiter = stream.__aiter__()
+        while True:
+            try:
+                event = await _await_or_cancel(
+                    aiter.__anext__(), cancel, produced, inject=inject
+                )
+            except StopAsyncIteration:
+                break
+            for kind, payload in assembler.apply(event):
+                _emit_progress(emit, kind, payload)
+            _raise_if_cancelled(cancel, produced)
+        return assembler.response()
+    except TurnCancelled:
+        if store is not None and session_id is not None and fire is not None:
+            await _flush_stream_interrupt(store, session_id, fire, assembler)
+        raise
+    finally:
+        if entered:
+            with suppress(Exception):
+                await stream_cm.__aexit__(None, None, None)
+        elif hasattr(stream, "close"):
+            close = stream.close
+            if callable(close):
+                result = close()
+                if hasattr(result, "__await__"):
+                    with suppress(Exception):
+                        await result
+
+
+async def _complete_llm(
+    client: Any,
+    *,
+    cancel: asyncio.Event | None,
+    inject: asyncio.Event | None,
+    produced: list[Event],
+    emit: Callable[[dict[str, Any]], None] | None,
+    store: Store | None,
+    session_id: UUID | None,
+    fire: Callable[[Event], None] | None,
+    **kwargs: Any,
+) -> Any:
+    stream_cm = message_stream(client, **kwargs)
+    if stream_cm is not None:
+        try:
+            return await _read_message_stream(
+                stream_cm,
+                cancel=cancel,
+                inject=inject,
+                produced=produced,
+                emit=emit,
+                store=store,
+                session_id=session_id,
+                fire=fire,
+            )
+        except (TurnCancelled, TurnInjected):
+            raise
+        except Exception:
+            log.warning("LLM stream failed; falling back to create", exc_info=True)
+    return await _await_or_cancel(
+        client.messages.create(**kwargs),
+        cancel,
+        produced,
+        inject=inject,
+    )
+
+
 async def _create_agent_message(
     client: Any,
     *,
@@ -1687,9 +1817,13 @@ async def _create_agent_message(
     inject: asyncio.Event | None,
     max_tokens: int | None = None,
     model: str | None = None,
+    emit: Callable[[dict[str, Any]], None] | None = None,
+    store: Store | None = None,
+    session_id: UUID | None = None,
+    fire: Callable[[Event], None] | None = None,
 ):
-    """messages.create with a per-model output budget; re-ask once, larger, when a
-    tool_use was cut off by max_tokens (#80)."""
+    """LLM call (streamed when the client supports it) with a per-model output
+    budget; re-ask once, larger, when a tool_use was cut off by max_tokens (#80)."""
     from orbweaver.llm import completion_max_tokens, max_tokens_for_model
 
     model = model or settings.orbweaver_model
@@ -1701,22 +1835,26 @@ async def _create_agent_message(
         "tools": cast(Any, tools),
         "messages": cast(Any, messages),
     }
-    resp = await _await_or_cancel(
-        client.messages.create(**kwargs),
-        cancel,
-        produced,
-        inject=inject,
-    )
+
+    async def _call() -> Any:
+        return await _complete_llm(
+            client,
+            cancel=cancel,
+            inject=inject,
+            produced=produced,
+            emit=emit,
+            store=store,
+            session_id=session_id,
+            fire=fire,
+            **kwargs,
+        )
+
+    resp = await _call()
     if truncated_tool_uses(resp):
         raised = min(max_tokens_for_model(model), settings.output_reserve)
         if raised > budget:
             kwargs["max_tokens"] = raised
-            resp = await _await_or_cancel(
-                client.messages.create(**kwargs),
-                cancel,
-                produced,
-                inject=inject,
-            )
+            resp = await _call()
     return resp
 
 
@@ -2175,6 +2313,7 @@ async def agent_turn(
                     produced=produced,
                     inject=inj,
                     fire=fire,
+                    emit=emit,
                     nudge=nudge,
                 )
             except TurnInjected:
@@ -2401,6 +2540,7 @@ async def agent_turn(
                     produced=produced,
                     inject=inject_event(),
                     fire=fire,
+                    emit=emit,
                     nudge=(
                         GIT_NOT_DONE_CONCLUDE
                         if ctx.get("git_not_done")
