@@ -8,6 +8,26 @@ from uuid import uuid4
 
 from orbweaver.config import settings
 
+SONNET_MAX_TOKENS = 64_000
+OPUS_MAX_TOKENS = 32_000
+DEFAULT_MAX_TOKENS = 8_192
+
+
+def max_tokens_for_model(model: str) -> int:
+    """Output budget for a model id (Claw Code: Sonnet 64k, Opus 32k)."""
+    name = (model or "").lower()
+    if "opus" in name:
+        return OPUS_MAX_TOKENS
+    if "sonnet" in name:
+        return SONNET_MAX_TOKENS
+    return DEFAULT_MAX_TOKENS
+
+
+def completion_max_tokens(model: str | None = None) -> int:
+    """Tokens to request; stay at or under output_reserve so compact math holds."""
+    raw = max_tokens_for_model(model or settings.orbweaver_model)
+    return max(1, min(raw, settings.output_reserve))
+
 
 def select_provider() -> str:
     if settings.anthropic_api_key.strip():
