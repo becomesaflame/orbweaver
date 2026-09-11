@@ -15,8 +15,11 @@ cd backend
 pip install -e ".[dev]"
 export ORBWEAVER_STORE=memory   # default; use postgres with compose
 export ANTHROPIC_API_KEY=...    # optional; without it the loop echoes
+export ORBWEAVER_JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")
 python3 -m orbweaver.cli serve
 ```
+
+`serve` refuses to start when `ORBWEAVER_JWT_SECRET` is unset, the default, or shorter than 32 bytes (anyone with the source could forge tokens). For a throwaway local run set `ORBWEAVER_DEV_INSECURE=1` instead. Cross-origin browser clients need `ORBWEAVER_CORS_ORIGINS=https://a.example,https://b.example`; the bundled web UI is same-origin and needs nothing.
 
 Mint a JWT on the gateway host (not over HTTP):
 
@@ -80,6 +83,8 @@ Linux Bash for `LocalWorkspace` runs in **bubblewrap**. The sandbox is write con
 
 Configure extra roots, sockets, and domains in `~/.orbweaver/sandbox.json`, `$WORKSPACE_ROOT/.orbweaver/sandbox.json`, or `ORBWEAVER_SANDBOX_CONFIG` (see `deploy/sandbox.json.example`). `denyRead` overlays skip paths that do not exist so a missing `~/.gnupg` cannot prevent the sandbox from starting.
 
+Credential files are masked by default (`DEFAULT_DENY_READ` in `sandbox/policy.py`): `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `~/.config/hub`, `~/.config/gcloud`, `~/.docker/config.json`, `~/.kube`, `~/.azure`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials*`, plus the running gateway checkout's `backend/.env` and other `.env*` files. Directories become an empty tmpfs and files read as `/dev/null`; the `Read` tool denies the same paths. Put an entry back with `allowRead` (e.g. `["~/.npmrc"]`) or `ORBWEAVER_SANDBOX_ALLOW_READ`. Private SSH keys never enter the sandbox by default: `~/.ssh/config`, `known_hosts`, and `*.pub` are re-exposed, and an ssh-agent (`SSH_AUTH_SOCK`) signs from the host. To bind keys anyway set `"ssh": {"bindIdentities": true}` (host `IdentityFile` entries and the standard `id_*` names) or list them in `"ssh": {"identities": [...]}`. `allowRead` and `ssh` are honoured only in `~/.orbweaver/sandbox.json`, `ORBWEAVER_SANDBOX_CONFIG`, and the environment — the workspace file is agent-writable and cannot widen the sandbox.
+Sandboxed Bash does not inherit the gateway environment. bwrap starts with `--clearenv` and receives only an allowlist (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TZ`, `TMPDIR`, host proxy variables, and `SSH_AUTH_SOCK` when that socket is granted). Add names or globs with `env.allow` in `sandbox.json` or `ORBWEAVER_SANDBOX_ENV_ALLOW`; `*KEY*`, `*SECRET*`, `*TOKEN*`, `*PASSWORD*`, `ORBWEAVER_*`, `DATABASE_URL`, `ANTHROPIC_*`, `OPENAI_*`, `OPENROUTER_*`, `TELEGRAM_*`, and `HINDSIGHT_*` are never passed through.
 `WebFetch` and `Browser` run on the host, outside bubblewrap, but follow the same `networkPolicy`: the URL and every redirect hop are resolved first, loopback / RFC1918 / link-local (including `169.254.169.254`) addresses are refused, `WebFetch` connects to the vetted address (`Host` and SNI keep the hostname), and Playwright aborts sub-resources and JS navigations that fail the check. `deny` patterns always apply and `allow` patterns always grant; when nothing matches, `networkPolicy.webDefault` (`ORBWEAVER_SANDBOX_WEB_NETWORK_DEFAULT`, default `allow`) decides so the public web stays reachable while Bash keeps `default: deny`. Set `webDefault: "deny"` to confine both tools to the allowlist. WebFetch downloads at most 2 MB and only text-like content types.
 
 ### MCP servers

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 
 
 def main() -> None:
@@ -25,8 +26,16 @@ def main() -> None:
         return
     import uvicorn
 
+    from orbweaver.auth import InsecureJwtSecretError, check_jwt_secret
     from orbweaver.config import settings
 
+    try:
+        check_jwt_secret(settings)
+    except InsecureJwtSecretError as e:
+        # No handlers are configured yet, so logging's last-resort handler
+        # writes this to stderr; uvicorn would otherwise own logging setup.
+        logging.getLogger("orbweaver").error("refusing to start: %s", e)
+        raise SystemExit(1) from e
     uvicorn.run(
         "orbweaver.app:app",
         host=settings.orbweaver_host,

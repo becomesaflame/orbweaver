@@ -2,16 +2,25 @@
   "additionalReadonlyPaths": [],
   "additionalReadwritePaths": [],
   "denyRead": ["~/.ssh", "~/.gnupg", "~/.aws"],
+  "allowRead": [],
+  "ssh": {
+    "bindIdentities": false,
+    "identities": []
+  },
   "allowUnixSockets": [
     "/run/systemd/journal/socket",
     "/run/user/1000/systemd/journal/socket",
     "/run/postgresql/.s.PGSQL.5432"
   ],
+  "allowGitConfig": false,
   "networkPolicy": {
     "default": "deny",
     "webDefault": "allow",
     "includeDefaults": true,
     "allow": [],
     "deny": []
+  },
+  "env": {
+    "allow": []
   }
 }
