@@ -7,7 +7,6 @@ import logging
 import os
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,7 +29,14 @@ from pydantic import BaseModel
 
 from orbweaver import __version__
 from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel, pending_ask_user
-from orbweaver.auth import mint_token, require_user
+from orbweaver.auth import (
+    WS_BEARER_SUBPROTOCOL,
+    check_jwt_secret,
+    decode_token,
+    mint_token,
+    require_user,
+    websocket_subprotocol_token,
+)
 from orbweaver.checkpoints import (
     CheckpointError,
     CheckpointHeadMismatch,
@@ -51,6 +57,11 @@ from orbweaver.store import (
     session_at_id,
 )
 from orbweaver.subagent import is_subagent_session
+from orbweaver.turns import RunningTurn
+from orbweaver.turns import acquire as acquire_turn
+from orbweaver.turns import get as get_running_turn
+from orbweaver.turns import is_running as turn_is_running
+from orbweaver.turns import release as release_turn
 from orbweaver.uris import (
     WorkspaceURIError,
     list_workspace_dirs,
@@ -78,6 +89,9 @@ WEB_DIR = _web_dir()
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # Refuse to serve with a forgeable JWT secret (issue #97). Raising here
+    # makes uvicorn log "Application startup failed" and exit non-zero.
+    check_jwt_secret(settings)
     store = get_store()
     connect = getattr(store, "connect", None)
     if connect:
@@ -95,14 +109,25 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
+def configure_cors(target: FastAPI, origins: list[str]) -> None:
+    """Allow credentialed cross-origin calls only from `origins`.
+
+    The default (empty list) is same-origin only: the bundled web UI is served
+    by this process, so browsers never need CORS for it. `*` with credentials
+    is rejected by browsers and would echo any Origin, so credentials are only
+    enabled for an explicit origin list.
+    """
+    target.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=bool(origins) and "*" not in origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
 app = FastAPI(title="Orbweaver", lifespan=_lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configure_cors(app, settings.cors_origins)
 
 
 _RATE_LIMIT_WINDOW_S = 60.0
@@ -259,15 +284,6 @@ def _user(request: Request) -> dict:
     return require_user(request)
 
 
-@dataclass
-class RunningTurn:
-    cancel: asyncio.Event
-    inject: asyncio.Event = field(default_factory=asyncio.Event)
-    discard: bool = False
-    user_seq: int = 0
-
-
-_running_turns: dict[UUID, RunningTurn] = {}
 _ws_subscribers: dict[UUID, set[WebSocket]] = defaultdict(set)
 _GENERIC_TITLES = {"", "web", "session", "New chat", "vscode"}
 
@@ -630,17 +646,16 @@ async def _run_turn(
     *,
     resume: bool = False,
 ) -> dict[str, Any]:
-    if session_id in _running_turns:
+    state = acquire_turn(session_id, channel=_stored_channel(sess.jsonld) or "web")
+    if state is None:
         raise HTTPException(409, "turn already running")
-    if not resume:
-        await _maybe_autotitle(store, sess, user_text)
-    ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
-    if changed:
-        await store.put_entity(sess)
-    state = RunningTurn(cancel=asyncio.Event())
-    _running_turns[session_id] = state
     result: dict[str, Any] | None = None
     try:
+        if not resume:
+            await _maybe_autotitle(store, sess, user_text)
+        ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
+        if changed:
+            await store.put_entity(sess)
         events = await agent_turn(
             store,
             session_id,
@@ -689,9 +704,7 @@ async def _run_turn(
             raise HTTPException(status_code=502, detail=e.message) from e
         raise
     finally:
-        current = _running_turns.get(session_id)
-        if current is state:
-            _running_turns.pop(session_id, None)
+        release_turn(session_id, state)
         if result is not None:
             _broadcast(
                 session_id,
@@ -719,14 +732,28 @@ async def inject_turn(
     text = body.text.strip()
     if not text:
         raise HTTPException(400, "text is required")
-    state = _running_turns.get(session_id)
+    state = get_running_turn(session_id)
     if not state:
         raise HTTPException(409, "no turn is running")
-    store = get_store()
-    ev = await store.append_event(session_id, "user", {"text": text, "injected": True})
+    ev = await inject_into_turn(get_store(), session_id, state, text)
+    return {"status": "injected", "seq": ev.seq, "event": _event_dict(ev)}
+
+
+async def inject_into_turn(
+    store,
+    session_id: UUID,
+    state: RunningTurn,
+    text: str,
+    images: list[dict[str, str]] | None = None,
+) -> Any:
+    """Append a follow-up user event to a running turn and wake its LLM call."""
+    payload: dict[str, Any] = {"text": text, "injected": True}
+    if images:
+        payload["images"] = images
+    ev = await store.append_event(session_id, "user", payload)
     state.inject.set()
     _broadcast(session_id, _event_dict(ev))
-    return {"status": "injected", "seq": ev.seq, "event": _event_dict(ev)}
+    return ev
 
 
 @app.post("/v1/sessions/{session_id}/turns/continue")
@@ -747,7 +774,7 @@ async def continue_turn(session_id: UUID, _u: dict = Depends(_user)) -> dict[str
 async def cancel_turn(
     session_id: UUID, body: CancelTurnBody, _u: dict = Depends(_user)
 ) -> dict[str, Any]:
-    state = _running_turns.get(session_id)
+    state = get_running_turn(session_id)
     if not state:
         return {"status": "idle"}
     state.discard = body.discard
@@ -761,7 +788,7 @@ async def rewind(
 ) -> dict[str, Any]:
     if body.from_seq < 1:
         raise HTTPException(400, "from_seq must be >= 1")
-    if session_id in _running_turns:
+    if turn_is_running(session_id):
         raise HTTPException(409, "turn already running")
     store = get_store()
     sess = await store.get_entity(session_id)
@@ -826,17 +853,63 @@ async def correction(session_id: UUID, body: CorrectionBody, _u: dict = Depends(
     return {"status": "ok"}
 
 
-@app.websocket("/v1/sessions/{session_id}/ws")
-async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None = None) -> None:
-    await websocket.accept()
-    if not token:
-        await websocket.close(code=4401)
-        return
-    try:
-        from orbweaver.auth import decode_token
+_WS_AUTH_TIMEOUT_S = 10.0
 
+
+async def _ws_first_frame_token(websocket: WebSocket) -> str | None:
+    """Token from a first-message auth frame: {"type": "auth", "token": "<jwt>"}."""
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=_WS_AUTH_TIMEOUT_S)
+    except TimeoutError:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or str(data.get("type") or "") != "auth":
+        return None
+    tok = data.get("token")
+    return str(tok) if tok else None
+
+
+async def _ws_authenticate(websocket: WebSocket, query_token: str | None) -> bool:
+    """Accept the socket and resolve the bearer token.
+
+    Preferred: `Sec-WebSocket-Protocol: bearer, <jwt>` (echoed back as
+    `bearer`). Also accepted: a first frame `{"type": "auth", "token": ...}`.
+    Deprecated, removed in a future release: `?token=<jwt>` in the URL, which
+    ends up in access logs and proxies.
+    """
+    bearer_offered, sub_token = websocket_subprotocol_token(websocket)
+    await websocket.accept(subprotocol=WS_BEARER_SUBPROTOCOL if bearer_offered else None)
+    token: str | None
+    if bearer_offered:
+        token = sub_token
+    elif query_token:
+        log.warning(
+            "websocket auth via ?token= query parameter is deprecated and will be removed; "
+            "send `Sec-WebSocket-Protocol: bearer, <jwt>` or a first frame "
+            '{"type": "auth", "token": "<jwt>"} instead'
+        )
+        token = query_token
+    else:
+        token = await _ws_first_frame_token(websocket)
+    if not token:
+        return False
+    try:
         decode_token(token)
     except HTTPException:
+        return False
+    return True
+
+
+@app.websocket("/v1/sessions/{session_id}/ws")
+async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None = None) -> None:
+    try:
+        authed = await _ws_authenticate(websocket, token)
+    except WebSocketDisconnect:
+        return
+    if not authed:
         await websocket.close(code=4401)
         return
     store = get_store()
@@ -856,12 +929,12 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
             if not isinstance(data, dict):
                 continue
             typ = str(data.get("type") or "")
-            if typ in {"subscribe", "ping"}:
+            if typ in {"subscribe", "ping", "auth"}:
                 if typ == "ping":
                     await websocket.send_json({"kind": "pong"})
                 continue
             if typ == "cancel":
-                state = _running_turns.get(session_id)
+                state = get_running_turn(session_id)
                 if state:
                     state.discard = bool(data.get("discard"))
                     state.cancel.set()

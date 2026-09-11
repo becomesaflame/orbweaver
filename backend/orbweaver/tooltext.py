@@ -11,6 +11,136 @@ READ_CHAR_CAP = 20_000
 READ_DEFAULT_LINES = 400
 WEBFETCH_CHAR_CAP = 24_000
 WEBFETCH_RAW_CAP = 500_000
+BASH_OUTPUT_CAP = 200_000
+TRUNCATE_MAX_LINES = 2000
+# Head:tail split for previews. Failures (pytest summary, traceback, linker error)
+# live at the end, so the tail gets the larger share.
+_HEAD_SHARE = 3
+_TAIL_SHARE = 5
+
+
+def _omitted_marker(chars: int, lines: int, path: str | None) -> str:
+    what = f"{chars} chars omitted"
+    if lines > 0:
+        what += f" ({lines} lines)"
+    where = f"; full output saved to {path}" if path else ""
+    return f"[... {what}{where} ...]"
+
+
+def line_count(text: str) -> int:
+    if not text:
+        return 0
+    return text.count("\n") + (0 if text.endswith("\n") else 1)
+
+
+def needs_truncation(text: str, *, max_chars: int, max_lines: int = TRUNCATE_MAX_LINES) -> bool:
+    return len(text) > max_chars or line_count(text) > max_lines
+
+
+def _cut_head(text: str, chars: int, lines: int) -> int:
+    """Index where the head ends: within `chars`, at most `lines` lines, on a newline if close."""
+    end = min(len(text), max(0, chars))
+    nl = text.rfind("\n", 0, end)
+    if nl >= end // 2:
+        end = nl + 1
+    line_end = 0
+    for _ in range(max(0, lines)):
+        nxt = text.find("\n", line_end)
+        if nxt < 0:
+            line_end = len(text)
+            break
+        line_end = nxt + 1
+    return min(end, line_end)
+
+
+def _cut_tail(text: str, chars: int, lines: int) -> int:
+    """Index where the tail starts: within `chars`, at most `lines` lines, after a newline if close."""
+    n = len(text)
+    if lines <= 0 or chars <= 0:
+        return n
+    start = max(0, n - chars)
+    nl = text.find("\n", start, n)
+    if 0 <= nl < start + (n - start) // 2:
+        start = nl + 1
+    body_end = n - 1 if text.endswith("\n") else n
+    line_start = body_end
+    for _ in range(lines):
+        prev = text.rfind("\n", 0, line_start)
+        if prev < 0:
+            return max(start, 0)
+        line_start = prev
+    return max(start, line_start + 1)
+
+
+def truncate_head_tail(
+    text: str,
+    *,
+    max_chars: int,
+    max_lines: int = TRUNCATE_MAX_LINES,
+    path: str | None = None,
+) -> str:
+    """Keep the first ~3/8 and last ~5/8 of the budget with an omission marker between.
+
+    The result fits in `max_chars` characters and `max_lines` lines. Cuts land on line
+    boundaries when one is near. `path` is where the full output was saved, if anywhere.
+    """
+    if not needs_truncation(text, max_chars=max_chars, max_lines=max_lines):
+        return text
+    marker_len = len(_omitted_marker(len(text), text.count("\n"), path)) + 2
+    budget = max(0, max_chars - marker_len)
+    head_chars = budget * _HEAD_SHARE // (_HEAD_SHARE + _TAIL_SHARE)
+    tail_chars = budget - head_chars
+    line_budget = max(0, max_lines - 1)
+    head_lines = line_budget * _HEAD_SHARE // (_HEAD_SHARE + _TAIL_SHARE)
+    tail_lines = line_budget - head_lines
+    head_end = _cut_head(text, head_chars, head_lines)
+    tail_start = _cut_tail(text, tail_chars, tail_lines)
+    tail_start = max(tail_start, head_end)
+    head = text[:head_end]
+    tail = text[tail_start:]
+    omitted = text[head_end:tail_start]
+    marker = _omitted_marker(len(omitted), omitted.count("\n"), path)
+    if head and not head.endswith("\n"):
+        head += "\n"
+    if tail and not tail.startswith("\n"):
+        marker += "\n"
+    return f"{head}{marker}{tail}"
+
+
+def _fmt_seconds(seconds: float) -> str:
+    s = max(0.0, float(seconds))
+    return f"{s:.2f}s" if s < 10 else f"{s:.1f}s"
+
+
+def bash_result_header(
+    *,
+    returncode: int | None,
+    elapsed_s: float,
+    timed_out_after: int | None = None,
+) -> str:
+    """One line the model can read instead of inferring failure from the text."""
+    if timed_out_after is not None:
+        return f"timed out after {timed_out_after}s"
+    if returncode is None:
+        return f"interrupted in {_fmt_seconds(elapsed_s)}"
+    if returncode < 0:
+        return f"interrupted by signal {-returncode} in {_fmt_seconds(elapsed_s)}"
+    return f"exit {returncode} in {_fmt_seconds(elapsed_s)}"
+
+
+def format_bash_result(
+    output: str,
+    *,
+    returncode: int | None,
+    elapsed_s: float,
+    timed_out_after: int | None = None,
+) -> str:
+    """`exit <code> in <seconds>s` header, then the last BASH_OUTPUT_CAP chars of output."""
+    header = bash_result_header(
+        returncode=returncode, elapsed_s=elapsed_s, timed_out_after=timed_out_after
+    )
+    body = (output or "")[-BASH_OUTPUT_CAP:]
+    return f"{header}\n{body}" if body else header
 
 
 def _as_int(value: Any, default: int | None) -> int | None:

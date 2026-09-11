@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 from uuid import uuid4
 
 from orbweaver.permissions.rules import in_working_set
+from orbweaver.sandbox.egress import EgressDecision, check_url_async, network_policy_for
+from orbweaver.sandbox.policy import NetworkPolicy
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +27,69 @@ UNAVAILABLE = (
 MISSING_CHROMIUM = (
     "Playwright is installed but Chromium is missing. Run: playwright install chromium"
 )
+ROUTE_DECISION_TTL_S = 60.0
+
+
+class EgressGate:
+    """Per-session URL gate shared by ``navigate`` and the Playwright route handler.
+
+    Decisions are cached per (scheme, host, port) for a short time so a page with
+    many sub-resources does not resolve the same host on every request.
+    """
+
+    def __init__(self, network: NetworkPolicy | None = None) -> None:
+        self.network = network or NetworkPolicy()
+        self._cache: dict[tuple[str, str, int], tuple[float, EgressDecision]] = {}
+
+    @staticmethod
+    def _key(url: str) -> tuple[str, str, int] | None:
+        try:
+            parts = urlsplit(url)
+            scheme = (parts.scheme or "").lower()
+            host = (parts.hostname or "").lower()
+            port = parts.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            return None
+        if scheme not in {"http", "https"} or not host:
+            return None
+        return scheme, host, port
+
+    @staticmethod
+    def governs(url: str) -> bool:
+        """Only http(s) is policed; file:// is confined by resolve_navigate_target."""
+        return (urlsplit(url).scheme or "").lower() in {"http", "https"}
+
+    async def check(self, url: str) -> EgressDecision:
+        key = self._key(url)
+        now = time.monotonic()
+        if key is not None:
+            hit = self._cache.get(key)
+            if hit is not None and hit[0] > now:
+                return hit[1]
+        decision = await check_url_async(url, self.network)
+        if key is not None:
+            if len(self._cache) > 256:
+                self._cache.clear()
+            self._cache[key] = (now + ROUTE_DECISION_TTL_S, decision)
+        return decision
+
+    async def route(self, route: Any) -> None:
+        """Playwright ``page.route`` handler: abort sub-resources and JS navigations that fail policy."""
+        url = str(route.request.url)
+        if not self.governs(url):
+            await route.continue_()
+            return
+        try:
+            decision = await self.check(url)
+        except Exception:
+            log.debug("egress check failed for %s", url, exc_info=True)
+            await route.abort("blockedbyclient")
+            return
+        if decision.allowed:
+            await route.continue_()
+        else:
+            log.info("browser egress denied: %s", decision.reason)
+            await route.abort("blockedbyclient")
 
 
 def playwright_available() -> bool:
@@ -156,6 +222,7 @@ class _Session:
         self._browser: Any = None
         self._page: Any = None
         self._lock = asyncio.Lock()
+        self.gate = EgressGate()
 
     async def _ensure(self) -> Any:
         if self._page is not None:
@@ -169,8 +236,15 @@ class _Session:
             await self.close()
             raise
         context = await self._browser.new_context(viewport={"width": 1280, "height": 720})
-        self._page = await context.new_page()
+        page = await context.new_page()
+        # Every request the page makes (documents, sub-resources, fetch/XHR, JS
+        # navigations, redirect targets) goes through the egress gate.
+        await page.route("**/*", self._route)
+        self._page = page
         return self._page
+
+    async def _route(self, route: Any) -> None:
+        await self.gate.route(route)
 
     async def close(self) -> None:
         page, browser, pw = self._page, self._browser, self._pw
@@ -183,12 +257,25 @@ class _Session:
             except Exception:
                 log.debug("browser %s failed during close", method, exc_info=True)
 
-    async def run(self, inp: dict[str, Any], workspace) -> str:
+    async def run(self, inp: dict[str, Any], workspace, network: NetworkPolicy | None = None) -> str:
         async with self._lock:
+            if network is not None and network != self.gate.network:
+                self.gate = EgressGate(network)
             return await self._run(inp, workspace)
 
     async def _run(self, inp: dict[str, Any], workspace) -> str:
         action = str(inp.get("action") or "").strip().lower()
+        url = ""
+        if action == "navigate":
+            # Check before the browser exists so a denied URL never launches Chromium.
+            try:
+                url = resolve_navigate_target(str(inp.get("url") or ""), workspace)
+            except (ValueError, PermissionError) as e:
+                return f"Browser navigate failed: {e}"
+            if self.gate.governs(url):
+                decision = await self.gate.check(url)
+                if not decision.allowed:
+                    return f"Browser navigate failed: {decision.message}"
         try:
             page = await self._ensure()
         except Exception as e:
@@ -199,7 +286,6 @@ class _Session:
 
         try:
             if action == "navigate":
-                url = resolve_navigate_target(str(inp.get("url") or ""), workspace)
                 await page.goto(url, wait_until="load", timeout=NAVIGATE_TIMEOUT_MS)
                 return await self._snapshot(page)
             if self._page is None:
@@ -278,4 +364,4 @@ async def run_browser(inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         return UNAVAILABLE
     workspace = ctx.get("workspace")
     sess = await pool.session_for(ctx)
-    return await sess.run(inp, workspace)
+    return await sess.run(inp, workspace, network_policy_for(workspace))

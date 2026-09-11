@@ -10,7 +10,14 @@ class Settings(BaseSettings):
     anthropic_workspace_id: str = ""
     ollama_base_url: str = ""
     ollama_model: str = ""
+    # Required in production: >= 32 bytes, not the default. `serve` refuses to
+    # start otherwise unless ORBWEAVER_DEV_INSECURE=1.
     orbweaver_jwt_secret: str = "dev-secret-change-me"
+    orbweaver_dev_insecure: bool = False
+    # Comma-separated browser origins allowed for credentialed cross-origin
+    # calls. Empty (default) means same-origin only; the bundled web UI is
+    # served from the gateway itself and needs nothing here.
+    orbweaver_cors_origins: str = ""
     orbweaver_model: str = "claude-sonnet-4-6"
     orbweaver_classifier_model: str = "claude-sonnet-4-6"
     orbweaver_injection_probe_model: str = "claude-haiku-4-5"
@@ -27,14 +34,35 @@ class Settings(BaseSettings):
     orbweaver_auto_allow_bash_if_sandboxed: bool = True
     orbweaver_sandbox_config: str = ""
     orbweaver_mcp_config: str = ""
+    # Concurrency-safe tool calls from one assistant round that may run at once.
+    orbweaver_max_parallel_tools: int = 8
     orbweaver_sandbox_additional_readonly: str = ""
     orbweaver_sandbox_additional_readwrite: str = ""
     orbweaver_sandbox_deny_read: str = ""
+    orbweaver_sandbox_allow_read: str = ""
+    orbweaver_sandbox_ssh_identities: str = ""
+    orbweaver_sandbox_ssh_bind_identities: str = ""
     orbweaver_sandbox_unix_sockets: str = ""
     orbweaver_sandbox_allowed_domains: str = ""
     orbweaver_sandbox_denied_domains: str = ""
     orbweaver_sandbox_network_default: str = ""
+    orbweaver_sandbox_web_network_default: str = ""
     orbweaver_sandbox_include_default_domains: str = ""
+    # Subagents: process-wide cap on concurrently running children, per-child
+    # defaults for wall time and tool rounds, and how long a finishing parent
+    # turn waits for background children it never collected.
+    orbweaver_max_concurrent_subagents: int = 4
+    orbweaver_subagent_timeout_s: float = 600.0
+    orbweaver_subagent_max_rounds: int = 24
+    orbweaver_subagent_grace_s: float = 30.0
+    # bwrap hardening (issue #114). Limits apply to the sandboxed bash and its
+    # children via ulimit; 0 disables a limit. seccomp: auto | on | off.
+    orbweaver_sandbox_max_procs: int = 512
+    orbweaver_sandbox_max_mem_mb: int = 2048
+    orbweaver_sandbox_max_open_files: int = 4096
+    orbweaver_sandbox_seccomp: str = "auto"
+    orbweaver_sandbox_hide_sys: bool = True
+    orbweaver_sandbox_env_allow: str = ""  # extra env names/globs passed into sandboxed Bash
     orbweaver_checkpoints: bool = True  # per-turn git tree of the workspace for rewind
     orbweaver_checkpoint_keep_days: int = 14  # prune refs/orbweaver/checkpoints older than this
     orbweaver_pinned_token_cap: int = 4000
@@ -46,7 +74,20 @@ class Settings(BaseSettings):
     # (~85% of the 200k window). Claw Code uses 100k cumulative input tokens.
     compact_ratio: float = 0.85
     orbweaver_compact_model: str = "claude-haiku-4-5"
+    # Microcompact (stub old tool results in the prompt) runs only under pressure:
+    # when the payload estimate of the live window exceeds compact_micro_pressure
+    # of event_budget it clears the oldest large results, in chunks of
+    # (pressure - release) * event_budget, until the window is back under the
+    # pressure line. Chunking keeps the message prefix byte-identical between
+    # consecutive rounds so Anthropic prompt caching keeps hitting.
+    compact_micro_pressure: float = 0.6
+    compact_micro_release: float = 0.4
+    # Floor: the newest N compactable results are never stubbed.
     compact_micro_keep: int = 5
+    # Independent of pressure: a result older than this many tool rounds *and*
+    # larger than this many chars is stubbed (0 rounds disables the age rule).
+    compact_micro_stale_rounds: int = 24
+    compact_micro_stale_chars: int = 20000
     compact_tool_result_chars: int = 8000
     compact_max_failures: int = 3
     compact_overflow_retries: int = 4
@@ -54,6 +95,12 @@ class Settings(BaseSettings):
     compact_rehydrate_chars_per_file: int = 20000
     compact_rehydrate_token_budget: int = 50000
     compact_notes_max_chars: int = 12000
+    # Loop detection (orbweaver.stuck). Streaks count tool calls since the last user
+    # message; stuck_window is how many recent tool calls are scanned.
+    stuck_detection: bool = True
+    stuck_repeat_threshold: int = 3
+    stuck_alternating_threshold: int = 6
+    stuck_window: int = 20
     database_url: str = "postgresql://orbweaver:orbweaver@localhost:5432/orbweaver"
     orbweaver_store: str = "memory"  # memory | postgres
     workspace_root: str = "."
@@ -83,6 +130,10 @@ class Settings(BaseSettings):
         if not self.telegram_allowlist.strip():
             return set()
         return {int(x.strip()) for x in self.telegram_allowlist.split(",") if x.strip()}
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [o.strip() for o in self.orbweaver_cors_origins.split(",") if o.strip()]
 
     @property
     def brave_api_key(self) -> str:
