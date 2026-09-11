@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from orbweaver.mcp.environment import expand_env_refs
+
+log = logging.getLogger(__name__)
+
+DEFAULT_TIMEOUT_S = 30.0
+DEFAULT_STARTUP_TIMEOUT_S = 8.0
+
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_*?]*$")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -31,12 +43,23 @@ def expand_path(raw: str, *, relative_to: Path | None = None) -> Path:
 
 @dataclass(frozen=True)
 class McpServerSpec:
+    """One configured server. ``command`` selects stdio, ``url`` Streamable HTTP."""
+
     name: str
-    command: str
+    command: str = ""
     args: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
     disabled: bool = False
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    env_passthrough: tuple[str, ...] = ()
+    timeout_s: float = DEFAULT_TIMEOUT_S
+    startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S
+
+    @property
+    def transport(self) -> str:
+        return "http" if self.url and not self.command else "stdio"
 
     def fingerprint(self) -> str:
         return json.dumps(
@@ -47,6 +70,11 @@ class McpServerSpec:
                 "env": self.env,
                 "cwd": self.cwd,
                 "disabled": self.disabled,
+                "url": self.url,
+                "headers": self.headers,
+                "envPassthrough": list(self.env_passthrough),
+                "timeout_s": self.timeout_s,
+                "startup_timeout_s": self.startup_timeout_s,
             },
             sort_keys=True,
         )
@@ -57,7 +85,7 @@ class McpConfig:
     servers: tuple[McpServerSpec, ...] = ()
 
     def enabled(self) -> tuple[McpServerSpec, ...]:
-        return tuple(s for s in self.servers if not s.disabled and s.command)
+        return tuple(s for s in self.servers if not s.disabled and (s.command or s.url))
 
     def fingerprint(self) -> str:
         return json.dumps([s.fingerprint() for s in self.enabled()])
@@ -74,13 +102,37 @@ def _as_str_map(raw: Any) -> dict[str, str]:
     return out
 
 
+def _as_name_list(raw: Any) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        raw = [p for p in re.split(r"[,\s]+", raw) if p]
+    if not isinstance(raw, list):
+        return ()
+    out: list[str] = []
+    for item in raw:
+        name = str(item).strip()
+        if name and _ENV_NAME.match(name) and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def _as_timeout(raw: Any, default: float) -> float:
+    if raw is None or isinstance(raw, bool):
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 def _parse_server(name: str, raw: Any) -> McpServerSpec | None:
     if not isinstance(raw, dict):
         return None
-    if raw.get("url") and not raw.get("command"):
-        # HTTP/SSE transports are out of v1.
-        return None
     command = str(raw.get("command") or "").strip()
+    url = str(raw.get("url") or "").strip()
+    if url and not url.lower().startswith(("http://", "https://")):
+        log.warning("MCP server %s: unsupported url %r (need http(s)://)", name, url)
+        url = ""
     args_raw = raw.get("args") or []
     args: tuple[str, ...]
     if isinstance(args_raw, str):
@@ -99,6 +151,13 @@ def _parse_server(name: str, raw: Any) -> McpServerSpec | None:
         env=_as_str_map(raw.get("env")),
         cwd=cwd,
         disabled=disabled,
+        url=url,
+        headers=_as_str_map(raw.get("headers")),
+        env_passthrough=_as_name_list(raw.get("envPassthrough")),
+        timeout_s=_as_timeout(raw.get("timeout_s", raw.get("timeoutS")), DEFAULT_TIMEOUT_S),
+        startup_timeout_s=_as_timeout(
+            raw.get("startup_timeout_s", raw.get("startupTimeoutS")), DEFAULT_STARTUP_TIMEOUT_S
+        ),
     )
 
 
@@ -122,9 +181,14 @@ def _merge_server(base: McpServerSpec | None, incoming: McpServerSpec) -> McpSer
         return incoming
     env = dict(base.env)
     env.update(incoming.env)
-    command = incoming.command or base.command
-    args = incoming.args if incoming.command else base.args
+    headers = dict(base.headers)
+    headers.update(incoming.headers)
+    replaces_transport = bool(incoming.command or incoming.url)
+    command = incoming.command if replaces_transport else base.command
+    url = incoming.url if replaces_transport else base.url
+    args = incoming.args if replaces_transport else base.args
     cwd = incoming.cwd if incoming.cwd is not None else base.cwd
+    passthrough = tuple(dict.fromkeys([*base.env_passthrough, *incoming.env_passthrough]))
     return McpServerSpec(
         name=incoming.name,
         command=command,
@@ -132,6 +196,36 @@ def _merge_server(base: McpServerSpec | None, incoming: McpServerSpec) -> McpSer
         env=env,
         cwd=cwd,
         disabled=incoming.disabled,
+        url=url,
+        headers=headers,
+        env_passthrough=passthrough,
+        timeout_s=incoming.timeout_s,
+        startup_timeout_s=incoming.startup_timeout_s,
+    )
+
+
+def _expand_spec(
+    spec: McpServerSpec, environ: Mapping[str, str], global_passthrough: Iterable[str]
+) -> McpServerSpec:
+    """Resolve ``${VAR}`` in env/headers from the passthrough allowlist only."""
+    allow = tuple(dict.fromkeys([*global_passthrough, *spec.env_passthrough]))
+    env = {k: expand_env_refs(v, environ, allow, where=f"{spec.name} env {k}") for k, v in spec.env.items()}
+    headers = {
+        k: expand_env_refs(v, environ, allow, where=f"{spec.name} header {k}")
+        for k, v in spec.headers.items()
+    }
+    return McpServerSpec(
+        name=spec.name,
+        command=spec.command,
+        args=spec.args,
+        env=env,
+        cwd=spec.cwd,
+        disabled=spec.disabled,
+        url=spec.url,
+        headers=headers,
+        env_passthrough=allow,
+        timeout_s=spec.timeout_s,
+        startup_timeout_s=spec.startup_timeout_s,
     )
 
 
@@ -144,8 +238,11 @@ def load_mcp_config(
 ) -> McpConfig:
     """Merge ~/.orbweaver/mcp.json, workspace .orbweaver/mcp.json, then extra file.
 
-    Later sources override command/args/cwd/disabled. ``env`` maps are deep-merged
-    so host tokens survive a workspace command override.
+    Later sources override command/args/cwd/disabled. ``env`` and ``headers``
+    maps are deep-merged so host tokens survive a workspace command override.
+    ``${VAR}`` references in ``env``/``headers`` values expand only from the
+    per-server ``envPassthrough`` list, the file-level ``envPassthrough`` list,
+    or ``ORBWEAVER_MCP_ENV_PASSTHROUGH``; anything else expands to "".
     """
     from orbweaver.config import settings as default_settings
 
@@ -155,6 +252,9 @@ def load_mcp_config(
     home_dir = (home or Path.home()).resolve()
 
     merged: dict[str, McpServerSpec] = {}
+    global_passthrough: list[str] = list(
+        _as_name_list(getattr(cfg, "orbweaver_mcp_env_passthrough", "") or "")
+    )
     sources: list[Path] = [
         home_dir / ".orbweaver" / "mcp.json",
         root / ".orbweaver" / "mcp.json",
@@ -166,7 +266,12 @@ def load_mcp_config(
     for path in sources:
         if not path.is_file():
             continue
-        for name, spec in _servers_from_file(_read_json(path)).items():
+        data = _read_json(path)
+        for name in _as_name_list(data.get("envPassthrough")):
+            if name not in global_passthrough:
+                global_passthrough.append(name)
+        for name, spec in _servers_from_file(data).items():
             merged[name] = _merge_server(merged.get(name), spec)
 
-    return McpConfig(servers=tuple(merged.values()))
+    servers = tuple(_expand_spec(s, env, global_passthrough) for s in merged.values())
+    return McpConfig(servers=servers)

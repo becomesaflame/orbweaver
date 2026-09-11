@@ -5,11 +5,11 @@ import anthropic
 import pytest
 
 from orbweaver.agent import DEFAULT_MAX_ROUNDS, agent_turn, run_tools
-from orbweaver.subagent import SUBAGENT_MAX_ROUNDS
 from orbweaver.channels.telegram import texts_for_reply
 from orbweaver.config import settings
 from orbweaver.permissions.pipeline import abort_message
 from orbweaver.store import Event, reset_store_for_tests
+from orbweaver.subagent import SUBAGENT_MAX_ROUNDS
 from orbweaver.workspace import LocalWorkspace
 
 
@@ -172,7 +172,7 @@ def test_round_cap_is_safety_ceiling_not_compact_valve():
 async def test_fifty_reads_conclude_from_model_stop_not_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
     reads = [
-        SimpleNamespace(content=[_ToolUse("Read", {"path": "tiny.txt"}, uid=f"r{i}")])
+        SimpleNamespace(content=[_ToolUse("Read", {"path": f"tiny{i}.txt"}, uid=f"r{i}")])
         for i in range(50)
     ]
     client = _RecordingAnthropic(reads)

@@ -42,9 +42,89 @@ async def test_delete_tool_removes_file(tmp_path):
     sid = uuid4()
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     ws.write("src/a.py", "x")
-    result = await run_tools("Delete", {"path": "src/a.py"}, _ctx(store, ws, sid))
+    ctx = _ctx(store, ws, sid)
+    await run_tools("Read", {"path": "src/a.py"}, ctx)
+    result = await run_tools("Delete", {"path": "src/a.py"}, ctx)
     assert result.startswith("deleted")
     assert not (tmp_path / "src" / "a.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_tool_requires_prior_read(tmp_path):
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("src/a.py", "x")
+    result = await run_tools("Delete", {"path": "src/a.py"}, _ctx(store, ws, sid))
+    assert result == "error: src/a.py has not been read yet. Read it first before editing it."
+    assert (tmp_path / "src" / "a.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_tool_directory_skips_read_check(tmp_path):
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("pkg/a.py", "x")
+    result = await run_tools("Delete", {"path": "pkg"}, _ctx(store, ws, sid))
+    assert result.startswith("deleted")
+    assert not (tmp_path / "pkg").exists()
+
+
+@pytest.mark.asyncio
+async def test_write_unread_existing_file_refused(tmp_path):
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("src/a.py", "original\n")
+    result = await run_tools(
+        "Write", {"path": "src/a.py", "content": "clobbered\n"}, _ctx(store, ws, sid)
+    )
+    assert result == "error: src/a.py has not been read yet. Read it first before editing it."
+    assert (tmp_path / "src" / "a.py").read_text(encoding="utf-8") == "original\n"
+
+
+@pytest.mark.asyncio
+async def test_write_new_file_skips_read_check(tmp_path):
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    result = await run_tools(
+        "Write", {"path": "src/new.py", "content": "a\nb\n"}, _ctx(store, ws, sid)
+    )
+    assert result == "wrote src/new.py (new file, 2 lines)"
+    assert (tmp_path / "src" / "new.py").read_text(encoding="utf-8") == "a\nb\n"
+
+
+@pytest.mark.asyncio
+async def test_write_after_read_returns_diff_and_allows_rewrite(tmp_path):
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("src/a.py", "one\ntwo\n")
+    ctx = _ctx(store, ws, sid)
+    await run_tools("Read", {"path": "src/a.py"}, ctx)
+    result = await run_tools("Write", {"path": "src/a.py", "content": "one\nthree\n"}, ctx)
+    assert result.startswith("wrote src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n")
+    assert "\n-two\n+three" in result
+    # A successful Write refreshes the stamp: the next Write needs no re-read.
+    again = await run_tools("Write", {"path": "src/a.py", "content": "one\nfour\n"}, ctx)
+    assert again.startswith("wrote src/a.py\n")
+    assert (tmp_path / "src" / "a.py").read_text(encoding="utf-8") == "one\nfour\n"
+
+
+@pytest.mark.asyncio
+async def test_write_diff_is_capped(tmp_path):
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ws.write("big.txt", "\n".join(f"line {i}" for i in range(600)) + "\n")
+    ctx = _ctx(store, ws, sid)
+    await run_tools("Read", {"path": "big.txt"}, ctx)
+    content = "\n".join(f"LINE {i}" for i in range(600)) + "\n"
+    result = await run_tools("Write", {"path": "big.txt", "content": content}, ctx)
+    assert "[diff truncated;" in result
+    assert len(result.splitlines()) < 220
 
 
 @pytest.mark.asyncio
