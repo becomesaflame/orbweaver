@@ -35,6 +35,13 @@ class Settings(BaseSettings):
     orbweaver_sandbox_denied_domains: str = ""
     orbweaver_sandbox_network_default: str = ""
     orbweaver_sandbox_include_default_domains: str = ""
+    # Subagents: process-wide cap on concurrently running children, per-child
+    # defaults for wall time and tool rounds, and how long a finishing parent
+    # turn waits for background children it never collected.
+    orbweaver_max_concurrent_subagents: int = 4
+    orbweaver_subagent_timeout_s: float = 600.0
+    orbweaver_subagent_max_rounds: int = 24
+    orbweaver_subagent_grace_s: float = 30.0
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
     context_window: int = 200_000
