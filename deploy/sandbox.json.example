@@ -13,5 +13,8 @@
     "includeDefaults": true,
     "allow": [],
     "deny": []
+  },
+  "env": {
+    "allow": []
   }
 }

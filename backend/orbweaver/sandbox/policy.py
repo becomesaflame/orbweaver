@@ -107,6 +107,9 @@ class SandboxPolicy:
     # Keep .git/config writable inside the sandbox for `git remote set-url`
     # workflows. .git/hooks and .gitmodules stay read-only either way (#94).
     allow_git_config: bool = False
+    # Extra environment variable names/globs passed into the sandbox on top of
+    # DEFAULT_ENV_ALLOW. DEFAULT_ENV_EXCLUDE still wins (sandbox.json `env.allow`).
+    env_allow: tuple[str, ...] = ()
 
     def readwrite_roots(self, workspace_root: Path, tmp_dir: Path | None = None) -> tuple[Path, ...]:
         roots = [workspace_root.resolve()]
@@ -216,6 +219,10 @@ def _merge_file(
             allow_git_config = git_raw.strip().lower() in {"1", "true", "yes"}
         else:
             allow_git_config = bool(git_raw)
+    env_allow = list(policy.env_allow)
+    env_raw = data.get("env")
+    if isinstance(env_raw, dict):
+        env_allow = _merge_names(env_allow, env_raw.get("allow"))
     return replace(
         policy,
         additional_readonly=add_paths(policy.additional_readonly, "additionalReadonlyPaths"),
@@ -224,7 +231,22 @@ def _merge_file(
         allow_unix_sockets=add_paths(policy.allow_unix_sockets, "allowUnixSockets"),
         network=network,
         allow_git_config=allow_git_config,
+        env_allow=tuple(env_allow),
     )
+
+
+def _merge_names(current: list[str], extra: Any) -> list[str]:
+    items = extra or []
+    if isinstance(items, str):
+        items = _parse_list(items)
+    if not isinstance(items, list):
+        return current
+    out = list(current)
+    for item in items:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
 
 
 def _filter_sockets(paths: Iterable[Path]) -> tuple[Path, ...]:
@@ -300,6 +322,7 @@ def load_sandbox_policy(
     extra_socks = env_list("ORBWEAVER_SANDBOX_UNIX_SOCKETS", "orbweaver_sandbox_unix_sockets")
     extra_allow = env_list("ORBWEAVER_SANDBOX_ALLOWED_DOMAINS", "orbweaver_sandbox_allowed_domains")
     extra_deny_dom = env_list("ORBWEAVER_SANDBOX_DENIED_DOMAINS", "orbweaver_sandbox_denied_domains")
+    extra_env_allow = env_list("ORBWEAVER_SANDBOX_ENV_ALLOW", "orbweaver_sandbox_env_allow")
 
     paths_ro = list(policy.additional_readonly)
     paths_rw = list(policy.additional_readwrite)
@@ -355,6 +378,7 @@ def load_sandbox_policy(
             deny=tuple(deny_dom),
         ),
         allow_git_config=allow_git_config,
+        env_allow=tuple(_merge_names(list(policy.env_allow), extra_env_allow)),
     )
     policy = _with_hardcoded_denies(policy, home=home_dir, environ=env)
     deny = list(policy.deny_read)
