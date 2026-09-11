@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     # turn waits for background children it never collected.
     orbweaver_max_concurrent_subagents: int = 4
     orbweaver_subagent_timeout_s: float = 600.0
-    orbweaver_subagent_max_rounds: int = 24
+    orbweaver_subagent_max_rounds: int = 256
     orbweaver_subagent_grace_s: float = 30.0
     # bwrap hardening (issue #114). Limits apply to the sandboxed bash and its
     # children via ulimit; 0 disables a limit. seccomp: auto | on | off.

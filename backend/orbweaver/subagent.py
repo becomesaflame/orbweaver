@@ -30,7 +30,8 @@ except ImportError:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 CHILD_BLOCKED_TOOLS = frozenset({"SpawnSubagent", "SubagentWait", "AskUser", "ScheduleTask"})
-SUBAGENT_MAX_ROUNDS = 24
+# Independent of the parent turn. Do not share a small cap that starves both.
+SUBAGENT_MAX_ROUNDS = 256
 RESULT_TEXT_CAP = 8000
 # How long settle_children waits for a hard-cancelled child to finalize its events.
 CANCEL_FINALIZE_S = 5.0

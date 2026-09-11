@@ -76,7 +76,9 @@ from orbweaver.tooltext import format_read
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MAX_ROUNDS = 48
+# Safety ceiling only. Compact (and user Stop) are the context valve.
+# Do not treat this as a normal implement-turn budget.
+DEFAULT_MAX_ROUNDS = 256
 INTERRUPTED_BY_USER = "interrupted by user"
 LAST_ROUND_NUDGE = (
     "This is the last tool round of this turn. After these tool results, answer the user "
@@ -906,9 +908,10 @@ def static_system(channel: str = "") -> str:
         "claim. Do not git add -A if it would stage junk "
         "(.venv, .orbweaver-tmp). Never force-push main. Never rewrite history "
         "unless the user asked. "
-        "Finish with a user-visible answer "
-        "before the tool-round budget runs out; spawn a subagent for a long exploration "
-        "instead of burning parent rounds."
+        "Finish with a user-visible answer when the work is done. Compact is the "
+        "context valve; a high safety ceiling is not a reason to stop while still "
+        "making progress. Spawn a subagent for a long isolated exploration so the "
+        "parent transcript stays focused — the child has its own ceiling."
     )
 
 
