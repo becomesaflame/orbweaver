@@ -22,6 +22,7 @@ from orbweaver.sandbox.ssh import (
     resolv_conf_overlay_args,
     ssh_config_overlay_args,
     ssh_identity_bind_args,
+    ssh_private_identity_files,
 )
 
 log = logging.getLogger(__name__)
@@ -104,18 +105,40 @@ def sandbox_available() -> bool:
 
 
 def _deny_read_overlay_args(hidden: Path) -> list[str]:
-    """Hide an existing denyRead path. Skip missing ones: bwrap cannot mkdir on a ro-bind."""
+    """Hide an existing denyRead path. Skip missing ones: bwrap cannot mkdir on a ro-bind.
+
+    Directories get an empty ``--tmpfs``; files get ``/dev/null`` bound over them. bwrap
+    refuses to mount on a symlink ("Can't create file"), so a symlinked entry (dotfiles
+    manager) masks its resolved target instead; the link then points at the mask.
+    """
     try:
         if not hidden.exists():
             return []
-        dest = str(hidden)
-        if hidden.is_dir():
+        target = hidden.resolve() if hidden.is_symlink() else hidden
+        dest = str(target)
+        if target.is_dir():
             return ["--tmpfs", dest]
-        if hidden.is_file():
+        if target.is_file():
             return ["--ro-bind", "/dev/null", dest]
     except OSError:
         return []
     return []
+
+
+def deny_read_overlay_args(policy: SandboxPolicy) -> list[str]:
+    """bwrap mount args that mask every ``policy.deny_read`` entry that exists."""
+    args: list[str] = []
+    seen: set[str] = set()
+    for hidden in policy.deny_read:
+        chunk = _deny_read_overlay_args(hidden)
+        if not chunk:
+            continue
+        dest = chunk[-1]
+        if dest in seen:
+            continue
+        seen.add(dest)
+        args.extend(chunk)
+    return args
 
 
 def _dir_chain(path: Path) -> list[str]:
@@ -176,12 +199,16 @@ def build_bwrap_argv(
         )
     # After the host bind: a private /dev (so /dev/null is writable), /proc, and /tmp.
     argv.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
-    ensure_ssh_sandbox(tmp, proxied=not full_network)
+    private_keys = ssh_private_identity_files(ssh_policy=pol.ssh)
+    ensure_ssh_sandbox(tmp, proxied=not full_network, identity_files=private_keys)
     argv.extend(ssh_config_overlay_args(tmp))
     argv.extend(["--tmpfs", "/run"])
     if not _is_run_symlink():
         argv.extend(["--tmpfs", "/var/run"])
     argv.extend(resolv_conf_overlay_args(tmp))
+    # Credential masks first, then the allowlisted sockets and the ~/.ssh public files go
+    # back on top: an SSH_AUTH_SOCK under a hidden directory must survive the tmpfs.
+    argv.extend(deny_read_overlay_args(pol))
     seen_dirs: set[str] = set()
     for sock in pol.allow_unix_sockets:
         sock_p = Path(sock)
@@ -191,14 +218,16 @@ def build_bwrap_argv(
             seen_dirs.add(d)
             argv.extend(["--dir", d])
         argv.extend(["--ro-bind-try", str(sock_p), str(sock_p)])
-    for hidden in pol.deny_read:
-        argv.extend(_deny_read_overlay_args(hidden))
-    argv.extend(ssh_identity_bind_args())
+    argv.extend(ssh_identity_bind_args(ssh_policy=pol.ssh))
     for rw in pol.readwrite_roots(root, tmp):
         argv.extend(["--bind", str(rw), str(rw)])
     for rel in PROTECTED_WRITE_REL:
         protected = root / rel
         argv.extend(["--ro-bind-try", str(protected), str(protected)])
+    agent_sock = os.environ.get("SSH_AUTH_SOCK", "").strip()
+    if agent_sock and Path(agent_sock) in set(pol.allow_unix_sockets):
+        # Agent forwarding: ssh inside the sandbox signs through the host agent.
+        argv.extend(["--setenv", "SSH_AUTH_SOCK", agent_sock])
     argv.extend(["--setenv", "TMPDIR", str(tmp), "--chdir", str(root), "--", "bash", "-lc", command])
     return argv
 

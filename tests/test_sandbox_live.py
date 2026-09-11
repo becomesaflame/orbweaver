@@ -89,26 +89,57 @@ def test_full_network_can_resolve_github(live_root):
     assert "github.com" in out.lower() or "AddressFamily" in out
 
 
+def _bind_identities_policy(root):
+    """Operator opt-in (sandbox.json ``ssh.bindIdentities``): host IdentityFile keys are bound."""
+    from dataclasses import replace
+
+    from orbweaver.sandbox.policy import load_sandbox_policy
+    from orbweaver.sandbox.ssh import SshPolicy
+
+    return replace(load_sandbox_policy(root), ssh=SshPolicy(bind_identities=True))
+
+
 def test_sandboxed_ssh_uses_host_identity(live_root):
     from orbweaver.sandbox.ssh import ssh_private_identity_files
 
-    keys = ssh_private_identity_files()
+    policy = _bind_identities_policy(live_root)
+    keys = ssh_private_identity_files(ssh_policy=policy.ssh)
     if not keys:
         pytest.skip("no host SSH identity file")
-    out = run_sandboxed("ssh -G github.com", live_root, timeout=15)
+    out = run_sandboxed("ssh -G github.com", live_root, timeout=15, policy=policy)
     assert any(key.name in out for key in keys)
+
+
+def test_sandboxed_ssh_default_policy_hides_private_keys(live_root):
+    """Issue #95: without bindIdentities no private key is visible; public files are."""
+    import os
+
+    from orbweaver.sandbox.ssh import SshPolicy, ssh_private_identity_files, ssh_public_files
+
+    keys = ssh_private_identity_files(ssh_policy=SshPolicy(bind_identities=True))
+    if not keys:
+        pytest.skip("no host SSH identity file")
+    ssh_dir = os.path.expanduser("~/.ssh")
+    out = run_sandboxed(f"ls -A {ssh_dir}", live_root, timeout=15)
+    listed = set(out.split())
+    for key in keys:
+        assert key.name not in listed, out
+    for public in ssh_public_files():
+        assert public.name in listed, out
 
 
 def test_sandboxed_git_ls_remote_github(live_root):
     """Production orbweaver2: git clone git@github.com:… over sandboxed ssh."""
     from orbweaver.sandbox.ssh import ssh_private_identity_files
 
-    if not ssh_private_identity_files():
+    policy = _bind_identities_policy(live_root)
+    if not ssh_private_identity_files(ssh_policy=policy.ssh):
         pytest.skip("no host SSH identity file")
     out = run_sandboxed(
         "git ls-remote git@github.com:becomesaflame/orbweaver.git",
         live_root,
         timeout=45,
+        policy=policy,
     )
     assert "Could not resolve hostname" not in out
     assert "Bad owner or permissions" not in out
