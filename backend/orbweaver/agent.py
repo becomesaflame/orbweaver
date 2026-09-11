@@ -37,6 +37,7 @@ from orbweaver.compact.overflow import (
 )
 from orbweaver.compact.project import INTERRUPTED_TOOL
 from orbweaver.config import settings
+from orbweaver.hooks import apply_post_tool_use, hook_cancel_abort, run_pre_tool_use
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
 from orbweaver.instructions import instruction_blocks_for_call, seen_instruction_keys
 from orbweaver.lints import read_lints
@@ -928,6 +929,20 @@ def build_agent_system(
         {"type": "text", "text": static_system(channel), "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": rest},
     ]
+
+
+async def preflight_tool(
+    name: str, inp: dict[str, Any], ctx: dict[str, Any]
+) -> tuple[dict[str, Any], PermissionDecision]:
+    """PreToolUse hooks, then the permission gate. Raises TurnAborted on cancel."""
+    pre = await run_pre_tool_use(name, inp, ctx)
+    if pre.action == "cancel":
+        raise hook_cancel_abort(name, pre.tool_input, pre.reason)
+    if pre.action == "deny":
+        return pre.tool_input, PermissionDecision(
+            "deny", pre.reason or "denied by PreToolUse hook", "hook"
+        )
+    return pre.tool_input, await can_use_tool(name, pre.tool_input, ctx)
 
 
 def _tool_call_summary(name: str, inp: Any) -> str:
@@ -1924,6 +1939,8 @@ async def agent_turn(
         for body in collect_finished(ctx):
             fire(await store.append_event(session_id, "subagent_result", body))
     tool_slots = asyncio.Semaphore(max(1, int(settings.orbweaver_max_parallel_tools)))
+    # tool_use id -> input after PreToolUse hooks; what was gated, shown, and run.
+    inputs: dict[str, dict[str, Any]] = {}
 
     async def run_allowed_tool(block: Any, inp: dict[str, Any]) -> _ToolOutcome:
         """Run one permitted tool_use with the given input and probe its output."""
@@ -1933,6 +1950,7 @@ async def agent_turn(
             return _ToolOutcome("error: question is required")
         async with tool_slots:
             raw = await run_tools(block.name, inp, ctx)
+        raw = await apply_post_tool_use(block.name, inp, raw, ctx)
         text, persisted_path = persist_tool_result(workspace, str(block.id), block.name, raw)
         # Probes run after the round, concurrently (see launch_probes); a flagged
         # result gets its warning via an injection_warning event.
@@ -1940,20 +1958,24 @@ async def agent_turn(
             round_probes.append(ProbeItem(str(block.id), block.name, text))
         return _ToolOutcome(text, persisted_path)
 
-    async def execute_tool(block: Any, decision: PermissionDecision) -> _ToolOutcome:
+    async def execute_tool(
+        block: Any, decision: PermissionDecision, inp: dict[str, Any] | None = None
+    ) -> _ToolOutcome:
         """Fast path: run an allowed tool_use; blocked (deny / unheld ask) calls get the gate text."""
         if decision.behavior != "allow":
             return _ToolOutcome(_blocked_tool_result(decision), is_error=True, executed=False)
-        return await run_allowed_tool(block, dict(block.input))
+        return await run_allowed_tool(block, dict(block.input) if inp is None else dict(inp))
 
-    async def hold_for_approval(block: Any, decision: PermissionDecision) -> _ToolOutcome:
+    async def hold_for_approval(
+        block: Any, decision: PermissionDecision, inp: dict[str, Any] | None = None
+    ) -> _ToolOutcome:
         """Hold an ask-gated tool_use until the user answers, then run exactly what they saw.
 
         Records permission_request / permission_response (and permission_rule_added
         for allow-for-session). Deny, timeout and cancel return the gate text as an
         is_error result without running the tool.
         """
-        recorded_input = dict(block.input)
+        recorded_input = dict(block.input) if inp is None else dict(inp)
         pend = PendingApproval(
             session_id=session_id,
             tool_use_id=str(block.id),
@@ -2094,7 +2116,9 @@ async def agent_turn(
         if block.name == "ScheduleTask" and outcome.executed:
             fire(
                 await store.append_event(
-                    session_id, "schedule_request", {"input": dict(block.input)}
+                    session_id,
+                    "schedule_request",
+                    {"input": inputs.get(str(block.id), dict(block.input))},
                 )
             )
 
@@ -2209,7 +2233,7 @@ async def agent_turn(
                     fire(call_ev)
                 ctx["events"] = await store.list_events(session_id)
                 verdicts = await asyncio.gather(
-                    *(can_use_tool(b.name, dict(b.input), ctx) for b in batch),
+                    *(preflight_tool(b.name, dict(b.input), ctx) for b in batch),
                     return_exceptions=True,
                 )
                 decisions: list[PermissionDecision] = []
@@ -2230,7 +2254,9 @@ async def agent_turn(
                         return produced
                     if isinstance(verdict, BaseException):
                         raise verdict
-                    decisions.append(verdict)
+                    tool_input, decision = verdict
+                    inputs[str(block.id)] = tool_input
+                    decisions.append(decision)
                     fire(
                         await store.append_event(
                             session_id,
@@ -2238,16 +2264,16 @@ async def agent_turn(
                             {
                                 "tool_use_id": block.id,
                                 "name": block.name,
-                                "behavior": verdict.behavior,
-                                "reason": verdict.reason,
-                                "fast_path": verdict.fast_path,
+                                "behavior": decision.behavior,
+                                "reason": decision.reason,
+                                "fast_path": decision.fast_path,
                             },
                         )
                     )
                 # AskUser is never concurrency-safe, so it is always a batch of one.
                 if len(batch) == 1 and batch[0].name == "AskUser" and decisions[0].behavior == "allow":
                     block = batch[0]
-                    question = str(dict(block.input).get("question") or "").strip()
+                    question = str(inputs[str(block.id)].get("question") or "").strip()
                     if question and not can_wait_for_user(ctx):
                         await record_abort(_ask_user_headless_abort(question))
                         return produced
@@ -2272,10 +2298,10 @@ async def agent_turn(
                     for block, decision in zip(batch, decisions, strict=True):
                         check()
                         if decision.behavior == "ask":
-                            outcome = await hold_for_approval(block, decision)
+                            outcome = await hold_for_approval(block, decision, inputs[str(block.id)])
                         else:
                             try:
-                                outcome = await execute_tool(block, decision)
+                                outcome = await execute_tool(block, decision, inputs[str(block.id)])
                             except ToolInterrupted as e:
                                 await record_interrupted(block, e)
                                 raise TurnCancelled(produced) from e
@@ -2284,7 +2310,7 @@ async def agent_turn(
                         await record_result(block, outcome)
                         if outcome.executed:
                             instruction_blocks.extend(
-                                _nested_instructions_for(workspace, block.name, dict(block.input), ctx)
+                                _nested_instructions_for(workspace, block.name, inputs[str(block.id)], ctx)
                             )
                         if outcome.approval == "cancelled":
                             # The is_error result is on record; now stop like any other cancel.
@@ -2297,7 +2323,7 @@ async def agent_turn(
                         break
                     continue
                 outcomes = await asyncio.gather(
-                    *(execute_tool(b, d) for b, d in zip(batch, decisions, strict=True)),
+                    *(execute_tool(b, d, inputs[str(b.id)]) for b, d in zip(batch, decisions, strict=True)),
                     return_exceptions=True,
                 )
                 for block, got in zip(batch, outcomes, strict=True):
@@ -2310,7 +2336,7 @@ async def agent_turn(
                         raise got
                     if got.executed:
                         instruction_blocks.extend(
-                            _nested_instructions_for(workspace, block.name, dict(block.input), ctx)
+                            _nested_instructions_for(workspace, block.name, inputs[str(block.id)], ctx)
                         )
                     if decision.behavior == "ask":
                         # The pipeline aborts headless asks before this; an ask that

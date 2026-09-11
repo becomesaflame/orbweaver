@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     orbweaver_mcp_auto_allow_readonly: bool = True
     # Concurrency-safe tool calls from one assistant round that may run at once.
     orbweaver_max_parallel_tools: int = 8
+    orbweaver_hooks_config: str = ""
     orbweaver_sandbox_additional_readonly: str = ""
     orbweaver_sandbox_additional_readwrite: str = ""
     orbweaver_sandbox_deny_read: str = ""

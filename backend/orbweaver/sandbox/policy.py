@@ -62,6 +62,7 @@ def default_journal_sockets(uid: int | None = None) -> tuple[Path, ...]:
 PROTECTED_WRITE_REL: tuple[str, ...] = (
     ".orbweaver/sandbox.json",
     ".orbweaver/mcp.json",
+    ".orbweaver/hooks.json",
 )
 
 
@@ -624,4 +625,6 @@ def load_sandbox_policy(
     deny = list(policy.deny_read)
     deny.append(home_dir / ".orbweaver" / "mcp.json")
     deny.append(root / ".orbweaver" / "mcp.json")
+    deny.append(home_dir / ".orbweaver" / "hooks.json")
+    deny.append(root / ".orbweaver" / "hooks.json")
     return replace(policy, deny_read=tuple(_unique_paths(deny)))
