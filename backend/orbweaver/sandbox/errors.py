@@ -39,6 +39,17 @@ def network_denied(host: str) -> str:
     )
 
 
+def web_egress_denied(detail: str) -> str:
+    """WebFetch/Browser denial. There is no permissions override for these tools."""
+    return sandbox_denied(
+        "network",
+        detail,
+        "WebFetch and Browser cannot reach loopback, LAN, or link-local addresses; "
+        "other hosts follow the sandbox networkPolicy (allow/deny/webDefault). "
+        "Do not retry the same target",
+    )
+
+
 def unix_socket_denied(path: str) -> str:
     return sandbox_denied(
         "unix_socket",

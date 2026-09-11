@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     orbweaver_sandbox_allowed_domains: str = ""
     orbweaver_sandbox_denied_domains: str = ""
     orbweaver_sandbox_network_default: str = ""
+    orbweaver_sandbox_web_network_default: str = ""
     orbweaver_sandbox_include_default_domains: str = ""
     # bwrap hardening (issue #114). Limits apply to the sandboxed bash and its
     # children via ulimit; 0 disables a limit. seccomp: auto | on | off.

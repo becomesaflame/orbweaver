@@ -15,6 +15,7 @@
   "allowGitConfig": false,
   "networkPolicy": {
     "default": "deny",
+    "webDefault": "allow",
     "includeDefaults": true,
     "allow": [],
     "deny": []
