@@ -14,6 +14,19 @@ class Settings(BaseSettings):
     orbweaver_model: str = "claude-sonnet-4-6"
     orbweaver_classifier_model: str = "claude-sonnet-4-6"
     orbweaver_injection_probe_model: str = "claude-haiku-4-5"
+    # off | scoped | all. scoped skips in-project Read/Grep/Glob/WorkspaceSearch and
+    # benign Bash; all probes every eligible result (pre-0.33.22 behaviour).
+    orbweaver_injection_probe_mode: str = "scoped"
+    # Comma-separated dirs (relative to a project root) whose files are untrusted
+    # even inside the project. "$defaults" expands to the built-in list.
+    orbweaver_injection_probe_skip_dirs: str = "$defaults"
+    # ';'- or newline-separated regexes. Bash whose command matches is probed.
+    orbweaver_injection_probe_bash_network: str = "$defaults"
+    # ';'- or newline-separated regexes. Output matching any of these is probed
+    # regardless of tool or path (cheap prefilter for instruction-like phrasing).
+    orbweaver_injection_probe_prefilter: str = "$defaults"
+    # Seconds the next LLM call waits for a round's probes before proceeding.
+    orbweaver_injection_probe_budget_s: float = 3.0
     orbweaver_permission_mode: str = "auto"
     orbweaver_permission_deny: str = ""
     orbweaver_permission_ask: str = ""

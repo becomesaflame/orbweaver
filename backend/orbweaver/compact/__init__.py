@@ -19,8 +19,11 @@ from orbweaver.compact.project import (
 )
 from orbweaver.compact.rehydrate import rehydrate_messages
 from orbweaver.compact.usage import (
+    ProbeStats,
     estimate_prompt_tokens,
     event_token_count,
+    probe_stats,
+    record_probe_usage,
     record_usage,
     reset_compact_state,
     usage_input_tokens,
@@ -29,6 +32,7 @@ from orbweaver.compact.usage import (
 __all__ = [
     "CONTEXT_FULL_MESSAGE",
     "ContextFullError",
+    "ProbeStats",
     "choose_keep_from_recent_rounds",
     "ensure_tool_use_results",
     "estimate_prompt_tokens",
@@ -41,7 +45,9 @@ __all__ = [
     "microcompact_events",
     "overflow_compact_budget",
     "persist_tool_result",
+    "probe_stats",
     "prompt_events",
+    "record_probe_usage",
     "record_usage",
     "rehydrate_messages",
     "reset_compact_state",
