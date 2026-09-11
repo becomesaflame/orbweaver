@@ -16,6 +16,7 @@ _SAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
 _sessions: dict[str, StdioMcpSession] = {}
 _tool_index: dict[str, tuple[str, str]] = {}
+_tool_read_only: dict[str, bool] = {}
 _loaded_fp = ""
 
 
@@ -24,6 +25,7 @@ async def reset_mcp_sessions() -> None:
     global _loaded_fp
     _loaded_fp = ""
     _tool_index.clear()
+    _tool_read_only.clear()
     sessions = list(_sessions.values())
     _sessions.clear()
     for session in sessions:
@@ -69,6 +71,23 @@ def _anthropic_schema(tool: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
+def tool_annotation_read_only(tool: dict[str, Any]) -> bool:
+    """True when a tools/list entry carries ``annotations.readOnlyHint: true``."""
+    annotations = tool.get("annotations")
+    if not isinstance(annotations, dict):
+        return False
+    return annotations.get("readOnlyHint") is True
+
+
+def mcp_tool_read_only(name: str) -> bool:
+    """Whether an exposed ``mcp_<server>_<tool>`` name was listed as read-only.
+
+    Unknown or not-yet-listed tools are not read-only; the agent treats them as
+    unsafe to run concurrently.
+    """
+    return _tool_read_only.get(name, False)
+
+
 async def mcp_tool_specs(workspace=None, *, config: McpConfig | None = None) -> list[dict[str, Any]]:
     """List configured MCP tools as Anthropic Messages API tool objects."""
     cfg = config if config is not None else _config_for(workspace)
@@ -91,6 +110,7 @@ async def mcp_tool_specs(workspace=None, *, config: McpConfig | None = None) -> 
                 exposed = f"{exposed[:60]}_{len(used)}"
             used.add(exposed)
             _tool_index[exposed] = (spec.name, original)
+            _tool_read_only[exposed] = tool_annotation_read_only(tool)
             desc = str(tool.get("description") or original or "MCP tool")
             specs.append(
                 {

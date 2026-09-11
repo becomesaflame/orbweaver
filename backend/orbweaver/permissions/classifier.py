@@ -85,7 +85,7 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
         return {"id": inp.get("id"), "depth": inp.get("depth")}
     if name == "SpawnSubagent":
         return {"task": inp.get("task"), "type": inp.get("type") or inp.get("role")}
-    if name in {"Glob", "Grep", "AskUser", "TodoWrite", "Skill"}:
+    if name in {"Glob", "Grep", "AskUser", "TodoWrite", "Skill", "SubagentWait"}:
         return ""
     return inp
 
