@@ -15,6 +15,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from orbweaver.config import settings
+from orbweaver.editmatch import TIER_EXACT, find_replacement, nearest_lines, unified_diff
 from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
 from orbweaver.tooltext import normalize_grep_pattern
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
@@ -274,10 +275,35 @@ class LocalWorkspace:
     def read(self, path: str) -> str:
         return self._resolve(path).read_text(encoding="utf-8")
 
+    def edit_target(self, path: str) -> Path:
+        """Resolved path an edit tool would touch (write-side policy applied)."""
+        return self._resolve(path, write=True)
+
+    def read_target(self, path: str) -> Path:
+        return self._resolve(path)
+
     def write(self, path: str, content: str) -> None:
         p = self._resolve(path, write=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
+
+    def write_with_diff(self, path: str, content: str) -> str:
+        """Write and describe the change: a unified diff for existing files."""
+        p = self._resolve(path, write=True)
+        before: str | None = None
+        if p.is_file():
+            try:
+                before = p.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                before = None
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        line_count = len(content.splitlines())
+        if before is None:
+            return f"wrote {path} (new file, {line_count} lines)"
+        if before == content:
+            return f"wrote {path} (unchanged)"
+        return f"wrote {path}\n{unified_diff(before, content, path)}"
 
     def str_replace(
         self, path: str, old: str, new: str, *, replace_all: bool = False
@@ -288,18 +314,25 @@ class LocalWorkspace:
         if not target.is_file():
             return f"error: file not found: {path}"
         current = target.read_text(encoding="utf-8")
-        n = current.count(old)
-        if n == 0:
-            return f"error: old_string not found in {path}"
+        match = find_replacement(current, old, new)
+        if match is None:
+            msg = f"error: old_string not found in {path}"
+            near = nearest_lines(current, old)
+            if near:
+                msg += ". Nearest lines:\n" + "\n".join(near)
+            return msg
+        n = match.count
+        via = "" if match.tier == TIER_EXACT else f" via {match.tier}"
         if n > 1 and not replace_all:
+            where = ", ".join(str(s.line) for s in match.spans[:10])
             return (
-                f"error: old_string matched {n} times in {path}; "
+                f"error: old_string matched {n} times in {path}{via} (lines {where}); "
                 "include more surrounding context for a unique match, or set replace_all true"
             )
-        updated = current.replace(old, new) if replace_all else current.replace(old, new, 1)
+        updated = match.apply(current, replace_all=replace_all)
         target.write_text(updated, encoding="utf-8")
         noun = "occurrence" if n == 1 else "occurrences"
-        return f"updated {path} ({n} {noun})"
+        return f"updated {path} ({n} {noun}{via})\n{unified_diff(current, updated, path)}"
 
     def write_bytes(self, path: str, data: bytes) -> str:
         p = self._resolve(path, write=True)

@@ -37,6 +37,7 @@ from orbweaver.lints import read_lints
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
+from orbweaver.readstate import ReadState, read_state_for
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.todos import inject_session_todos, persist_todos
@@ -98,7 +99,13 @@ TOOL_SPEC = [
     },
     {
         "name": "Write",
-        "description": "Write a file in the session workspace.",
+        "description": (
+            "Write a file in the session workspace. Overwriting an existing file "
+            "requires that you Read it earlier this session and that it has not "
+            "changed on disk since; otherwise the call is refused and you must Read "
+            "first. New files skip that check. The result is a unified diff for "
+            "existing files. Prefer StrReplace for partial edits."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
@@ -109,10 +116,16 @@ TOOL_SPEC = [
         "name": "StrReplace",
         "description": (
             "Edit an existing workspace file by replacing old_string with new_string. "
-            "old_string must match exactly once unless replace_all is true. Prefer this "
-            "over Write for existing files and over Bash (python, sed, perl) for source "
-            "edits. To resolve a git conflict, replace the entire hunk including "
-            "<<<<<<< / ======= / >>>>>>> marker lines with the resolved text."
+            "Read the file first: edits to a file you have not Read this session, or "
+            "that changed on disk since you read it, are refused. old_string must "
+            "match exactly once unless replace_all is true. When no exact match exists "
+            "the tool retries with line-number prefixes stripped, then a per-line "
+            "whitespace-trimmed match (the file's indentation is kept), then a "
+            "first/last-line anchor for blocks of 3+ lines; the result says which tier "
+            "matched and shows a unified diff. Prefer this over Write for existing "
+            "files and over Bash (python, sed, perl) for source edits. To resolve a git "
+            "conflict, replace the entire hunk including <<<<<<< / ======= / >>>>>>> "
+            "marker lines with the resolved text."
         ),
         "input_schema": {
             "type": "object",
@@ -132,7 +145,8 @@ TOOL_SPEC = [
         "name": "NotebookEdit",
         "description": (
             "Edit one cell in a .ipynb notebook. Do not Write the whole notebook JSON. "
-            "action is replace (default), insert, or delete. replace can set source or "
+            "Read the notebook first this session or the edit is refused. action is "
+            "replace (default), insert, or delete. replace can set source or "
             "search-replace with old_string/new_string."
         ),
         "input_schema": {
@@ -158,7 +172,8 @@ TOOL_SPEC = [
         "description": (
             "Delete a file or directory in the session working set. Same deny/ask rules as "
             "Write: always-deny secrets (.env, keys), and paths outside the working set are "
-            "blocked. Prefer this over Bash rm."
+            "blocked. Deleting a file requires that you Read it this session. Prefer this "
+            "over Bash rm."
         ),
         "input_schema": {
             "type": "object",
@@ -676,7 +691,9 @@ def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dic
 def static_system(channel: str = "") -> str:
     write_line = (
         "In auto mode, in-project Write and StrReplace apply immediately. "
-        "Prefer StrReplace for existing files. "
+        "Prefer StrReplace for existing files. Read a file before you edit it: "
+        "Write, StrReplace, NotebookEdit and Delete refuse existing files you have "
+        "not Read this session or that changed since. "
     )
     if channel_allows_proposepatch(channel):
         write_line += "Prefer ProposePatch when a visible diff overlay helps the user. "
@@ -789,6 +806,55 @@ def _ask_user_headless_abort(question: str) -> TurnAborted:
     )
 
 
+def _read_state(ctx: dict[str, Any], ws: Any) -> ReadState | None:
+    """Session ReadState (seeded from events once); None when tracking is off."""
+    if not settings.edit_require_read or not hasattr(ws, "edit_target"):
+        return None
+    state = ctx.get("read_state")
+    if not isinstance(state, ReadState):
+        state = read_state_for(ctx["session_id"])
+        ctx["read_state"] = state
+    state.seed(ctx.get("events"), ws.read_target)
+    return state
+
+
+def _edit_guard(ctx: dict[str, Any], ws: Any, path: str) -> str | None:
+    """Error text when ``path`` exists but was not Read this session or changed since."""
+    state = _read_state(ctx, ws)
+    if state is None:
+        return None
+    try:
+        target = ws.edit_target(path)
+    except PermissionError:
+        return None  # the tool itself reports the policy error
+    problem = state.check(target, path)
+    return f"error: {problem}" if problem else None
+
+
+def _note_edit(ctx: dict[str, Any], ws: Any, path: str, *, deleted: bool = False) -> None:
+    state = _read_state(ctx, ws)
+    if state is None:
+        return
+    try:
+        target = ws.edit_target(path)
+    except PermissionError:
+        return
+    if deleted:
+        state.forget(target)
+    else:
+        state.record(target)
+
+
+def _note_read(ctx: dict[str, Any], ws: Any, path: str) -> None:
+    state = _read_state(ctx, ws)
+    if state is None:
+        return
+    try:
+        state.record(ws.read_target(path))
+    except PermissionError:
+        return
+
+
 async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     ws = ctx["workspace"]
     store: Store = ctx["store"]
@@ -801,29 +867,59 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             raw = ws.read(path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
+        _note_read(ctx, ws, path)
         return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
-        ws.write(inp["path"], inp["content"])
-        return f"wrote {inp['path']}"
+        path = str(inp.get("path") or "")
+        refused = _edit_guard(ctx, ws, path)
+        if refused:
+            return refused
+        if hasattr(ws, "write_with_diff"):
+            result = ws.write_with_diff(path, inp["content"])
+        else:
+            ws.write(path, inp["content"])
+            result = f"wrote {path}"
+        _note_edit(ctx, ws, path)
+        return result
     if name == "StrReplace":
+        path = str(inp.get("path") or "")
         try:
-            return ws.str_replace(
-                str(inp.get("path") or ""),
+            refused = _edit_guard(ctx, ws, path)
+            if refused:
+                return refused
+            result = ws.str_replace(
+                path,
                 str(inp.get("old_string") or ""),
                 str(inp.get("new_string") if inp.get("new_string") is not None else ""),
                 replace_all=bool(inp.get("replace_all")),
             )
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error replacing in {inp.get('path')}: {e}"
+        if result.startswith("updated"):
+            _note_edit(ctx, ws, path)
+        return result
     if name == "NotebookEdit":
         from orbweaver.notebook import apply_notebook_edit
 
-        return apply_notebook_edit(ws, inp)
+        path = str(inp.get("path") or "")
+        refused = _edit_guard(ctx, ws, path)
+        if refused:
+            return refused
+        result = apply_notebook_edit(ws, inp)
+        if not result.startswith("error"):
+            _note_edit(ctx, ws, path)
+        return result
     if name == "Delete":
+        path = str(inp.get("path") or "")
         try:
-            return ws.delete(inp["path"])
+            refused = _edit_guard(ctx, ws, path)
+            if refused:
+                return refused
+            result = ws.delete(path)
         except (OSError, PermissionError) as e:
             return f"error deleting {inp.get('path')}: {e}"
+        _note_edit(ctx, ws, path, deleted=True)
+        return result
     if name == "ProposePatch":
         result = ws.propose_patch(inp["path"], inp.get("old_string") or "", inp["new_string"])
         return json.dumps(result)[:200_000]
