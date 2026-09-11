@@ -126,11 +126,28 @@
     #composer-hint { padding:0 1rem 0.75rem; font-size:0.75rem; color:var(--muted); min-height:1.15rem; }
     .msg.injected { border-left-color:#8aa0c8; }
     .msg.ask { border-left-color:#8aa0c8; }
+    .msg.permission { border-left-color:#d9a441; }
+    .msg.permission .perm-title { font-weight:600; }
+    .msg.permission .perm-summary {
+      font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:0.82rem;
+      background:#1f1f1f; border-radius:6px; padding:0.35rem 0.5rem; margin:0.35rem 0;
+      white-space:pre-wrap; word-break:break-word;
+    }
+    .msg.permission .perm-reason { color:var(--muted); font-size:0.8rem; }
+    .msg.permission .perm-outcome { margin-top:0.35rem; font-size:0.85rem; color:#cfcfcf; }
+    .msg.permission.resolved { opacity:0.85; }
+    .msg.permission .perm-actions button { border:1px solid var(--line); }
+    .msg.permission .perm-actions button.allow { color:#8fd18f; }
+    .msg.permission .perm-actions button.deny { color:#e08a8a; }
     .msg-actions { display:flex; gap:0.25rem; margin-top:0.4rem; }
     .msg-actions button {
       font-size:0.75rem; color:var(--muted); padding:0.12rem 0.45rem; border-radius:6px;
     }
     .msg-actions button:hover { color:var(--ink); }
+    .msg-actions .restore-files {
+      display:flex; align-items:center; gap:0.25rem; font-size:0.75rem; color:var(--muted); cursor:pointer;
+    }
+    .msg.checkpoint { border-left-color:#8ac8a0; }
     .btn-new.secondary {
       background:transparent; color:var(--ink); border:1px solid var(--line); font-weight:600;
     }
@@ -178,6 +195,148 @@
     .msg.working, .msg.stopped {
       color:var(--muted); font-style:italic; background:transparent; border-left-color:#555;
     }
+    .msg.working .msg-role, .msg.stopped .msg-role { display:none; }
+    .msg-role {
+      font-size:0.7rem; letter-spacing:0.04em; text-transform:uppercase; color:var(--muted);
+      margin-bottom:0.25rem; font-weight:600;
+    }
+    .msg.user .msg-role { color:var(--accent); }
+    .msg.assistant .msg-role { color:#c4a574; }
+
+    /* Markdown bodies */
+    .msg-body.md { white-space:normal; overflow-wrap:anywhere; }
+    .md > :first-child { margin-top:0; }
+    .md > :last-child { margin-bottom:0; }
+    .md p, .md ul, .md ol, .md blockquote, .md table { margin:0.45rem 0; }
+    .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin:0.8rem 0 0.35rem; line-height:1.25; font-weight:650; }
+    .md h1 { font-size:1.25rem; } .md h2 { font-size:1.12rem; } .md h3 { font-size:1.02rem; }
+    .md h4, .md h5, .md h6 { font-size:0.95rem; }
+    .md ul, .md ol { padding-left:1.4rem; }
+    .md li + li { margin-top:0.15rem; }
+    .md a { color:#9dc3ff; }
+    .md code {
+      font: 0.86em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background:#0d0d0d; border:1px solid var(--line); border-radius:4px; padding:0.05rem 0.3rem;
+    }
+    .md pre { margin:0; padding:0.6rem 0.7rem; overflow-x:auto; background:#0d0d0d; }
+    .md pre code { background:transparent; border:0; padding:0; font-size:0.82rem; white-space:pre; }
+    .codeblock { margin:0.5rem 0; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:#0d0d0d; }
+    .code-bar {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:0.15rem 0.35rem 0.15rem 0.7rem; background:#181818; border-bottom:1px solid var(--line);
+      font-size:0.7rem; color:var(--muted);
+    }
+    .copy-btn { font-size:0.7rem; padding:0.1rem 0.45rem; color:var(--muted); border-radius:5px; }
+    .copy-btn:hover { color:var(--ink); }
+    .md blockquote { border-left:3px solid #444; margin-left:0; padding:0.1rem 0.8rem; color:#bbb; }
+    .md table { border-collapse:collapse; display:block; overflow-x:auto; max-width:100%; }
+    .md th, .md td { border:1px solid var(--line); padding:0.25rem 0.55rem; text-align:left; }
+    .md th { background:#181818; }
+    .md img { max-width:100%; border-radius:6px; }
+    .md hr { border:0; border-top:1px solid var(--line); margin:0.8rem 0; }
+    .md input[type="checkbox"] { margin-right:0.35rem; }
+
+    /* Tool cards */
+    .msg.card { padding:0; overflow:hidden; color:#ccc; font-size:0.85rem; }
+    .msg.card.warned { border-left-color:#d9a441; }
+    .msg.card.subagent { border-left-color:#8aa0c8; }
+    .card-head {
+      width:100%; display:flex; align-items:center; gap:0.5rem;
+      padding:0.5rem 0.7rem; border-radius:0; color:#ddd; font-size:0.85rem;
+    }
+    .card-head:hover { background:var(--hover); }
+    .tool-icon { flex:none; width:1.2rem; text-align:center; font-size:0.95rem; }
+    .tool-name { flex:none; font-weight:650; color:#eee; }
+    .tool-summary {
+      flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+      color:#aaa; font: 0.8rem/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .card-head .chev { flex:none; color:var(--muted); width:0.8rem; text-align:center; }
+    .chip {
+      flex:none; font-size:0.66rem; letter-spacing:0.04em; text-transform:uppercase; font-weight:650;
+      padding:0.1rem 0.45rem; border-radius:999px; border:1px solid transparent;
+    }
+    .chip.running { color:#9dc3ff; border-color:#33507a; background:#16233a; animation:pulse 1.4s ease-in-out infinite; }
+    .chip.waiting { color:#c9b3ff; border-color:#5a4a86; background:#241f3a; }
+    .chip.done { color:#a9d6b4; border-color:#3a5c42; background:#182a1d; }
+    .chip.error { color:#ff9f9f; border-color:#7a3333; background:#3a1616; }
+    .chip.blocked { color:#f2c069; border-color:#7a5a1e; background:#3a2c10; }
+    .chip.stopped { color:#bbb; border-color:#444; background:#222; }
+    @keyframes pulse { 0%, 100% { opacity:1; } 50% { opacity:0.55; } }
+    .card-body { border-top:1px solid var(--line); padding:0.55rem 0.75rem 0.65rem; display:flex; flex-direction:column; gap:0.5rem; }
+    .card-body.hidden { display:none; }
+    .card-body > div:empty, .card-body > pre:empty { display:none; }
+    .card-input, .tool-output {
+      margin:0; font: 0.8rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space:pre-wrap; overflow-wrap:anywhere; background:#0d0d0d; border:1px solid var(--line);
+      border-radius:6px; padding:0.5rem 0.6rem; max-height:26rem; overflow:auto; color:#d6d6d6;
+    }
+    .card-out { display:flex; flex-direction:column; gap:0.4rem; }
+    .card-out img.tool-image { max-width:min(100%, 40rem); border-radius:6px; border:1px solid var(--line); }
+    .card-perm { font-size:0.78rem; color:var(--muted); }
+    .card-perm[data-behavior="deny"], .card-perm[data-behavior="ask"] { color:#f2c069; }
+    .card-warn {
+      font-size:0.8rem; color:#f2c069; background:#3a2c10; border:1px solid #7a5a1e;
+      border-radius:6px; padding:0.35rem 0.55rem;
+    }
+    .card-persist { font-size:0.78rem; color:var(--muted); display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap; }
+    .card-persist code { font-size:0.78rem; color:#ccc; background:#0d0d0d; padding:0.05rem 0.3rem; border-radius:4px; }
+    .card-note { font-size:0.78rem; color:var(--muted); }
+    .out-more { font-size:0.75rem; color:var(--muted); font-style:italic; }
+    .msg.tool.error { border-left-color:#c05050; color:#f0b0b0; }
+    .msg.tool.note { color:var(--muted); font-size:0.8rem; }
+    .msg.event { padding:0.35rem 0.75rem; }
+    .msg.event summary { cursor:pointer; color:var(--muted); font-size:0.8rem; }
+    .msg.event pre { font-size:0.78rem; white-space:pre-wrap; overflow-wrap:anywhere; margin:0.35rem 0 0; color:#bbb; }
+
+    /* Diffs */
+    .diff { border:1px solid var(--line); border-radius:6px; overflow:hidden; background:#0d0d0d; }
+    .diff-head {
+      display:flex; align-items:center; gap:0.6rem; padding:0.25rem 0.6rem;
+      background:#181818; border-bottom:1px solid var(--line); font-size:0.75rem; color:#bbb;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .diff-head .add { color:#8fd19e; } .diff-head .del { color:#f19a9a; }
+    .diff-body { margin:0; padding:0.3rem 0; max-height:26rem; overflow:auto; font: 0.78rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .dl { display:flex; white-space:pre-wrap; overflow-wrap:anywhere; padding:0 0.6rem 0 0; }
+    .dl .dm { flex:none; width:1.4rem; text-align:center; color:var(--muted); user-select:none; }
+    .dl.add { background:rgba(70, 160, 90, 0.18); color:#c9f0d0; }
+    .dl.add .dm { color:#8fd19e; }
+    .dl.del { background:rgba(200, 70, 70, 0.18); color:#f5c9c9; }
+    .dl.del .dm { color:#f19a9a; }
+    .dl.ctx { color:#9a9a9a; }
+    .dl.more { color:var(--muted); font-style:italic; padding-left:1.4rem; }
+
+    /* Ask-user prompt */
+    .msg.ask { border-left-color:#8aa0c8; background:#1a1d24; }
+    .msg.ask .msg-role { color:#8aa0c8; }
+    .ask-hint { margin-top:0.45rem; font-size:0.75rem; color:var(--muted); }
+    .msg.ask.answered .ask-hint { display:none; }
+
+    /* Subagent card */
+    .sub-task { white-space:pre-wrap; overflow-wrap:anywhere; color:#ddd; }
+    .sub-meta { display:flex; align-items:center; gap:0.6rem; font-size:0.75rem; color:var(--muted); flex-wrap:wrap; }
+    .sub-open { font-size:0.75rem; padding:0.1rem 0.45rem; color:#9dc3ff; border:1px solid #33507a; border-radius:6px; }
+    .card-nested { display:flex; flex-direction:column; gap:0.35rem; }
+    .card-nested .msg { margin:0; }
+    .card-nested:empty { display:none; }
+
+    /* Todo checklist */
+    .todo-list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:0.2rem; }
+    .todo-item { display:flex; align-items:flex-start; gap:0.45rem; font-size:0.85rem; color:#ddd; }
+    .todo-item .tmark { flex:none; width:1.1rem; text-align:center; color:var(--muted); font-family: ui-monospace, monospace; }
+    .todo-item.completed { color:var(--muted); text-decoration:line-through; }
+    .todo-item.completed .tmark { color:#a9d6b4; text-decoration:none; }
+    .todo-item.in_progress .tmark { color:#9dc3ff; }
+    .todo-item.in_progress { color:#fff; }
+    .todo-item.cancelled { color:#777; text-decoration:line-through; }
+    #todo-panel { margin:0.5rem 1rem 0; background:var(--panel); border-radius:8px; border-left:3px solid #c4a574; }
+    #todo-panel.hidden { display:none; }
+    #todo-head { width:100%; display:flex; align-items:center; gap:0.5rem; font-size:0.8rem; color:#ddd; padding:0.35rem 0.6rem; }
+    #todo-head .tcount { color:var(--muted); font-weight:500; }
+    #todo-head .chev { margin-left:auto; color:var(--muted); }
+    #todo-body { padding:0.1rem 0.75rem 0.55rem; max-height:11rem; overflow-y:auto; }
+    #todo-panel.collapsed #todo-body { display:none; }
   </style>
 </head>
 <body>
@@ -236,6 +395,10 @@
     </header>
     <div id="log"></div>
     <div id="dock">
+      <div id="todo-panel" class="hidden">
+        <button type="button" id="todo-head"><span>Tasks</span><span class="tcount" id="todo-count"></span><span class="chev">▾</span></button>
+        <div id="todo-body"></div>
+      </div>
       <div id="followups" class="hidden"></div>
       <div id="composer">
         <textarea id="text" placeholder="Message (Shift+Enter for newline)"></textarea>
@@ -249,6 +412,9 @@
       <div id="composer-hint"></div>
     </div>
   </div>
+  <!-- Vendored, pinned; see web/vendor/README.md. Served by the /ui static mount. -->
+  <script src="/ui/vendor/marked.min.js"></script>
+  <script src="/ui/vendor/purify.min.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
     const LS = {
@@ -332,16 +498,576 @@
       _scrollToBottom();
     }
 
-    function add(kind, text, opts={}) {
-      const d = document.createElement("div");
-      d.className = "msg " + kind + (opts.extraClass ? " " + opts.extraClass : "");
-      if (opts.seq != null) d.dataset.seq = String(opts.seq);
-      const body = document.createElement("div");
-      body.className = "msg-body";
-      body.textContent = kind + ": " + text;
-      d.appendChild(body);
-      $("log").appendChild(d);
+    // ------------------------------------------------------------------
+    // Rendering layer. renderEvent(ev) is the single entry point for both
+    // history backfill and live WebSocket events; it dedupes by seq so a
+    // reconnect/backfill that replays an event does not double-render.
+    // ------------------------------------------------------------------
+    const renderedSeqs = new Set();
+    const toolCards = new Map();      // tool_use_id -> card
+    const subagentCards = new Map();  // child_session_id -> card
+    const askBlocks = new Map();      // tool_use_id -> ask_user prompt element
+    let currentTodos = [];
+    let _renderTarget = null;         // when set, new nodes go here (nested subagent events)
+    const OUTPUT_CAP = 20000;
+    const DIFF_MAX_LINES = 400;
+    const ROLE_LABEL = { user: "You", assistant: "Orbweaver", tool: "Tool" };
+    const TOOL_ICONS = {
+      Read: "\u{1F4C4}", Write: "\u270F\uFE0F", StrReplace: "\u270F\uFE0F", ProposePatch: "\u270F\uFE0F",
+      NotebookEdit: "\u{1F4D3}", Delete: "\u{1F5D1}\uFE0F", Bash: "\u2328\uFE0F", Glob: "\u{1F50D}",
+      Grep: "\u{1F50D}", CodeSearch: "\u{1F50D}", ReadLints: "\u{1F9F9}", WebFetch: "\u{1F310}",
+      WebSearch: "\u{1F310}", Browser: "\u{1F310}", AskUser: "\u2753", TodoWrite: "\u2611\uFE0F",
+      SpawnSubagent: "\u{1F9F5}", GenerateImage: "\u{1F5BC}\uFE0F", SendPhoto: "\u{1F5BC}\uFE0F",
+      MemorySearch: "\u{1F9E0}", MemoryGraph: "\u{1F9E0}", MemoryRemember: "\u{1F9E0}",
+      ScheduleTask: "\u23F0"
+    };
+    const mdReady = !!(window.marked && window.DOMPurify);
+    if (mdReady) window.marked.use({ gfm: true, breaks: true });
+
+    function toolIcon(name) {
+      if (TOOL_ICONS[name]) return TOOL_ICONS[name];
+      if (String(name || "").startsWith("mcp_")) return "\u{1F50C}";
+      return "\u{1F527}";
+    }
+    function el(tag, cls, text) {
+      const n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text != null) n.textContent = text;
+      return n;
+    }
+    function appendToLog(node) {
+      if (_renderTarget && _renderTarget.isConnected) {
+        _renderTarget.appendChild(node);
+      } else {
+        const log = $("log");
+        const working = log.querySelector(":scope > .msg.working");
+        if (working) log.insertBefore(node, working);
+        else log.appendChild(node);
+      }
       _scrollToBottom();
+    }
+    function resetLog() {
+      $("log").replaceChildren();
+      renderedSeqs.clear();
+      toolCards.clear();
+      subagentCards.clear();
+      askBlocks.clear();
+      _renderTarget = null;
+      setTodos([]);
+    }
+    function copyText(text, btn) {
+      const flash = () => {
+        if (!btn) return;
+        const old = btn.textContent;
+        btn.textContent = "Copied";
+        setTimeout(() => { btn.textContent = old; }, 1200);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(flash, () => {});
+        return;
+      }
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+        flash();
+      } catch (e) {}
+    }
+    function decorateCodeBlock(pre) {
+      const wrap = el("div", "codeblock");
+      const bar = el("div", "code-bar");
+      const code = pre.querySelector("code");
+      const langCls = code ? [...code.classList].find((c) => c.startsWith("language-")) : null;
+      bar.appendChild(el("span", "code-lang", langCls ? langCls.slice(9) : ""));
+      const copy = el("button", "copy-btn", "Copy");
+      copy.type = "button";
+      copy.title = "Copy code";
+      copy.onclick = (e) => { e.stopPropagation(); copyText(pre.textContent, copy); };
+      bar.appendChild(copy);
+      pre.replaceWith(wrap);
+      wrap.append(bar, pre);
+    }
+    function renderMarkdown(container, text) {
+      container.replaceChildren();
+      const src = text == null ? "" : String(text);
+      container.classList.remove("md", "plain");
+      if (!mdReady) {
+        container.classList.add("plain");
+        container.textContent = src;
+        return container;
+      }
+      let frag;
+      try {
+        const html = window.marked.parse(src);
+        frag = window.DOMPurify.sanitize(html, {
+          USE_PROFILES: { html: true },
+          RETURN_DOM_FRAGMENT: true,
+          FORBID_TAGS: ["style", "form", "input", "textarea", "select", "button"],
+          FORBID_ATTR: ["style"]
+        });
+      } catch (e) {
+        container.classList.add("plain");
+        container.textContent = src;
+        return container;
+      }
+      frag.querySelectorAll("a[href]").forEach((a) => {
+        a.setAttribute("target", "_blank");
+        a.setAttribute("rel", "noopener noreferrer");
+      });
+      frag.querySelectorAll("pre").forEach(decorateCodeBlock);
+      container.classList.add("md");
+      container.appendChild(frag);
+      return container;
+    }
+
+    function add(kind, text, opts={}) {
+      const d = el("div", "msg " + kind + (opts.extraClass ? " " + opts.extraClass : ""));
+      if (opts.seq != null) d.dataset.seq = String(opts.seq);
+      const label = opts.label != null ? opts.label : ROLE_LABEL[kind];
+      if (label) d.appendChild(el("div", "msg-role", label));
+      const body = el("div", "msg-body");
+      const markdown = opts.markdown != null ? opts.markdown : (kind === "user" || kind === "assistant");
+      if (markdown) renderMarkdown(body, text);
+      else body.textContent = text == null ? "" : String(text);
+      d.appendChild(body);
+      appendToLog(d);
+      return d;
+    }
+
+    // ---- Tool cards -------------------------------------------------------
+    function setCardStatus(card, status) {
+      card.status = status;
+      card.chip.className = "chip " + status;
+      card.chip.textContent = status;
+    }
+    function expandCard(card) {
+      card.body.classList.remove("hidden");
+      card.chev.textContent = "\u25BE";
+      card.el.classList.add("open");
+    }
+    function section(card, cls, tag) {
+      let node = card.body.querySelector(":scope > ." + cls);
+      if (!node) {
+        node = el(tag || "div", cls);
+        card.body.appendChild(node);
+      }
+      return node;
+    }
+    function createToolCard(id, name, opts={}) {
+      const root = el("div", "msg tool card");
+      if (opts.seq != null) root.dataset.seq = String(opts.seq);
+      if (id) root.dataset.toolUseId = String(id);
+      root.dataset.tool = name || "";
+      const head = el("button", "card-head");
+      head.type = "button";
+      const icon = el("span", "tool-icon", toolIcon(name));
+      const nm = el("span", "tool-name", name || "tool");
+      const sum = el("span", "tool-summary", opts.summary || "");
+      sum.title = opts.summary || "";
+      const chip = el("span", "chip", "");
+      const chev = el("span", "chev", "\u25B8");
+      head.append(icon, nm, sum, chip, chev);
+      const body = el("div", "card-body hidden");
+      head.onclick = () => {
+        const hidden = body.classList.toggle("hidden");
+        chev.textContent = hidden ? "\u25B8" : "\u25BE";
+        root.classList.toggle("open", !hidden);
+      };
+      root.append(head, body);
+      const card = { el: root, head, body, chip, chev, sum, nm, icon, name: name || "tool", status: null };
+      setCardStatus(card, "running");
+      appendToLog(root);
+      return card;
+    }
+    function ensureToolCard(id, name, opts={}) {
+      const key = id == null ? "" : String(id);
+      const existing = key ? toolCards.get(key) : null;
+      if (existing && existing.el.isConnected) return existing;
+      const card = createToolCard(key || null, name, opts);
+      if (key) toolCards.set(key, card);
+      return card;
+    }
+    function summarizeInputClient(name, inp) {
+      if (!inp || typeof inp !== "object") return "";
+      if (name === "Bash") return String(inp.command || "");
+      if (inp.path) return String(inp.path);
+      if (inp.pattern) return String(inp.pattern);
+      if (inp.query) return String(inp.query);
+      if (inp.url) return String(inp.url);
+      if (inp.question) return String(inp.question);
+      if (inp.task) return String(inp.task);
+      if (inp.prompt) return String(inp.prompt);
+      return "";
+    }
+
+    // ---- Line diff (LCS) ---------------------------------------------------
+    function splitLines(s) {
+      if (s === "") return [];
+      const arr = String(s).split("\n");
+      if (arr.length && arr[arr.length - 1] === "") arr.pop();
+      return arr;
+    }
+    function lineDiff(a, b) {
+      const n = a.length, m = b.length;
+      let start = 0;
+      while (start < n && start < m && a[start] === b[start]) start++;
+      let endA = n, endB = m;
+      while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB--; }
+      const ca = a.slice(start, endA), cb = b.slice(start, endB);
+      const N = ca.length, M = cb.length;
+      const out = [];
+      for (let k = 0; k < start; k++) out.push([" ", a[k]]);
+      if (N * M > 400000) {
+        for (const l of ca) out.push(["-", l]);
+        for (const l of cb) out.push(["+", l]);
+      } else {
+        const W = M + 1;
+        const dp = new Uint32Array((N + 1) * W);
+        for (let i = N - 1; i >= 0; i--) {
+          for (let j = M - 1; j >= 0; j--) {
+            dp[i * W + j] = ca[i] === cb[j]
+              ? dp[(i + 1) * W + j + 1] + 1
+              : Math.max(dp[(i + 1) * W + j], dp[i * W + j + 1]);
+          }
+        }
+        let i = 0, j = 0;
+        while (i < N && j < M) {
+          if (ca[i] === cb[j]) { out.push([" ", ca[i]]); i++; j++; }
+          else if (dp[(i + 1) * W + j] >= dp[i * W + j + 1]) { out.push(["-", ca[i]]); i++; }
+          else { out.push(["+", cb[j]]); j++; }
+        }
+        while (i < N) out.push(["-", ca[i++]]);
+        while (j < M) out.push(["+", cb[j++]]);
+      }
+      for (let k = endA; k < n; k++) out.push([" ", a[k]]);
+      return out;
+    }
+    function renderDiff(oldText, newText, opts={}) {
+      const a = splitLines(oldText), b = splitLines(newText);
+      const ops = lineDiff(a, b);
+      let added = 0, removed = 0;
+      for (const [op] of ops) { if (op === "+") added++; else if (op === "-") removed++; }
+      const root = el("div", "diff");
+      const head = el("div", "diff-head");
+      head.appendChild(el("span", "path", opts.path || ""));
+      if (opts.note) head.appendChild(el("span", "note", opts.note));
+      head.appendChild(el("span", "add", "+" + added));
+      head.appendChild(el("span", "del", "\u2212" + removed));
+      root.appendChild(head);
+      const body = el("pre", "diff-body");
+      const shown = ops.slice(0, DIFF_MAX_LINES);
+      for (const [op, line] of shown) {
+        const row = el("div", "dl " + (op === "+" ? "add" : op === "-" ? "del" : "ctx"));
+        row.appendChild(el("span", "dm", op === " " ? "" : op));
+        row.appendChild(el("span", "dt", line));
+        body.appendChild(row);
+      }
+      if (ops.length > shown.length) {
+        body.appendChild(el("div", "dl more", "\u2026 " + (ops.length - shown.length) + " more lines"));
+      }
+      root.appendChild(body);
+      return root;
+    }
+    function buildDiffForCall(name, inp) {
+      inp = inp || {};
+      let oldText = null, newText = null, note = "";
+      if (name === "Write") {
+        newText = inp.content;
+        note = "new content";
+      } else if (name === "StrReplace" || name === "ProposePatch") {
+        oldText = inp.old_string == null ? "" : inp.old_string;
+        newText = inp.new_string == null ? "" : inp.new_string;
+        if (name === "ProposePatch") note = "proposed";
+      } else if (name === "NotebookEdit") {
+        if (inp.action === "delete") return null;
+        if (inp.source != null) { newText = inp.source; note = "cell " + (inp.cell_idx != null ? inp.cell_idx : ""); }
+        else if (inp.new_string != null) {
+          oldText = inp.old_string == null ? "" : inp.old_string;
+          newText = inp.new_string;
+          note = "cell " + (inp.cell_idx != null ? inp.cell_idx : "");
+        }
+      }
+      if (oldText == null && newText == null) return null;
+      return renderDiff(oldText == null ? "" : String(oldText), newText == null ? "" : String(newText), {
+        path: inp.path || "", note
+      });
+    }
+
+    // ---- Todos ------------------------------------------------------------
+    const TODO_MARK = { pending: "\u2610", in_progress: "\u25D0", completed: "\u2611", cancelled: "\u2715" };
+    function todoListEl(todos) {
+      const ul = el("ul", "todo-list");
+      for (const t of todos) {
+        const status = TODO_MARK[t.status] ? t.status : "pending";
+        const li = el("li", "todo-item " + status);
+        li.appendChild(el("span", "tmark", TODO_MARK[status]));
+        li.appendChild(el("span", "ttext", t.content || ""));
+        ul.appendChild(li);
+      }
+      return ul;
+    }
+    function normalizeTodosClient(raw) {
+      if (!Array.isArray(raw)) return null;
+      return raw.filter((t) => t && typeof t === "object" && t.content).map((t, i) => ({
+        id: String(t.id || i + 1), content: String(t.content), status: String(t.status || "pending")
+      }));
+    }
+    function setTodos(todos) {
+      currentTodos = Array.isArray(todos) ? todos : [];
+      paintTodos();
+    }
+    function paintTodos() {
+      const panel = $("todo-panel");
+      const body = $("todo-body");
+      body.replaceChildren();
+      if (!currentTodos.length) { panel.classList.add("hidden"); return; }
+      panel.classList.remove("hidden");
+      const done = currentTodos.filter((t) => t.status === "completed").length;
+      $("todo-count").textContent = done + "/" + currentTodos.length;
+      body.appendChild(todoListEl(currentTodos));
+    }
+    $("todo-head").onclick = () => {
+      const panel = $("todo-panel");
+      panel.classList.toggle("collapsed");
+      panel.querySelector(".chev").textContent = panel.classList.contains("collapsed") ? "\u25B8" : "\u25BE";
+    };
+    function parseTodosResult(text) {
+      try {
+        const parsed = JSON.parse(text);
+        return normalizeTodosClient(parsed && parsed.todos);
+      } catch (e) { return null; }
+    }
+
+    // ---- Event renderers ---------------------------------------------------
+    function imageEl(source) {
+      const img = el("img", "tool-image");
+      img.alt = "tool result image";
+      img.loading = "lazy";
+      if (source && source.type === "base64" && source.data) {
+        const media = /^image\/[a-z0-9.+-]+$/i.test(String(source.media_type || "")) ? source.media_type : "image/png";
+        img.src = "data:" + media + ";base64," + String(source.data).replace(/\s+/g, "");
+      } else if (source && source.type === "url" && /^https?:\/\//i.test(String(source.url || ""))) {
+        img.src = source.url;
+        img.referrerPolicy = "no-referrer";
+      } else {
+        const note = el("div", "card-note", "[image: " + String((source && (source.path || source.type)) || "unavailable") + "]");
+        return note;
+      }
+      return img;
+    }
+    function parseImageRead(text) {
+      if (typeof text !== "string" || !text.includes("__orbweaver_image__")) return null;
+      try {
+        const parsed = JSON.parse(text);
+        return parsed && parsed.__orbweaver_image__ ? parsed : null;
+      } catch (e) { return null; }
+    }
+    function isErrorText(t) {
+      return /^\s*(error\b|blocked by permission gate|this action needs user approval|unknown tool\b|traceback)/i.test(t || "");
+    }
+    function renderToolCall(ev, p) {
+      const name = p.name || "tool";
+      const inp = p.input && typeof p.input === "object" ? p.input : {};
+      const summary = p.summary || summarizeInputClient(name, inp);
+      const card = ensureToolCard(p.id, name, { seq: ev.seq, summary });
+      card.name = name;
+      card.nm.textContent = name;
+      card.icon.textContent = toolIcon(name);
+      card.sum.textContent = summary;
+      card.sum.title = summary;
+      if (ev.seq != null && !card.el.dataset.seq) card.el.dataset.seq = String(ev.seq);
+      const diff = buildDiffForCall(name, inp);
+      if (diff) {
+        section(card, "card-diff").replaceChildren(diff);
+        expandCard(card);
+      } else if (name === "Bash" && inp.command) {
+        section(card, "card-input", "pre").textContent = String(inp.command);
+      } else if (Object.keys(inp).length) {
+        const keys = Object.keys(inp);
+        const onlySummary = keys.length === 1 && String(inp[keys[0]]) === summary;
+        if (!onlySummary) section(card, "card-input", "pre").textContent = JSON.stringify(inp, null, 2);
+      }
+      if (name === "AskUser") setCardStatus(card, "waiting");
+      if (name === "SpawnSubagent") card.pendingSubagent = true;
+      return card;
+    }
+    function renderToolResult(ev, p) {
+      const card = ensureToolCard(p.tool_use_id, p.name || "tool", { seq: ev.seq });
+      const name = card.name;
+      let content = p.content != null ? p.content : (p.text != null ? p.text : "");
+      const out = section(card, "card-out");
+      out.replaceChildren();
+      let text = "";
+      const pushText = (t) => { text += (text ? "\n" : "") + t; };
+      const blocks = Array.isArray(content) ? content : [content];
+      for (const b of blocks) {
+        if (b && typeof b === "object" && b.type === "image") out.appendChild(imageEl(b.source));
+        else if (b && typeof b === "object" && b.type === "text") pushText(String(b.text || ""));
+        else if (typeof b === "string") pushText(b);
+        else if (b != null) pushText(JSON.stringify(b, null, 2));
+      }
+      const imgRead = parseImageRead(text);
+      if (imgRead) {
+        text = "Read image " + (imgRead.path || "") + " (" + (imgRead.media_type || "image") +
+          (imgRead.bytes != null ? ", " + imgRead.bytes + " bytes" : "") + ") \u2014 sent to the model as vision input.";
+        out.appendChild(el("div", "card-note", text));
+        text = "";
+      }
+      if (name === "TodoWrite") {
+        const todos = parseTodosResult(text);
+        if (todos) {
+          out.appendChild(todoListEl(todos));
+          setTodos(todos);
+          expandCard(card);
+          text = "";
+        }
+      }
+      if (name === "SpawnSubagent" && text) {
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed && typeof parsed === "object" && "text" in parsed) {
+            const md = el("div", "msg-body");
+            renderMarkdown(md, parsed.text || "(no text)");
+            out.appendChild(md);
+            if (parsed.status && parsed.status !== "ok") out.appendChild(el("div", "card-note", "status: " + parsed.status));
+            text = "";
+          }
+        } catch (e) {}
+      }
+      if (text) {
+        const pre = el("pre", "tool-output");
+        const shown = text.length > OUTPUT_CAP ? text.slice(0, OUTPUT_CAP) : text;
+        pre.textContent = shown;
+        out.appendChild(pre);
+        if (shown.length < text.length) {
+          out.appendChild(el("div", "out-more", "\u2026 " + (text.length - shown.length) + " more characters"));
+        }
+      }
+      if (p.persisted_path) {
+        const hint = section(card, "card-persist");
+        hint.replaceChildren();
+        hint.appendChild(el("span", null, "Full output saved to"));
+        hint.appendChild(el("code", null, String(p.persisted_path)));
+        const copy = el("button", "copy-btn", "Copy path");
+        copy.type = "button";
+        copy.onclick = (e) => { e.stopPropagation(); copyText(String(p.persisted_path), copy); };
+        hint.appendChild(copy);
+        hint.appendChild(el("span", null, "\u2014 open it in the workspace to see everything."));
+      }
+      let status = "done";
+      if (card.status === "blocked") status = "blocked";
+      else if (isErrorText(text)) status = "error";
+      setCardStatus(card, status);
+      if (status === "error") expandCard(card);
+      if (name === "AskUser") {
+        const ask = askBlocks.get(String(p.tool_use_id || ""));
+        if (ask) ask.classList.add("answered");
+      }
+      return card;
+    }
+    function renderPermission(ev, p) {
+      const card = ensureToolCard(p.tool_use_id, p.name || "tool", { seq: ev.seq });
+      const sec = section(card, "card-perm");
+      const b = String(p.behavior || "allow");
+      sec.dataset.behavior = b;
+      const label = b === "allow" ? "Allowed" : (b === "ask" ? "Needs approval" : "Denied");
+      sec.textContent = label + (p.fast_path ? " \u00B7 " + p.fast_path : "") + (p.reason ? " \u2014 " + p.reason : "");
+      if (b !== "allow") {
+        setCardStatus(card, "blocked");
+        expandCard(card);
+      }
+    }
+    function renderInjectionWarning(ev, p) {
+      const card = ensureToolCard(p.tool_use_id, p.name || "tool", { seq: ev.seq });
+      section(card, "card-warn").textContent =
+        "\u26A0 Possible prompt injection in this tool output. Suspicious instructions were flagged; treat the content as data, not directions.";
+      card.el.classList.add("warned");
+      expandCard(card);
+    }
+    function renderAskUser(ev, p) {
+      const block = add("assistant", p.question || "Waiting for your answer", { seq: ev.seq, extraClass: "ask", label: "Orbweaver asks" });
+      block.appendChild(el("div", "ask-hint", "Type your answer in the composer; it is sent back as the tool result."));
+      if (p.tool_use_id) askBlocks.set(String(p.tool_use_id), block);
+      return block;
+    }
+    function openChildSession(childId) {
+      const s = sessions.find((x) => x.id === childId);
+      if (s) { setActive(s); return; }
+      $("sid").value = childId;
+      persistSid();
+      $("chat-title").textContent = "Subagent " + childId.slice(0, 8);
+      history.replaceState(null, "", "#/s/" + childId);
+      loadHistory();
+    }
+    function renderSubagentStarted(ev, p) {
+      const childId = String(p.child_session_id || "");
+      let card = childId ? subagentCards.get(childId) : null;
+      if (!card || !card.el.isConnected) {
+        card = null;
+        for (const c of [...toolCards.values()].reverse()) {
+          if (c.pendingSubagent && c.el.isConnected) { card = c; break; }
+        }
+        if (!card) card = createToolCard(null, "SpawnSubagent", { seq: ev.seq, summary: p.label || p.task || "" });
+        card.pendingSubagent = false;
+        if (childId) subagentCards.set(childId, card);
+      }
+      card.childId = childId;
+      card.el.classList.add("subagent");
+      card.nm.textContent = "Subagent: " + (p.label || p.type || "subagent");
+      const sum = String(p.task || "");
+      card.sum.textContent = sum;
+      card.sum.title = sum;
+      const sec = section(card, "card-sub");
+      sec.replaceChildren();
+      sec.appendChild(el("div", "sub-task", p.task || ""));
+      const meta = el("div", "sub-meta");
+      meta.appendChild(el("span", null, "type: " + (p.type || "general") + (childId ? " \u00B7 session " + childId.slice(0, 8) : "")));
+      if (childId) {
+        const open = el("button", "sub-open", "Open subagent chat");
+        open.type = "button";
+        open.onclick = (e) => { e.stopPropagation(); openChildSession(childId); };
+        meta.appendChild(open);
+      }
+      sec.appendChild(meta);
+      section(card, "card-nested");
+      setCardStatus(card, "running");
+      return card;
+    }
+    function renderSubagentFinished(ev, p) {
+      const card = subagentCards.get(String(p.child_session_id || ""));
+      if (!card || !card.el.isConnected) { renderGenericEvent(ev); return; }
+      const st = String(p.status || "ok");
+      setCardStatus(card, st === "ok" ? "done" : (st === "cancelled" ? "stopped" : "error"));
+      section(card, "card-sub").appendChild(el("div", "card-note", "Subagent finished: " + st));
+    }
+    function renderNested(childId, fn) {
+      const card = subagentCards.get(String(childId));
+      if (!card || !card.el.isConnected) return false;
+      const prev = _renderTarget;
+      _renderTarget = section(card, "card-nested");
+      try { fn(); } finally { _renderTarget = prev; }
+      return true;
+    }
+    function renderGenericEvent(ev) {
+      const p = ev.payload || {};
+      const d = el("div", "msg tool event");
+      if (ev.seq != null) d.dataset.seq = String(ev.seq);
+      const det = el("details");
+      det.appendChild(el("summary", null, ev.kind));
+      const pre = el("pre");
+      let json = "";
+      try { json = JSON.stringify(p, null, 2); } catch (e) { json = String(p); }
+      pre.textContent = json.length > 4000 ? json.slice(0, 4000) + "\u2026" : json;
+      det.appendChild(pre);
+      d.appendChild(det);
+      appendToLog(d);
+      return d;
+    }
+    function renderNote(ev, text, cls) {
+      const d = add("tool", text, { seq: ev.seq, extraClass: "note " + (cls || ""), label: "", markdown: false });
       return d;
     }
     function attachUserActions(el, text, seq, pending) {
@@ -354,6 +1080,22 @@
       edit.title = pending ? "Pause and edit this prompt" : "Edit this prompt";
       edit.onclick = (ev) => { ev.stopPropagation(); editPrompt(text, seq, el); };
       actions.appendChild(edit);
+      if (!pending && seq != null) {
+        const lab = document.createElement("label");
+        lab.className = "restore-files";
+        lab.title = "Put the workspace back to how it was before this turn (git checkpoint)";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.className = "restore-files-box";
+        box.dataset.auto = "1";
+        box.checked = turnEditsFilesAfter(seq);
+        box.onclick = (ev) => ev.stopPropagation();
+        box.onchange = () => { box.dataset.auto = "0"; };
+        lab.appendChild(box);
+        lab.appendChild(document.createTextNode(" also restore files"));
+        lab.onclick = (ev) => ev.stopPropagation();
+        actions.appendChild(lab);
+      }
       if (pending) {
         const cancel = document.createElement("button");
         cancel.type = "button";
@@ -364,29 +1106,186 @@
       }
       el.appendChild(actions);
     }
+    const FILE_EDIT_TOOLS = new Set(["Write", "StrReplace", "Delete", "NotebookEdit", "Bash"]);
+    function turnEditsFilesAfter(seq) {
+      for (const node of $("log").querySelectorAll("[data-edits-files='1']")) {
+        const s = Number(node.dataset.seq);
+        if (Number.isFinite(s) && s >= seq) return true;
+      }
+      return false;
+    }
+    function syncRestoreDefaults() {
+      for (const box of $("log").querySelectorAll(".restore-files-box[data-auto='1']")) {
+        const msg = box.closest(".msg");
+        const seq = msg ? Number(msg.dataset.seq) : NaN;
+        if (Number.isFinite(seq)) box.checked = turnEditsFilesAfter(seq);
+      }
+    }
+    function restoreSummaryText(p) {
+      if (p.status === "skipped") return "files not restored: " + (p.note || "no checkpoint");
+      const restored = p.restored || [], deleted = p.deleted || [];
+      const parts = [];
+      if (restored.length) parts.push("restored " + restored.length + " file" + (restored.length === 1 ? "" : "s"));
+      if (deleted.length) parts.push("deleted " + deleted.length + " file" + (deleted.length === 1 ? "" : "s"));
+      const names = restored.concat(deleted.map((d) => "-" + d));
+      const shown = names.slice(0, 6).join(", ") + (names.length > 6 ? ", …" : "");
+      return "workspace " + (parts.length ? parts.join(", ") : "already matched the checkpoint")
+        + (shown ? " (" + shown + ")" : "");
+    }
     function renderEvent(ev) {
+      if (!ev || typeof ev !== "object") return;
+      if (ev.seq != null) {
+        const key = Number(ev.seq);
+        if (Number.isFinite(key)) {
+          if (renderedSeqs.has(key)) return;
+          renderedSeqs.add(key);
+        }
+      }
       const p = ev.payload || {};
-      if (ev.kind === "user" || ev.kind === "assistant") {
-        const extra = p.injected ? "injected" : "";
-        const el = add(ev.kind, p.text || "", { seq: ev.seq, extraClass: extra });
-        if (ev.kind === "user") attachUserActions(el, p.text || "", ev.seq, false);
-      } else if (ev.kind === "ask_user") {
-        add("assistant", p.question || "Waiting for your answer", { seq: ev.seq, extraClass: "ask" });
-      } else if (ev.kind === "turn_aborted") {
-        add("assistant", p.text || "Turn aborted", { seq: ev.seq, extraClass: "stopped" });
-      } else if (ev.kind === "cron_result") {
+      const kind = ev.kind;
+      if (kind === "assistant_delta" || kind === "tool_use_progress") return;
+      if (kind === "subscribed" || kind === "pong" || kind === "idle" || kind === "cancelling") return;
+      if (p.child_session_id && kind !== "subagent_started" && kind !== "subagent_finished") {
+        if (renderNested(p.child_session_id, () => renderEventInner(ev, p))) return;
+      }
+      renderEventInner(ev, p);
+    }
+    function renderEventInner(ev, p) {
+      const kind = ev.kind;
+      if (kind === "checkpoint_restore") {
+        add("tool", restoreSummaryText(p), { seq: ev.seq, extraClass: "checkpoint", markdown: false });
+      } else if (kind === "user" || kind === "assistant") {
+        const extra = (p.injected || p.stuck_nudge) ? "injected" : "";
+        const node = add(kind, p.text || "", { seq: ev.seq, extraClass: extra });
+        if (kind === "user") attachUserActions(node, p.text || "", ev.seq, false);
+      } else if (kind === "tool_call") {
+        const card = renderToolCall(ev, p);
+        if (card && FILE_EDIT_TOOLS.has(p.name)) card.el.dataset.editsFiles = "1";
+      } else if (kind === "tool_result" || kind === "MemoryRecall") {
+        renderToolResult(ev, p);
+      } else if (kind === "permission_decision") {
+        renderPermission(ev, p);
+      } else if (kind === "permission_request") {
+        renderPermissionRequest(p, ev.seq);
+      } else if (kind === "permission_response") {
+        resolvePermissionCard(p.tool_use_id, permissionOutcomeLabel(p.decision, p.scope));
+      } else if (kind === "permission_rule_added") {
+        renderNote(ev, "Allowed for this session: " + (p.tool || "") + "(" + (p.subject || "*") + ")", "permission");
+      } else if (kind === "injection_warning") {
+        renderInjectionWarning(ev, p);
+      } else if (kind === "ask_user") {
+        renderAskUser(ev, p);
+      } else if (kind === "subagent_started") {
+        renderSubagentStarted(ev, p);
+      } else if (kind === "subagent_finished") {
+        renderSubagentFinished(ev, p);
+      } else if (kind === "todo_state") {
+        const todos = normalizeTodosClient(p.todos);
+        if (todos) setTodos(todos);
+      } else if (kind === "patch_proposal") {
+        const card = p.tool_use_id ? toolCards.get(String(p.tool_use_id)) : null;
+        if (card && card.el.isConnected) {
+          section(card, "card-note").textContent = "Patch proposed \u2014 review it in the VS Code overlay or apply it from the diff above.";
+        } else {
+          renderGenericEvent(ev);
+        }
+      } else if (kind === "schedule_request") {
+        renderNote(ev, "Scheduled task requested: " + summarizeInputClient("ScheduleTask", p.input || {}), "schedule");
+      } else if (kind === "turn_aborted") {
+        add("assistant", p.text || "Turn aborted", { seq: ev.seq, extraClass: "stopped", markdown: false });
+      } else if (kind === "cron_result") {
         const extra = p.status === "aborted" ? "stopped" : "";
         add("assistant", p.text || "Scheduled task finished.", { seq: ev.seq, extraClass: extra });
-      } else if (ev.kind === "turn_interrupted") {
+      } else if (kind === "turn_interrupted") {
         renderStopped(ev.seq);
       } else if (ev.kind === "assistant_delta" || ev.kind === "tool_use_progress") {
         return;
+      } else if (ev.kind === "subagent_event") {
+        const inner = p.event || {};
+        const tag = "\u21b3 subagent " + String(p.subagent_id || "").slice(0, 8) + " " + (inner.kind || "");
+        add("tool", tag + " " + JSON.stringify(inner.payload || {}).slice(0, 240), { seq: ev.seq });
       } else {
-        add("tool", ev.kind + " " + JSON.stringify(p).slice(0,400), { seq: ev.seq });
+        renderGenericEvent(ev);
+      }
+    }
+    function permissionOutcomeLabel(decision, scope) {
+      if (decision === "allow") return scope === "session" ? "Allowed for this session" : "Allowed";
+      if (decision === "deny") return "Denied";
+      if (decision === "timeout") return "Timed out — not executed";
+      if (decision === "cancelled") return "Cancelled — not executed";
+      return String(decision || "resolved");
+    }
+    function permissionCard(toolUseId) {
+      if (!toolUseId) return null;
+      return $("log").querySelector('.msg.permission[data-tool-use-id="' + String(toolUseId).replace(/"/g, "") + '"]');
+    }
+    function resolvePermissionCard(toolUseId, label) {
+      const card = permissionCard(toolUseId);
+      if (!card) return;
+      card.classList.add("resolved");
+      card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = true; });
+      let out = card.querySelector(".perm-outcome");
+      if (!out) {
+        out = document.createElement("div");
+        out.className = "perm-outcome";
+        card.appendChild(out);
+      }
+      out.textContent = "→ " + label;
+    }
+    function renderPermissionRequest(p, seq) {
+      const d = document.createElement("div");
+      d.className = "msg assistant permission";
+      if (seq != null) d.dataset.seq = String(seq);
+      d.dataset.toolUseId = String(p.tool_use_id || "");
+      const title = document.createElement("div");
+      title.className = "perm-title";
+      title.textContent = "Approval needed: " + (p.name || "tool");
+      d.appendChild(title);
+      const summary = document.createElement("div");
+      summary.className = "perm-summary";
+      summary.textContent = p.summary || JSON.stringify(p.input || {}).slice(0, 400);
+      d.appendChild(summary);
+      if (p.reason) {
+        const why = document.createElement("div");
+        why.className = "perm-reason";
+        why.textContent = "Why: " + p.reason;
+        d.appendChild(why);
+      }
+      const actions = document.createElement("div");
+      actions.className = "msg-actions perm-actions";
+      const sid = currentSid();
+      const mk = (label, decision, scope, cls) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = label;
+        b.className = cls;
+        b.onclick = () => decidePermission(sid, p.tool_use_id, decision, scope, d);
+        actions.appendChild(b);
+      };
+      mk("Allow", "allow", "once", "allow");
+      mk("Allow for session", "allow", "session", "allow");
+      mk("Deny", "deny", "once", "deny");
+      d.appendChild(actions);
+      $("log").appendChild(d);
+      _scrollToBottom();
+      return d;
+    }
+    async function decidePermission(sid, toolUseId, decision, scope, card) {
+      if (!sid || !toolUseId) return;
+      card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = true; });
+      try {
+        await api("/v1/sessions/" + sid + "/turns/approve", {
+          method:"POST", body: JSON.stringify({ tool_use_id: toolUseId, decision, scope })
+        });
+        resolvePermissionCard(toolUseId, permissionOutcomeLabel(decision, scope) + " · waiting for the agent…");
+      } catch (e) {
+        resolvePermissionCard(toolUseId, "Could not send decision: " + String(e));
+        card.classList.remove("resolved");
+        card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = false; });
       }
     }
     function renderStopped(seq) {
-      const el = add("assistant", "Stopped", { extraClass: "stopped", seq: seq });
+      const node = add("assistant", "Stopped", { extraClass: "stopped", seq: seq, markdown: false });
       const actions = document.createElement("div");
       actions.className = "msg-actions";
       const cont = document.createElement("button");
@@ -394,8 +1293,14 @@
       cont.textContent = "Continue";
       cont.onclick = () => continueTurn();
       actions.appendChild(cont);
-      el.appendChild(actions);
-      return el;
+      node.appendChild(actions);
+      return node;
+    }
+    function addWorking() {
+      return add("assistant", "Working\u2026", { extraClass: "working", markdown: false });
+    }
+    function addError(err) {
+      return add("tool", String(err), { extraClass: "error", label: "Error", markdown: false });
     }
     function qlist(sid) {
       if (!sid) return [];
@@ -496,10 +1401,11 @@
     }
     function dropFromSeq(seq) {
       if (seq == null) return;
-      for (const node of [...$("log").children]) {
+      for (const node of [...$("log").querySelectorAll("[data-seq]")]) {
         const s = Number(node.dataset.seq);
         if (Number.isFinite(s) && s >= seq) node.remove();
       }
+      for (const s of [...renderedSeqs]) if (s >= seq) renderedSeqs.delete(s);
     }
     function ensurePlaceholder() {
       if (!$("log").querySelector(".msg")) {
@@ -684,6 +1590,7 @@
       const sid = currentSid();
       if (!sid) {
         $("status").textContent = "disconnected";
+        resetLog();
         $("log").innerHTML = '<div class="placeholder">Start a new chat or pick one from the left.</div>';
         _resetAutoscroll();
         return;
@@ -695,7 +1602,7 @@
       try {
         const r = await api("/v1/sessions/" + sid + "/events");
         if (inFlight && inFlight.sid === sid) { syncComposer(); return; }
-        $("log").replaceChildren();
+        resetLog();
         _resetAutoscroll();
         const evs = r.events || [];
         stoppedSids.delete(sid);
@@ -704,10 +1611,12 @@
           $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
         } else {
           for (const ev of evs) renderEvent(ev);
+          syncRestoreDefaults();
           if (pendingAskFromEvents(evs)) waitingAskSids.add(sid);
           else {
-            const last = evs[evs.length - 1];
-            if (last.kind !== "assistant") stoppedSids.add(sid);
+            const turns = evs.filter((e) => e.kind !== "checkpoint_restore");
+            const last = turns[turns.length - 1];
+            if (last && last.kind !== "assistant") stoppedSids.add(sid);
           }
         }
         $("status").textContent = "";
@@ -743,7 +1652,7 @@
         event_count: 0
       };
       sessions = [session, ...sessions.filter((s) => s.id !== session.id)];
-      $("log").replaceChildren();
+      resetLog();
       $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
       _resetAutoscroll();
       setActive(session, { skipHistory: true });
@@ -880,11 +1789,17 @@
       }
       stoppedSids.delete(sid);
       if (pending || seq == null) { syncComposer(); return; }
+      const box = el ? el.querySelector(".restore-files-box") : null;
+      const restoreFiles = box ? box.checked : turnEditsFilesAfter(seq);
       try {
-        await api("/v1/sessions/" + sid + "/rewind", {
-          method:"POST", body: JSON.stringify({ from_seq: seq })
+        const r = await api("/v1/sessions/" + sid + "/rewind", {
+          method:"POST", body: JSON.stringify({ from_seq: seq, restore_files: restoreFiles })
         });
         dropFromSeq(seq);
+        if (r.checkpoint_restore) {
+          const cp = r.checkpoint_restore;
+          add("tool", restoreSummaryText(cp), { seq: cp.seq, extraClass: "checkpoint" });
+        }
         ensurePlaceholder();
         await refreshSessions();
       } catch (e) { $("status").textContent = String(e); }
@@ -900,11 +1815,10 @@
         const r = await api("/v1/sessions/" + sid + "/turns/inject", {
           method:"POST", body: JSON.stringify({ text })
         });
-        if (currentSid() === sid) {
-          const working = $("log").querySelector(".msg.working");
-          const el = add("user", text, { seq: r.seq, extraClass: "injected" });
-          attachUserActions(el, text, r.seq, false);
-          if (working) $("log").appendChild(working);
+        if (currentSid() === sid && r.seq != null && !renderedSeqs.has(Number(r.seq))) {
+          renderedSeqs.add(Number(r.seq));
+          const node = add("user", text, { seq: r.seq, extraClass: "injected" });
+          attachUserActions(node, text, r.seq, false);
         }
       } catch (e) {
         restoreComposer(text);
@@ -915,31 +1829,85 @@
       const origin = $("base").value.trim() || window.location.origin;
       const u = new URL("/v1/sessions/" + sid + "/ws", origin);
       u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-      const tok = $("token").value.trim();
-      if (tok) u.searchParams.set("token", tok);
       return u.toString();
     }
+    function openSessionWs(sid) {
+      // The JWT rides in Sec-WebSocket-Protocol ("bearer, <jwt>") rather than
+      // the URL so it never lands in access logs; the gateway echoes "bearer".
+      const tok = $("token").value.trim();
+      const protocols = tok ? ["bearer", tok] : [];
+      return new WebSocket(sessionWsUrl(sid), protocols);
+    }
+    function maxSeqInLog() {
+      let top = 0;
+      $("log").querySelectorAll("[data-seq]").forEach((n) => {
+        const s = Number(n.dataset.seq);
+        if (Number.isFinite(s) && s > top) top = s;
+      });
+      return top;
+    }
+    const RECONNECT_BASE_MS = 500;
+    const RECONNECT_CAP_MS = 10000;
+    // Runs one turn over the session WebSocket. If the socket drops after the
+    // turn has started, reconnects with backoff and sends
+    // {type:"subscribe", after_seq} so the server replays the gap; frames are
+    // deduplicated by seq and the promise settles only on turn_done (or a
+    // turn_status that says the turn is over).
     function streamTurn(sid, payload, onEvent) {
       return new Promise((resolve, reject) => {
         let settled = false;
-        let ws;
+        let ws = null;
+        let retryTimer = null;
+        let attempt = 0;
+        let started = false;    // saw at least one stored event for this turn
+        let replaying = false;  // between sending subscribe and receiving turn_status
+        let lastSeq = maxSeqInLog();
+        const seen = new Set();
+        const here = () => currentSid() === sid;
+        const setLink = (state) => {
+          if (!here()) return;
+          const w = $("log").querySelector(".msg.working .msg-body");
+          if (state === "reconnecting") {
+            $("status").textContent = "reconnecting… (" + attempt + ")";
+            if (w) w.textContent = "assistant: Working… (reconnecting)";
+          } else {
+            if ($("status").textContent.startsWith("reconnecting")) $("status").textContent = "working…";
+            if (w) w.textContent = "assistant: Working…";
+          }
+        };
         const finish = (fn, val) => {
           if (settled) return;
           settled = true;
+          if (retryTimer) clearTimeout(retryTimer);
           try { if (ws) ws.close(); } catch (e) {}
+          if ($("status").textContent.startsWith("reconnecting")) $("status").textContent = "working…";
           fn(val);
         };
-        try { ws = new WebSocket(sessionWsUrl(sid)); }
-        catch (e) { reject(e); return; }
-        ws.onopen = () => {
-          try { ws.send(JSON.stringify(payload)); }
-          catch (e) { finish(reject, e); }
+        const scheduleReconnect = () => {
+          const delay = Math.min(RECONNECT_CAP_MS, RECONNECT_BASE_MS * Math.pow(2, attempt));
+          attempt += 1;
+          setLink("reconnecting");
+          retryTimer = setTimeout(() => connect(true), delay);
         };
-        ws.onmessage = (ev) => {
-          let msg;
-          try { msg = JSON.parse(ev.data); }
-          catch (e) { finish(reject, e); return; }
-          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" || msg.kind === "idle") {
+        const onFrame = (msg) => {
+          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" ||
+              msg.kind === "idle" || msg.kind === "injected" || msg.kind === "approval") {
+            return;
+          }
+          if (msg.kind === "turn_status") {
+            replaying = false;
+            attempt = 0;
+            if (msg.running) { setLink("connected"); return; }
+            const last = msg.last_turn_done;
+            if (!started) {
+              finish(reject, new Error("connection lost before the turn started"));
+            } else if (last && last.status === "error") {
+              finish(reject, new Error(last.detail || "turn failed"));
+            } else if (last) {
+              finish(resolve, { status: last.status || "ok", user_seq: last.user_seq });
+            } else {
+              finish(resolve, { status: "stopped", user_seq: null });
+            }
             return;
           }
           if (msg.kind === "error") {
@@ -951,15 +1919,55 @@
             finish(resolve, { status: msg.status || "ok", user_seq: msg.user_seq });
             return;
           }
+          if (msg.seq != null) {
+            started = true;
+            if (seen.has(msg.seq)) return;
+            seen.add(msg.seq);
+            if (msg.seq > lastSeq) lastSeq = msg.seq;
+            if (replaying && here() && $("log").querySelector('[data-seq="' + msg.seq + '"]')) return;
+          }
           if (onEvent) onEvent(msg);
         };
-        ws.onerror = () => finish(reject, new Error("WebSocket error"));
-        ws.onclose = (ev) => {
+        function connect(resub) {
           if (settled) return;
-          if (ev.code === 4401) finish(reject, new Error("unauthorized"));
-          else if (ev.code === 4404) finish(reject, new Error("session not found"));
-          else finish(reject, new Error("WebSocket closed (" + ev.code + ")"));
-        };
+          retryTimer = null;
+          let sock;
+          try { sock = openSessionWs(sid); }
+          catch (e) {
+            if (resub) scheduleReconnect(); else reject(e);
+            return;
+          }
+          ws = sock;
+          sock.onopen = () => {
+            if (settled || ws !== sock) return;
+            try {
+              if (resub) {
+                replaying = true;
+                sock.send(JSON.stringify({ type: "subscribe", after_seq: lastSeq }));
+              } else {
+                sock.send(JSON.stringify(payload));
+              }
+            } catch (e) { try { sock.close(); } catch (e2) {} }
+          };
+          sock.onmessage = (ev) => {
+            if (settled || ws !== sock) return;
+            let msg;
+            try { msg = JSON.parse(ev.data); }
+            catch (e) { finish(reject, e); return; }
+            onFrame(msg);
+          };
+          sock.onerror = () => {};
+          sock.onclose = (ev) => {
+            if (settled || ws !== sock) return;
+            ws = null;
+            if (ev.code === 4401) { finish(reject, new Error("unauthorized")); return; }
+            if (ev.code === 4404) { finish(reject, new Error("session not found")); return; }
+            if (!started) { finish(reject, new Error("WebSocket closed (" + ev.code + ")")); return; }
+            replaying = false;
+            scheduleReconnect();
+          };
+        }
+        connect(false);
       });
     }
     async function continueTurn() {
@@ -971,7 +1979,7 @@
       const ph = $("log").querySelector(".placeholder");
       if (ph) ph.remove();
       $("log").querySelectorAll(".msg.stopped").forEach((n) => n.remove());
-      const workingEl = add("assistant", "Working…", { extraClass: "working" });
+      const workingEl = addWorking();
       let resolveDone;
       const done = new Promise((r) => { resolveDone = r; });
       inFlight = { sid, text: "", userEl: null, workingEl, done };
@@ -981,7 +1989,6 @@
         const r = await streamTurn(sid, { resume: true }, (ev) => {
           if (currentSid() !== sid) return;
           renderEvent(ev);
-          if (workingEl && workingEl.parentNode) $("log").appendChild(workingEl);
         });
         if (workingEl.parentNode) workingEl.remove();
         if (currentSid() === sid) {
@@ -992,7 +1999,7 @@
         await drainQueue(sid, r.status);
       } catch (e) {
         if (workingEl.parentNode) workingEl.remove();
-        if (currentSid() === sid) add("tool", String(e));
+        if (currentSid() === sid) addError(e);
       } finally {
         if (inFlight && inFlight.sid === sid) inFlight = null;
         if (resolveDone) resolveDone();
@@ -1017,7 +2024,7 @@
       if (!text) return;
       if (!currentSid()) {
         try { await createSession($("wuri").value, $("wkind").value); }
-        catch (e) { add("tool", String(e)); return; }
+        catch (e) { addError(e); return; }
       }
       persistSid();
       const sid = currentSid();
@@ -1028,7 +2035,7 @@
       $("text").value = "";
       const userEl = add("user", text, { extraClass: "pending" });
       attachUserActions(userEl, text, null, true);
-      const workingEl = add("assistant", "Working…", { extraClass: "working" });
+      const workingEl = addWorking();
       let resolveDone;
       const done = new Promise((r) => { resolveDone = r; });
       inFlight = { sid, text, userEl, workingEl, done };
@@ -1037,16 +2044,18 @@
       try {
         const r = await streamTurn(sid, { text }, (ev) => {
           if (currentSid() !== sid) return;
-          if (ev.kind === "user") {
+          if (ev.kind === "user" && !(ev.payload && ev.payload.injected)) {
             if (userEl) {
               userEl.classList.remove("pending");
-              if (ev.seq != null) userEl.dataset.seq = String(ev.seq);
+              if (ev.seq != null) {
+                userEl.dataset.seq = String(ev.seq);
+                renderedSeqs.add(Number(ev.seq));
+              }
               attachUserActions(userEl, text, ev.seq, false);
             }
             return;
           }
           renderEvent(ev);
-          if (workingEl && workingEl.parentNode) $("log").appendChild(workingEl);
         });
         const stillHere = currentSid() === sid;
         if (workingEl.parentNode) workingEl.remove();
@@ -1058,6 +2067,7 @@
         } else if (stillHere) {
           if (userEl && r.user_seq != null) userEl.dataset.seq = String(r.user_seq);
           if (userEl) attachUserActions(userEl, text, r.user_seq, false);
+          syncRestoreDefaults();
           if (r.status === "waiting_ask") waitingAskSids.add(sid);
           if (r.status === "stopped") stoppedSids.add(sid);
         }
@@ -1070,7 +2080,7 @@
       } catch (e) {
         if (workingEl.parentNode) workingEl.remove();
         if (userEl) userEl.classList.remove("pending");
-        if (currentSid() === sid) add("tool", String(e));
+        if (currentSid() === sid) addError(e);
       } finally {
         if (inFlight && inFlight.sid === sid) inFlight = null;
         if (resolveDone) resolveDone();

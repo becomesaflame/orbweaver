@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -194,7 +195,7 @@ def test_write_and_read_bytes(tmp_path: Path):
 
 def test_resolve_bash_timeout_default_and_cap():
     assert resolve_bash_timeout() == DEFAULT_BASH_TIMEOUT_S
-    assert resolve_bash_timeout(None, None) == 30
+    assert resolve_bash_timeout(None, None) == 120
     assert resolve_bash_timeout(45) == 45
     assert resolve_bash_timeout(block_until_ms=90_000) == 90
     assert resolve_bash_timeout(9999) == MAX_BASH_TIMEOUT_S
@@ -209,8 +210,49 @@ def test_bash_timeout_expiry(tmp_path: Path, monkeypatch):
     started = time.monotonic()
     out = ws.bash("sleep 5", timeout=1)
     elapsed = time.monotonic() - started
-    assert "timeout: command exceeded 1s" in out
+    assert "timed out after 1s" in out
     assert elapsed < 4
+
+
+def test_bash_result_has_exit_header(tmp_path: Path, monkeypatch):
+    from orbweaver.config import settings
+
+    monkeypatch.setattr(settings, "orbweaver_sandbox", False)
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ok = ws.bash("echo hi")
+    assert re.match(r"\[cwd .* \| exit 0 in [0-9.]+s\]$", ok.splitlines()[0])
+    assert ok.splitlines()[0].endswith("s]")
+    assert ok.splitlines()[1] == "hi"
+    failed = ws.bash("echo boom >&2; exit 3")
+    assert re.match(r"\[cwd .* \| exit 3 in [0-9.]+s\]$", failed.splitlines()[0])
+    assert "boom" in failed
+    empty = ws.bash("true")
+    assert re.match(r"\[cwd .* \| exit 0 in [0-9.]+s\]$", empty) and "\n" not in empty
+
+
+def test_bash_job_snapshot_previews_oversized_output(tmp_path: Path, monkeypatch):
+    from orbweaver.config import settings
+
+    monkeypatch.setattr(settings, "orbweaver_sandbox", False)
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    cmd = "for i in $(seq 1 6000); do echo \"row $i\"; done; echo 'FAILED tests/x.py::test_y'"
+    started = json.loads(ws.bash(cmd, background=True, timeout=20))
+    job_id = started["job_id"]
+    finished = json.loads(ws.collect_job(job_id, wait_s=15))
+    assert finished["status"] == "exited"
+    assert finished["returncode"] == 0
+    assert finished["elapsed_s"] >= 0
+    out = finished["output"]
+    assert out.startswith("row 1\n")
+    assert out.rstrip().endswith("FAILED tests/x.py::test_y")
+    assert "chars omitted" in out
+    rel = finished["persisted_path"]
+    assert rel == f".orbweaver/tool-results/{job_id}.txt"
+    assert f"full output saved to {rel}" in out
+    assert finished["output_chars"] > len(out)
+    assert ws.read(rel).rstrip().endswith("FAILED tests/x.py::test_y")
+    assert "row 3000" in ws.read(rel)
+    assert len(json.dumps(finished)) <= settings.compact_tool_result_chars
 
 
 def test_bash_raised_timeout_allows_over_30s(tmp_path: Path, monkeypatch):
@@ -255,7 +297,7 @@ async def test_run_tools_bash_timeout_and_background(tmp_path: Path, monkeypatch
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     ctx = {"workspace": ws, "store": reset_store_for_tests(), "session_id": uuid4()}
     timed_out = await run_tools("Bash", {"command": "sleep 5", "timeout": 1}, ctx)
-    assert "timeout: command exceeded 1s" in timed_out
+    assert "timed out after 1s" in timed_out
     started = json.loads(
         await run_tools("Bash", {"command": "echo tool-bg", "background": True, "timeout": 10}, ctx)
     )
@@ -276,7 +318,7 @@ def test_bash_tool_schema_documents_timeout_and_background():
     assert "background" in props
     assert "job_id" in props
     desc = bash["description"]
-    assert "30" in desc
+    assert "120" in desc
     assert "600" in desc
     assert "background" in desc.lower()
     assert "job_id" in desc

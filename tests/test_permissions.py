@@ -11,6 +11,7 @@ from orbweaver.permissions.rules import (
     is_critical_rm,
     is_protected_git_push,
     path_is_always_denied,
+    write_is_always_denied,
 )
 from orbweaver.store import Event
 from orbweaver.workspace import LocalWorkspace
@@ -301,6 +302,41 @@ async def test_denial_success_resets_consecutive(tmp_path, monkeypatch):
     assert ctx["denial_state"].consecutive_denials == 0
 
 
+@pytest.mark.asyncio
+async def test_git_config_write_denied(tmp_path, monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("classifier should not run")
+
+    monkeypatch.setattr("orbweaver.permissions.pipeline.classify_action", boom)
+    ctx = _ctx(tmp_path)
+    for tool in ("Write", "StrReplace", "Delete", "NotebookEdit"):
+        inp = {"path": ".git/config", "content": "x"}
+        decision = await can_use_tool(tool, inp, ctx)
+        assert decision.behavior == "deny", tool
+        assert decision.fast_path == "deny_rule"
+    hook = await can_use_tool("Write", {"path": ".git/hooks/pre-commit", "content": "x"}, ctx)
+    assert hook.behavior == "deny"
+
+
+def test_write_is_always_denied_paths():
+    assert write_is_always_denied(".git/config")
+    assert write_is_always_denied(".git/hooks/pre-commit")
+    assert write_is_always_denied("sub/pkg/.git/config")
+    assert write_is_always_denied(".gitmodules")
+    assert write_is_always_denied(".gitconfig")
+    assert write_is_always_denied(".bashrc")
+    assert write_is_always_denied(".bash_profile")
+    assert write_is_always_denied(".zshrc")
+    assert write_is_always_denied(".profile")
+    assert write_is_always_denied(".ripgreprc")
+    assert write_is_always_denied(".mcp.json")
+    assert write_is_always_denied(".env")  # inherited from path_is_always_denied
+    assert not write_is_always_denied("src/app.py")
+    assert not write_is_always_denied("README.md")
+    # Reads of git config are not blocked by the write-only rule.
+    assert not path_is_always_denied(".git/config")
+
+
 def test_critical_rm_and_deny_names():
     assert is_critical_rm("rm -rf /")
     assert is_critical_rm("rm -rf $HOME")
@@ -308,6 +344,7 @@ def test_critical_rm_and_deny_names():
     assert path_is_always_denied(".env")
     assert path_is_always_denied(".ssh/id_rsa")
     assert path_is_always_denied(".orbweaver/mcp.json")
+    assert path_is_always_denied(".orbweaver/hooks.json")
     assert is_protected_git_push("git push origin main")
     assert is_protected_git_push("git push -u origin master")
     assert is_protected_git_push("git push origin HEAD:main")

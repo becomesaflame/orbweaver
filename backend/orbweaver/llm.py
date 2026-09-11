@@ -28,6 +28,26 @@ _STREAM_EVENT_TYPES = frozenset(
     }
 )
 
+SONNET_MAX_TOKENS = 64_000
+OPUS_MAX_TOKENS = 32_000
+DEFAULT_MAX_TOKENS = 8_192
+
+
+def max_tokens_for_model(model: str) -> int:
+    """Output budget for a model id (Claw Code: Sonnet 64k, Opus 32k)."""
+    name = (model or "").lower()
+    if "opus" in name:
+        return OPUS_MAX_TOKENS
+    if "sonnet" in name:
+        return SONNET_MAX_TOKENS
+    return DEFAULT_MAX_TOKENS
+
+
+def completion_max_tokens(model: str | None = None) -> int:
+    """Tokens to request; stay at or under output_reserve so compact math holds."""
+    raw = max_tokens_for_model(model or settings.orbweaver_model)
+    return max(1, min(raw, settings.output_reserve))
+
 
 def select_provider() -> str:
     if settings.anthropic_api_key.strip():
@@ -44,6 +64,56 @@ def no_llm_echo(user_text: str) -> str:
         + "\nSet the key to enable the Claude tool loop, or set OLLAMA_BASE_URL and "
         "OLLAMA_MODEL for a local Ollama fallback."
     )
+
+
+CACHE_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
+# Mark the tools array as a cache prefix only when it is big enough to matter.
+CACHE_TOOLS_MIN = 8
+
+
+def prompt_cache_supported(client: Any) -> bool:
+    """Anthropic honours ``cache_control``; the Ollama shim rebuilds messages without it."""
+    return not isinstance(client, OllamaMessagesClient)
+
+
+def with_message_cache_breakpoint(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy ``messages`` with ``cache_control`` on the last block of the final user message.
+
+    Tool results are appended each round, so the previous breakpoint's prefix is
+    a prefix of this round's request and Anthropic serves it as a cache read.
+    String user content becomes a single text block on every user message so
+    the message that carried last round's breakpoint is byte-identical this
+    round. Never mutates the input (blocks may be shared with event payloads).
+    """
+    if not messages:
+        return messages
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        msg = dict(m)
+        content = msg.get("content")
+        if msg.get("role") == "user" and isinstance(content, str) and content:
+            msg["content"] = [{"type": "text", "text": content}]
+        out.append(msg)
+    for i in range(len(out) - 1, -1, -1):
+        msg = out[i]
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list) and content and isinstance(content[-1], dict):
+            blocks = list(content)
+            blocks[-1] = {**blocks[-1], "cache_control": dict(CACHE_EPHEMERAL)}
+            msg["content"] = blocks
+        break
+    return out
+
+
+def with_tool_cache_breakpoint(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Copy ``tools`` with ``cache_control`` on the last definition when the list is large."""
+    if not tools or len(tools) < CACHE_TOOLS_MIN or not isinstance(tools[-1], dict):
+        return tools
+    out = list(tools)
+    out[-1] = {**out[-1], "cache_control": dict(CACHE_EPHEMERAL)}
+    return out
 
 
 def make_agent_client(*, http: Any | None = None) -> Any | None:

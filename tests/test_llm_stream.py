@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+
 from orbweaver.agent import TurnCancelled, agent_turn
 from orbweaver.compact.project import (
     INTERRUPTED_TOOL,
