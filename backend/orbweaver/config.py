@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     orbweaver_checkpoint_keep_days: int = 14  # prune refs/orbweaver/checkpoints older than this
     orbweaver_pinned_token_cap: int = 4000
     orbweaver_skills_token_cap: int = 4000
+    # Per-item cap for one instruction doc / rule / skill body inlined in a prompt.
+    orbweaver_instruction_item_token_cap: int = 2000
+    # User-level instructions; empty → <orbweaver_data_dir or ~/.orbweaver>/AGENTS.md
+    orbweaver_user_instructions: str = ""
     context_window: int = 200_000
     output_reserve: int = 16_000
     static_token_estimate: int = 12_000

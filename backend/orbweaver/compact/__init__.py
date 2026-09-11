@@ -10,6 +10,7 @@ from orbweaver.compact.overflow import (
 from orbweaver.compact.persist import persist_tool_result
 from orbweaver.compact.pipeline import maybe_compact
 from orbweaver.compact.project import (
+    PROJECT_INSTRUCTIONS_KIND,
     choose_keep_from_recent_rounds,
     ensure_tool_use_results,
     events_to_messages,
@@ -30,6 +31,7 @@ from orbweaver.compact.usage import (
 
 __all__ = [
     "CONTEXT_FULL_MESSAGE",
+    "PROJECT_INSTRUCTIONS_KIND",
     "ContextFullError",
     "choose_keep_from_recent_rounds",
     "ensure_tool_use_results",

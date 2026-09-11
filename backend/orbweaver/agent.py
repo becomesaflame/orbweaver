@@ -17,6 +17,7 @@ from orbweaver import __version__
 from orbweaver.checkpoints import checkpoint_user_turn, pin_user_turn
 from orbweaver.compact import (
     CONTEXT_FULL_MESSAGE,
+    PROJECT_INSTRUCTIONS_KIND,
     ContextFullError,
     ensure_tool_use_results,
     events_to_messages,
@@ -34,6 +35,7 @@ from orbweaver.compact.overflow import (
 )
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
+from orbweaver.instructions import instruction_blocks_for_call, seen_instruction_keys
 from orbweaver.lints import read_lints
 from orbweaver.llm import (
     prompt_cache_supported,
@@ -264,6 +266,28 @@ TOOL_SPEC = [
                     "description": "Workspace paths to check. Empty uses recently edited files.",
                 }
             },
+        },
+    },
+    {
+        "name": "Skill",
+        "description": (
+            "Load a workspace skill (SKILL.md) or an on-demand rule by name. The system "
+            "prompt lists available skills and description-only rules as name: description; "
+            "call this to read the full body before following one. kind is skill (default) "
+            "or rule."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill or rule name from the list."},
+                "kind": {
+                    "type": "string",
+                    "enum": ["skill", "rule"],
+                    "description": "skill loads SKILL.md (default); rule loads a .cursor/rules "
+                    "or .orbweaver/rules entry that is not always-on.",
+                },
+            },
+            "required": ["name"],
         },
     },
     {
@@ -778,6 +802,11 @@ def static_system(channel: str = "") -> str:
         "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
         "Configured MCP servers appear as mcp_<server>_<tool> and use the "
         "same permission pipeline as other tools. "
+        "Project instructions: the workspace section below holds always-on rules; "
+        "skills and on-demand rules are listed by name, so call Skill(name) before "
+        "following one. Nested AGENTS.md / CLAUDE.md / .cursor/rules for a directory "
+        "arrive as <project-instructions dir=...> blocks after you touch a path under it; "
+        "follow them for work in that directory. "
         "Git: after clone, fetch, rebase, merge, commit, or push, read Git's state — "
         "the Bash footer 'git ritual' (status, branch, HEAD) is authoritative, not a "
         "success substring like 'Everything up-to-date'. Identify the repo (cd target "
@@ -811,6 +840,21 @@ def build_agent_system(
         {"type": "text", "text": static_system(channel), "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": rest},
     ]
+
+
+def _nested_instructions_for(
+    workspace, name: str, inp: dict[str, Any], ctx: dict[str, Any]
+) -> list[str]:
+    """Nested AGENTS.md / CLAUDE.md / .cursor/rules blocks for paths this call touched."""
+    root = getattr(workspace, "root", None)
+    if root is None:
+        return []
+    seen = ctx.setdefault("instructions_seen", set())
+    try:
+        return instruction_blocks_for_call(Path(root), name, inp, seen)
+    except Exception as e:  # discovery must never break the tool round
+        log.warning("nested instruction discovery failed for %s: %s", name, e)
+        return []
 
 
 def _blocked_tool_result(decision) -> str:
@@ -1034,6 +1078,18 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
             return str(e)
     if name == "ReadLints":
         return await asyncio.to_thread(read_lints, ws, inp, ctx.get("events"))
+    if name == "Skill":
+        from orbweaver.instructions import load_skill_or_rule
+
+        root = getattr(ws, "root", None)
+        if root is None:
+            return "error: this workspace has no local root for skills"
+        return await asyncio.to_thread(
+            load_skill_or_rule,
+            Path(root),
+            str(inp.get("name") or ""),
+            str(inp.get("kind") or "skill"),
+        )
     if name == "Bash":
         from orbweaver.git_ritual import annotate_bash_output, ritual_says_not_done
         from orbweaver.permissions.pipeline import bash_permissions
@@ -1531,6 +1587,9 @@ async def agent_turn(
         "emit": emit,
         "subagent_depth": subagent_depth,
         "channel": resolved_channel,
+        # Per-turn cache of nested instruction dirs / glob rules already injected. Seeded
+        # from blocks still in the live prompt window so a later turn does not repeat them.
+        "instructions_seen": seen_instruction_keys(live_events(prior)),
         # Background subagents spawned by this turn (str child id -> ChildRun).
         "children": {},
     }
@@ -1633,6 +1692,7 @@ async def agent_turn(
                 break
             stop_after_ask = False
             waiting_ask = False
+            instruction_blocks: list[str] = []
             # #99: consecutive concurrency-safe calls (Read, Grep, ...) form one
             # batch and run together; every unsafe call is a batch of one and a
             # barrier. tool_call events for a batch are recorded up front and
@@ -1728,6 +1788,10 @@ async def agent_turn(
                 for block, decision, outcome in zip(batch, decisions, outcomes, strict=True):
                     if isinstance(outcome, BaseException):
                         raise outcome
+                    if decision.behavior == "allow":
+                        instruction_blocks.extend(
+                            _nested_instructions_for(workspace, block.name, dict(block.input), ctx)
+                        )
                     if outcome.flagged:
                         fire(
                             await store.append_event(
@@ -1766,6 +1830,19 @@ async def agent_turn(
                                 session_id, "schedule_request", {"input": dict(block.input)}
                             )
                         )
+            if instruction_blocks:
+                # User-side message for the next round (rendered after the tool results),
+                # same path as injected follow-ups: persisted event, projected into the prompt.
+                fire(
+                    await store.append_event(
+                        session_id,
+                        PROJECT_INSTRUCTIONS_KIND,
+                        {
+                            "text": "\n\n".join(instruction_blocks),
+                            "keys": sorted(ctx["instructions_seen"]),
+                        },
+                    )
+                )
             if waiting_ask:
                 break
             if stop_after_ask:
