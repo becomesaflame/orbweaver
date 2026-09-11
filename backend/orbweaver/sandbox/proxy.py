@@ -43,9 +43,15 @@ def domain_allowed(hostname: str, network: NetworkPolicy) -> bool:
 
 def ip_is_blocked(addr: str) -> bool:
     try:
-        ip = ipaddress.ip_address(addr.split("%")[0])
+        ip: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(
+            addr.split("%")[0].strip("[]")
+        )
     except ValueError:
         return True
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        # ::ffff:127.0.0.1 must be judged as 127.0.0.1 (3.12 does not do this itself).
+        ip = mapped
     if ip == _METADATA_V4:
         return True
     return bool(
@@ -55,6 +61,7 @@ def ip_is_blocked(addr: str) -> bool:
         or ip.is_multicast
         or ip.is_reserved
         or ip.is_unspecified
+        or not ip.is_global
     )
 
 

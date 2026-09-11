@@ -18,6 +18,13 @@ _FS_HINT = re.compile(
     r"read-only file system|operation not permitted|permission denied",
     re.IGNORECASE,
 )
+# EPERM from the seccomp deny-list (orbweaver.sandbox.seccomp), not a mount.
+_SECCOMP_HINT = re.compile(
+    r"\b(?:ptrace|PTRACE_\w+|unshare|setns|namespace|perf_event_open|io_uring\w*|"
+    r"keyctl|add_key|request_key|userfaultfd|bpf)\b|"
+    r"must be superuser to use mount|no new privileges.*sudo",
+    re.IGNORECASE,
+)
 
 
 def sandbox_denied(kind: str, detail: str, retry: str) -> str:
@@ -29,6 +36,17 @@ def network_denied(host: str) -> str:
         "network",
         f"{host} not allowed",
         'Ask the user to approve permissions ["full_network"] before retrying',
+    )
+
+
+def web_egress_denied(detail: str) -> str:
+    """WebFetch/Browser denial. There is no permissions override for these tools."""
+    return sandbox_denied(
+        "network",
+        detail,
+        "WebFetch and Browser cannot reach loopback, LAN, or link-local addresses; "
+        "other hosts follow the sandbox networkPolicy (allow/deny/webDefault). "
+        "Do not retry the same target",
     )
 
 
@@ -45,6 +63,14 @@ def filesystem_denied(detail: str) -> str:
         "filesystem",
         detail,
         'Ask the user to approve permissions ["all"] before host writes',
+    )
+
+
+def syscall_denied() -> str:
+    return sandbox_denied(
+        "syscall",
+        "ptrace, mount, namespaces, keyrings, bpf, perf, io_uring and setuid are blocked by seccomp/no_new_privs",
+        'Ask the user to approve permissions ["all"] if the tool truly needs it',
     )
 
 
@@ -66,6 +92,8 @@ def label_sandbox_output(out: str) -> str:
             + "\n"
             + text
         )
+    if "operation not permitted" in text.lower() and _SECCOMP_HINT.search(text):
+        return syscall_denied() + "\n" + text
     if _FS_HINT.search(text):
         return filesystem_denied("sandbox blocked a filesystem operation") + "\n" + text
     return text

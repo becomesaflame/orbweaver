@@ -206,6 +206,16 @@ async def _index_server(spec: McpServerSpec, session: McpSession, used: set[str]
         )
     specs.extend(_resource_specs(spec, session, used))
     return specs
+def mcp_tool_read_only(name: str) -> bool:
+    """Whether an exposed ``mcp_*`` tool is annotated read-only (and not destructive).
+
+    Unknown or not-yet-listed tools are not read-only; the agent treats them as
+    unsafe to run concurrently.
+    """
+    ann = mcp_tool_annotations(name)
+    return bool(ann and ann.auto_allow_candidate)
+
+
 
 
 async def mcp_tool_specs(workspace=None, *, config: McpConfig | None = None) -> list[dict[str, Any]]:

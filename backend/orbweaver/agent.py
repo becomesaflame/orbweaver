@@ -7,14 +7,17 @@ import json
 import logging
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
 from orbweaver import __version__
+from orbweaver.checkpoints import checkpoint_user_turn, pin_user_turn
 from orbweaver.compact import (
     CONTEXT_FULL_MESSAGE,
+    PROJECT_INSTRUCTIONS_KIND,
     ContextFullError,
     ensure_tool_use_results,
     events_to_messages,
@@ -22,9 +25,8 @@ from orbweaver.compact import (
     maybe_compact,
     persist_tool_result,
     prompt_events,
-    record_usage,
+    record_response_usage,
     rehydrate_messages,
-    usage_input_tokens,
 )
 from orbweaver.compact.overflow import (
     OVERFLOW_KEEP_ROUNDS,
@@ -33,18 +35,34 @@ from orbweaver.compact.overflow import (
 )
 from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
+from orbweaver.instructions import instruction_blocks_for_call, seen_instruction_keys
 from orbweaver.lints import read_lints
+from orbweaver.llm import (
+    prompt_cache_supported,
+    with_message_cache_breakpoint,
+    with_tool_cache_breakpoint,
+)
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
-from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
+from orbweaver.permissions import (
+    PermissionDecision,
+    TurnAborted,
+    can_use_tool,
+    denial_state_for,
+)
 from orbweaver.permissions.injection_probe import probe_tool_output
+from orbweaver.procs import BashInterrupted
+from orbweaver.readstate import ReadState, read_state_for
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
+from orbweaver.stuck import NUDGE_KIND, StuckDetector
 from orbweaver.todos import inject_session_todos, persist_todos
-from orbweaver.tooltext import format_read, format_webfetch
+from orbweaver.tools import partition_tool_calls
+from orbweaver.tooltext import format_read
 
 log = logging.getLogger(__name__)
 
 DEFAULT_MAX_ROUNDS = 48
+INTERRUPTED_BY_USER = "interrupted by user"
 LAST_ROUND_NUDGE = (
     "This is the last tool round of this turn. After these tool results, answer the user "
     "with what you have. Do not start new exploration. Spawn a subagent only if a narrower "
@@ -81,7 +99,11 @@ TOOL_SPEC = [
             "Relative paths are the session workspace. Absolute paths in extra sandbox "
             "roots are auto-allowed; other host paths are classified. Use offset "
             "(1-based line, or negative from the end) and limit to page text; do not "
-            "page files with Bash. The result says how to continue when truncated."
+            "page files with Bash. Default limit is 400 lines: Grep (or one wide Read) "
+            "to find a symbol; do not take tiny windows, and do not re-Read a path "
+            "already in this turn unless its result was truncated or cleared. Once you "
+            "have the numbered lines, edit with StrReplace. The result says how to "
+            "continue when truncated."
         ),
         "input_schema": {
             "type": "object",
@@ -98,7 +120,13 @@ TOOL_SPEC = [
     },
     {
         "name": "Write",
-        "description": "Write a file in the session workspace.",
+        "description": (
+            "Write a file in the session workspace. Overwriting an existing file "
+            "requires that you Read it earlier this session and that it has not "
+            "changed on disk since; otherwise the call is refused and you must Read "
+            "first. New files skip that check. The result is a unified diff for "
+            "existing files. Prefer StrReplace for partial edits."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
@@ -109,10 +137,16 @@ TOOL_SPEC = [
         "name": "StrReplace",
         "description": (
             "Edit an existing workspace file by replacing old_string with new_string. "
-            "old_string must match exactly once unless replace_all is true. Prefer this "
-            "over Write for existing files and over Bash (python, sed, perl) for source "
-            "edits. To resolve a git conflict, replace the entire hunk including "
-            "<<<<<<< / ======= / >>>>>>> marker lines with the resolved text."
+            "Read the file first: edits to a file you have not Read this session, or "
+            "that changed on disk since you read it, are refused. old_string must "
+            "match exactly once unless replace_all is true. When no exact match exists "
+            "the tool retries with line-number prefixes stripped, then a per-line "
+            "whitespace-trimmed match (the file's indentation is kept), then a "
+            "first/last-line anchor for blocks of 3+ lines; the result says which tier "
+            "matched and shows a unified diff. Prefer this over Write for existing "
+            "files and over Bash (python, sed, perl) for source edits. To resolve a git "
+            "conflict, replace the entire hunk including <<<<<<< / ======= / >>>>>>> "
+            "marker lines with the resolved text."
         ),
         "input_schema": {
             "type": "object",
@@ -132,7 +166,8 @@ TOOL_SPEC = [
         "name": "NotebookEdit",
         "description": (
             "Edit one cell in a .ipynb notebook. Do not Write the whole notebook JSON. "
-            "action is replace (default), insert, or delete. replace can set source or "
+            "Read the notebook first this session or the edit is refused. action is "
+            "replace (default), insert, or delete. replace can set source or "
             "search-replace with old_string/new_string."
         ),
         "input_schema": {
@@ -158,7 +193,8 @@ TOOL_SPEC = [
         "description": (
             "Delete a file or directory in the session working set. Same deny/ask rules as "
             "Write: always-deny secrets (.env, keys), and paths outside the working set are "
-            "blocked. Prefer this over Bash rm."
+            "blocked. Deleting a file requires that you Read it this session. Prefer this "
+            "over Bash rm."
         ),
         "input_schema": {
             "type": "object",
@@ -233,6 +269,28 @@ TOOL_SPEC = [
         },
     },
     {
+        "name": "Skill",
+        "description": (
+            "Load a workspace skill (SKILL.md) or an on-demand rule by name. The system "
+            "prompt lists available skills and description-only rules as name: description; "
+            "call this to read the full body before following one. kind is skill (default) "
+            "or rule."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill or rule name from the list."},
+                "kind": {
+                    "type": "string",
+                    "enum": ["skill", "rule"],
+                    "description": "skill loads SKILL.md (default); rule loads a .cursor/rules "
+                    "or .orbweaver/rules entry that is not always-on.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
         "name": "Bash",
         "description": (
             "Run a shell command in the workspace. Default timeout is 30 seconds if unspecified; "
@@ -245,9 +303,11 @@ TOOL_SPEC = [
             "escalation. If the sandbox blocks the command, ask the user before setting "
             "permissions to [\"full_network\"] (arbitrary internet) or [\"all\"] "
             "(host writes/docker/sudo). Those overrides pause for approval. "
-            "unsandboxed true aliases [\"all\"]. Git commands get an automatic "
-            "status footer (branch, HEAD, rebase-in-progress); trust that over "
-            "success substrings in the command output."
+            "unsandboxed true aliases [\"all\"]. Every result starts with a header line "
+            "(`exit <code> in <seconds>s`, or `timed out after Ns`); trust it over success "
+            "substrings in the output. Oversized output is saved under "
+            ".orbweaver/tool-results/ and shown as head + tail around an omission marker. "
+            "Git commands get an automatic status footer (branch, HEAD, rebase-in-progress)."
         ),
         "input_schema": {
             "type": "object",
@@ -506,7 +566,11 @@ TOOL_SPEC = [
             "Spawn a nested agent with its own event stream to complete a focused task. "
             "Shares this workspace and memory. Returns a summary. Nested spawns are not allowed. "
             "type/role selects a tool subset: explore (read/search), implement (default, edits), "
-            "or shell (Bash)."
+            "or shell (Bash). With background true it returns {subagent_id, status: running} "
+            "at once and the child runs concurrently; spawn several in one round to fan out. "
+            "Finished background results are delivered to you automatically after your "
+            "next reply, or call SubagentWait to block for them. Children are cancelled if "
+            "you end the turn without collecting them."
         ),
         "input_schema": {
             "type": "object",
@@ -523,8 +587,44 @@ TOOL_SPEC = [
                     "enum": ["explore", "implement", "shell"],
                     "description": "Alias for type.",
                 },
+                "background": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return immediately and run the child concurrently "
+                        "(default false: wait for the result)."
+                    ),
+                },
+                "timeout_s": {
+                    "type": "number",
+                    "description": (
+                        "Wall-clock limit for the child in seconds (default 600). "
+                        "On timeout the child is cancelled and the result is an error."
+                    ),
+                },
+                "max_rounds": {
+                    "type": "integer",
+                    "description": "Tool-round budget for the child (default 24).",
+                },
             },
             "required": ["task"],
+        },
+    },
+    {
+        "name": "SubagentWait",
+        "description": (
+            "Block until background subagents finish and return their results "
+            "({subagent_id, status, text} each). ids selects children; omit it to wait "
+            "for every child spawned this turn whose result you have not seen."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "subagent_id values from SpawnSubagent (default: all pending).",
+                }
+            },
         },
     },
     {
@@ -676,7 +776,9 @@ def _prompt_messages(events: list[Event], workspace, user_text: str) -> list[dic
 def static_system(channel: str = "") -> str:
     write_line = (
         "In auto mode, in-project Write and StrReplace apply immediately. "
-        "Prefer StrReplace for existing files. "
+        "Prefer StrReplace for existing files. Read a file before you edit it: "
+        "Write, StrReplace, NotebookEdit and Delete refuse existing files you have "
+        "not Read this session or that changed since. "
     )
     if channel_allows_proposepatch(channel):
         write_line += "Prefer ProposePatch when a visible diff overlay helps the user. "
@@ -700,6 +802,11 @@ def static_system(channel: str = "") -> str:
         "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
         "Configured MCP servers appear as mcp_<server>_<tool> and use the "
         "same permission pipeline as other tools. "
+        "Project instructions: the workspace section below holds always-on rules; "
+        "skills and on-demand rules are listed by name, so call Skill(name) before "
+        "following one. Nested AGENTS.md / CLAUDE.md / .cursor/rules for a directory "
+        "arrive as <project-instructions dir=...> blocks after you touch a path under it; "
+        "follow them for work in that directory. "
         "Git: after clone, fetch, rebase, merge, commit, or push, read Git's state — "
         "the Bash footer 'git ritual' (status, branch, HEAD) is authoritative, not a "
         "success substring like 'Everything up-to-date'. Identify the repo (cd target "
@@ -733,6 +840,21 @@ def build_agent_system(
         {"type": "text", "text": static_system(channel), "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": rest},
     ]
+
+
+def _nested_instructions_for(
+    workspace, name: str, inp: dict[str, Any], ctx: dict[str, Any]
+) -> list[str]:
+    """Nested AGENTS.md / CLAUDE.md / .cursor/rules blocks for paths this call touched."""
+    root = getattr(workspace, "root", None)
+    if root is None:
+        return []
+    seen = ctx.setdefault("instructions_seen", set())
+    try:
+        return instruction_blocks_for_call(Path(root), name, inp, seen)
+    except Exception as e:  # discovery must never break the tool round
+        log.warning("nested instruction discovery failed for %s: %s", name, e)
+        return []
 
 
 def _blocked_tool_result(decision) -> str:
@@ -789,67 +911,185 @@ def _ask_user_headless_abort(question: str) -> TurnAborted:
     )
 
 
+def _read_state(ctx: dict[str, Any], ws: Any) -> ReadState | None:
+    """Session ReadState (seeded from events once); None when tracking is off."""
+    if not settings.edit_require_read or not hasattr(ws, "edit_target"):
+        return None
+    state = ctx.get("read_state")
+    if not isinstance(state, ReadState):
+        state = read_state_for(ctx["session_id"])
+        ctx["read_state"] = state
+    state.seed(ctx.get("events"), ws.read_target)
+    return state
+
+
+def _edit_guard(ctx: dict[str, Any], ws: Any, path: str) -> str | None:
+    """Error text when ``path`` exists but was not Read this session or changed since."""
+    state = _read_state(ctx, ws)
+    if state is None:
+        return None
+    try:
+        target = ws.edit_target(path)
+    except PermissionError:
+        return None  # the tool itself reports the policy error
+    problem = state.check(target, path)
+    return f"error: {problem}" if problem else None
+
+
+def _note_edit(ctx: dict[str, Any], ws: Any, path: str, *, deleted: bool = False) -> None:
+    state = _read_state(ctx, ws)
+    if state is None:
+        return
+    try:
+        target = ws.edit_target(path)
+    except PermissionError:
+        return
+    if deleted:
+        state.forget(target)
+    else:
+        state.record(target)
+
+
+def _note_read(ctx: dict[str, Any], ws: Any, path: str) -> None:
+    state = _read_state(ctx, ws)
+    if state is None:
+        return
+    try:
+        state.record(ws.read_target(path))
+    except PermissionError:
+        return
+
+
+class ToolInterrupted(Exception):
+    """A running tool was killed because the user stopped the turn."""
+
+    def __init__(self, message: str = INTERRUPTED_BY_USER) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+async def _bash_call(ws: Any, cancel: asyncio.Event | None, **kwargs: Any) -> str:
+    """ws.bash without blocking the loop; cancel-aware when the workspace supports it."""
+    run_async = getattr(ws, "bash_async", None)
+    if run_async is not None:
+        return await run_async(cancel=cancel, **kwargs)
+    return await asyncio.to_thread(ws.bash, **kwargs)
+
+
 async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """Execute one tool call. Blocking work runs off the event loop.
+
+    Everything that touches the filesystem, spawns a process, or makes a
+    synchronous HTTP request goes through ``asyncio.to_thread`` or an async
+    client, so one session's 10-minute ``pytest`` does not stall the gateway.
+    Foreground Bash honours ``ctx["cancel"]`` and raises ToolInterrupted.
+    """
     ws = ctx["workspace"]
     store: Store = ctx["store"]
     session_id: UUID = ctx["session_id"]
     if name == "Read":
         path = str(inp.get("path") or "")
         if is_image_path(path):
-            return format_image_read(ws, path)
+            return await asyncio.to_thread(format_image_read, ws, path)
         try:
-            raw = ws.read(path)
+            raw = await asyncio.to_thread(ws.read, path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
+        _note_read(ctx, ws, path)
         return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
-        ws.write(inp["path"], inp["content"])
-        return f"wrote {inp['path']}"
+        path = str(inp.get("path") or "")
+        refused = _edit_guard(ctx, ws, path)
+        if refused:
+            return refused
+        if hasattr(ws, "write_with_diff"):
+            result = await asyncio.to_thread(ws.write_with_diff, path, inp["content"])
+        else:
+            await asyncio.to_thread(ws.write, path, inp["content"])
+            result = f"wrote {path}"
+        _note_edit(ctx, ws, path)
+        return result
     if name == "StrReplace":
+        path = str(inp.get("path") or "")
         try:
-            return ws.str_replace(
-                str(inp.get("path") or ""),
+            refused = _edit_guard(ctx, ws, path)
+            if refused:
+                return refused
+            result = await asyncio.to_thread(
+                ws.str_replace,
+                path,
                 str(inp.get("old_string") or ""),
                 str(inp.get("new_string") if inp.get("new_string") is not None else ""),
                 replace_all=bool(inp.get("replace_all")),
             )
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error replacing in {inp.get('path')}: {e}"
+        if result.startswith("updated"):
+            _note_edit(ctx, ws, path)
+        return result
     if name == "NotebookEdit":
         from orbweaver.notebook import apply_notebook_edit
 
-        return apply_notebook_edit(ws, inp)
+        path = str(inp.get("path") or "")
+        refused = _edit_guard(ctx, ws, path)
+        if refused:
+            return refused
+        result = await asyncio.to_thread(apply_notebook_edit, ws, inp)
+        if not result.startswith("error"):
+            _note_edit(ctx, ws, path)
+        return result
     if name == "Delete":
+        path = str(inp.get("path") or "")
         try:
-            return ws.delete(inp["path"])
+            refused = _edit_guard(ctx, ws, path)
+            if refused:
+                return refused
+            result = await asyncio.to_thread(ws.delete, path)
         except (OSError, PermissionError) as e:
             return f"error deleting {inp.get('path')}: {e}"
+        _note_edit(ctx, ws, path, deleted=True)
+        return result
     if name == "ProposePatch":
-        result = ws.propose_patch(inp["path"], inp.get("old_string") or "", inp["new_string"])
+        result = await asyncio.to_thread(
+            ws.propose_patch, inp["path"], inp.get("old_string") or "", inp["new_string"]
+        )
         return json.dumps(result)[:200_000]
     if name == "Glob":
         try:
-            return "\n".join(ws.glob(inp["pattern"])[:200])
+            hits = await asyncio.to_thread(ws.glob, inp["pattern"])
+            return "\n".join(hits[:200])
         except (FileNotFoundError, RuntimeError, TimeoutError) as e:
             return str(e)
     if name == "Grep":
         from orbweaver.workspace import _ctx_int
 
         try:
-            return "\n".join(
-                ws.grep(
-                    inp["pattern"],
-                    inp.get("glob") or "**/*",
-                    file_type=inp.get("type") or None,
-                    after=_ctx_int(inp.get("A")),
-                    before=_ctx_int(inp.get("B")),
-                    context=_ctx_int(inp.get("C")),
-                )
+            hits = await asyncio.to_thread(
+                ws.grep,
+                inp["pattern"],
+                inp.get("glob") or "**/*",
+                file_type=inp.get("type") or None,
+                after=_ctx_int(inp.get("A")),
+                before=_ctx_int(inp.get("B")),
+                context=_ctx_int(inp.get("C")),
             )
+            return "\n".join(hits)
         except (FileNotFoundError, TimeoutError) as e:
             return str(e)
     if name == "ReadLints":
-        return read_lints(ws, inp, ctx.get("events"))
+        return await asyncio.to_thread(read_lints, ws, inp, ctx.get("events"))
+    if name == "Skill":
+        from orbweaver.instructions import load_skill_or_rule
+
+        root = getattr(ws, "root", None)
+        if root is None:
+            return "error: this workspace has no local root for skills"
+        return await asyncio.to_thread(
+            load_skill_or_rule,
+            Path(root),
+            str(inp.get("name") or ""),
+            str(inp.get("kind") or "skill"),
+        )
     if name == "Bash":
         from orbweaver.git_ritual import annotate_bash_output, ritual_says_not_done
         from orbweaver.permissions.pipeline import bash_permissions
@@ -857,27 +1097,31 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         perms = sorted(bash_permissions(inp))
         background = bool(inp.get("background"))
         job_id = inp.get("job_id")
-        result = ws.bash(
-            inp.get("command") or "",
-            timeout=inp.get("timeout"),
-            block_until_ms=inp.get("block_until_ms"),
-            background=background,
-            job_id=job_id,
-            unsandboxed=bool(inp.get("unsandboxed")),
-            permissions=perms,
-        )
+        command = inp.get("command") or ""
+        try:
+            result = await _bash_call(
+                ws,
+                ctx.get("cancel"),
+                command=command,
+                timeout=inp.get("timeout"),
+                block_until_ms=inp.get("block_until_ms"),
+                background=background,
+                job_id=job_id,
+                unsandboxed=bool(inp.get("unsandboxed")),
+                permissions=perms,
+            )
+        except BashInterrupted as e:
+            raise ToolInterrupted() from e
         if not background and not job_id:
-            result = annotate_bash_output(
-                Path(ws.root), inp.get("command") or "", result
+            result = await asyncio.to_thread(
+                annotate_bash_output, Path(ws.root), command, result
             )
             ctx["git_not_done"] = ritual_says_not_done(result)
         return result
     if name == "WebFetch":
-        import httpx
+        from orbweaver.webfetch import run_webfetch
 
-        r = httpx.get(inp["url"], timeout=20.0, follow_redirects=True)  # noqa: ASYNC210
-        ctype = r.headers.get("content-type") or ""
-        return format_webfetch(str(inp.get("url") or ""), r.status_code, ctype, r.text)
+        return await run_webfetch(inp, ctx)
     if name == "Browser":
         from orbweaver.browser import run_browser
 
@@ -885,11 +1129,11 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "WebSearch":
         from orbweaver.websearch import run_websearch
 
-        return run_websearch(inp)
+        return await asyncio.to_thread(run_websearch, inp)
     if name == "WorkspaceSearch":
         from orbweaver.codesearch import run_workspace_search
 
-        return run_workspace_search(ws, inp)
+        return await asyncio.to_thread(run_workspace_search, ws, inp)
     if name == "MemorySearch":
         from orbweaver.hindsight import enabled as hindsight_on
         from orbweaver.hindsight import format_recall
@@ -1011,6 +1255,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         from orbweaver.subagent import run_subagent
 
         return await run_subagent(inp, ctx)
+    if name == "SubagentWait":
+        from orbweaver.subagent import wait_subagents
+
+        return await wait_subagents(inp, ctx)
     if name == "ScheduleTask":
         try:
             due = datetime.fromisoformat(str(inp["due_at"]).replace("Z", "+00:00"))  # noqa: FURB162
@@ -1052,6 +1300,13 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     return f"unknown tool {name}"
 
 
+@dataclass(frozen=True)
+class _ToolOutcome:
+    content: str
+    persisted_path: str | None = None
+    flagged: bool = False
+
+
 class TurnCancelled(Exception):
     """Raised when the user stops or discards an in-flight turn."""
 
@@ -1089,13 +1344,21 @@ async def _create_with_overflow_retry(
         if nudge:
             _nudge_user(messages, nudge)
         messages = ensure_tool_use_results(messages)
+        send_tools = tools
+        if prompt_cache_supported(client):
+            # Breakpoints: static system block (build_agent_system), the tools
+            # array when large, and the final user block. Each round appends
+            # tool results after the previous breakpoint, so the prefix is a
+            # cache read. Only Anthropic sees these; the Ollama shim drops them.
+            messages = with_message_cache_breakpoint(messages)
+            send_tools = with_tool_cache_breakpoint(tools)
         try:
             return await _await_or_cancel(
                 client.messages.create(
                     model=model,
                     max_tokens=4096,
                     system=cast(Any, system),
-                    tools=cast(Any, tools),
+                    tools=cast(Any, send_tools),
                     messages=cast(Any, messages),
                 ),
                 cancel,
@@ -1219,7 +1482,16 @@ async def agent_turn(
             payload["ask_answer"] = True
         if images:
             payload["images"] = images
+        checkpoint: dict[str, Any] | None = None
+        if subagent_depth == 0:
+            checkpoint = await asyncio.to_thread(checkpoint_user_turn, workspace)
+            if checkpoint is not None:
+                payload["checkpoint"] = checkpoint
         user_ev = await store.append_event(session_id, "user", payload)
+        if checkpoint is not None:
+            await asyncio.to_thread(
+                pin_user_turn, workspace, checkpoint, session_id, user_ev.seq
+            )
         if turn_state is not None:
             turn_state.user_seq = user_ev.seq
         if emit:
@@ -1249,6 +1521,27 @@ async def agent_turn(
         payload.setdefault("text", exc.message)
         fire(await store.append_event(session_id, "turn_aborted", payload))
         fire(await store.append_event(session_id, "assistant", {"text": exc.message}))
+
+    stuck_detector = StuckDetector()
+
+    async def check_stuck() -> None:
+        """Nudge once per loop streak; raise TurnAborted when the streak outlives the nudge."""
+        verdict = stuck_detector.check(await store.list_events(session_id))
+        if verdict is None:
+            return
+        if verdict.action == "abort":
+            log.warning(
+                "stuck: %s loop on %s x%d, ending turn", verdict.pattern, verdict.tool, verdict.count
+            )
+            raise TurnAborted(verdict.text, verdict.abort_payload())
+        log.info("stuck: %s loop on %s x%d, nudging", verdict.pattern, verdict.tool, verdict.count)
+        fire(await store.append_event(session_id, NUDGE_KIND, verdict.nudge_payload()))
+        # Same kind as injected follow-ups so events_to_messages renders it as a user turn.
+        fire(
+            await store.append_event(
+                session_id, "user", {"text": verdict.text, NUDGE_KIND: True}
+            )
+        )
 
     if answering and pending is not None:
         uid = str((pending.payload or {}).get("id") or pending.id)
@@ -1291,9 +1584,38 @@ async def agent_turn(
         "events": [],
         "cancel": cancel,
         "fire": fire,
+        "emit": emit,
         "subagent_depth": subagent_depth,
         "channel": resolved_channel,
+        # Per-turn cache of nested instruction dirs / glob rules already injected. Seeded
+        # from blocks still in the live prompt window so a later turn does not repeat them.
+        "instructions_seen": seen_instruction_keys(live_events(prior)),
+        # Background subagents spawned by this turn (str child id -> ChildRun).
+        "children": {},
     }
+
+    async def deliver_child_results() -> None:
+        """Background children that finished since the last round: show the model."""
+        from orbweaver.subagent import collect_finished
+
+        for body in collect_finished(ctx):
+            fire(await store.append_event(session_id, "subagent_result", body))
+    tool_slots = asyncio.Semaphore(max(1, int(settings.orbweaver_max_parallel_tools)))
+
+    async def execute_tool(block: Any, decision: PermissionDecision) -> _ToolOutcome:
+        """Run one permitted tool_use and probe its output; blocked calls get the gate text."""
+        if decision.behavior != "allow":
+            return _ToolOutcome(_blocked_tool_result(decision))
+        if block.name == "AskUser":
+            # Waiting for the user is handled in the round loop; only an empty
+            # question reaches here.
+            return _ToolOutcome("error: question is required")
+        async with tool_slots:
+            raw = await run_tools(block.name, dict(block.input), ctx)
+        text, persisted_path = persist_tool_result(workspace, str(block.id), block.name, raw)
+        probed = await probe_tool_output(block.name, text)
+        return _ToolOutcome(probed["output"], persisted_path, bool(probed.get("flagged")))
+
     pins = await pinned_prompt(store)
     system = build_agent_system(
         pins,
@@ -1317,6 +1639,7 @@ async def agent_turn(
     try:
         for round_i in range(max_rounds):
             check()
+            await deliver_child_results()
             inj = inject_event()
             if inj is not None:
                 inj.clear()
@@ -1350,7 +1673,7 @@ async def agent_turn(
             events = await store.list_events(session_id)
             ctx["events"] = events
             last_seq = events[-1].seq if events else 0
-            record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
+            record_response_usage(session_id, getattr(resp, "usage", None), last_seq)
             tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
             if texts:
@@ -1369,57 +1692,66 @@ async def agent_turn(
                 break
             stop_after_ask = False
             waiting_ask = False
-            for block in tool_uses:
+            instruction_blocks: list[str] = []
+            # #99: consecutive concurrency-safe calls (Read, Grep, ...) form one
+            # batch and run together; every unsafe call is a batch of one and a
+            # barrier. tool_call events for a batch are recorded up front and
+            # tool_result events in the original tool_use order.
+            for run in partition_tool_calls([b.name for b in tool_uses]):
+                batch = [tool_uses[i] for i in run]
                 check()
-                call_ev = await store.append_event(
-                    session_id,
-                    "tool_call",
-                    {"id": block.id, "name": block.name, "input": block.input},
-                )
-                fire(call_ev)
+                for block in batch:
+                    call_ev = await store.append_event(
+                        session_id,
+                        "tool_call",
+                        {"id": block.id, "name": block.name, "input": block.input},
+                    )
+                    fire(call_ev)
                 ctx["events"] = await store.list_events(session_id)
-                try:
-                    decision = await can_use_tool(block.name, dict(block.input), ctx)
-                except TurnAborted as e:
+                verdicts = await asyncio.gather(
+                    *(can_use_tool(b.name, dict(b.input), ctx) for b in batch),
+                    return_exceptions=True,
+                )
+                decisions: list[PermissionDecision] = []
+                for block, verdict in zip(batch, verdicts, strict=True):
+                    if isinstance(verdict, TurnAborted):
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "tool_result",
+                                {
+                                    "tool_use_id": block.id,
+                                    "name": block.name,
+                                    "content": verdict.message,
+                                },
+                            )
+                        )
+                        await record_abort(verdict)
+                        return produced
+                    if isinstance(verdict, BaseException):
+                        raise verdict
+                    decisions.append(verdict)
                     fire(
                         await store.append_event(
                             session_id,
-                            "tool_result",
+                            "permission_decision",
                             {
                                 "tool_use_id": block.id,
                                 "name": block.name,
-                                "content": e.message,
+                                "behavior": verdict.behavior,
+                                "reason": verdict.reason,
+                                "fast_path": verdict.fast_path,
                             },
                         )
                     )
-                    await record_abort(e)
-                    return produced
-                fire(
-                    await store.append_event(
-                        session_id,
-                        "permission_decision",
-                        {
-                            "tool_use_id": block.id,
-                            "name": block.name,
-                            "behavior": decision.behavior,
-                            "reason": decision.reason,
-                            "fast_path": decision.fast_path,
-                        },
-                    )
-                )
-                persisted_path = None
-                if decision.behavior != "allow":
-                    result = _blocked_tool_result(decision)
-                    if decision.behavior == "ask":
-                        stop_after_ask = True
-                elif block.name == "AskUser":
+                # AskUser is never concurrency-safe, so it is always a batch of one.
+                if len(batch) == 1 and batch[0].name == "AskUser" and decisions[0].behavior == "allow":
+                    block = batch[0]
                     question = str(dict(block.input).get("question") or "").strip()
-                    if not question:
-                        result = "error: question is required"
-                    elif not can_wait_for_user(ctx):
+                    if question and not can_wait_for_user(ctx):
                         await record_abort(_ask_user_headless_abort(question))
                         return produced
-                    else:
+                    if question:
                         fire(
                             await store.append_event(
                                 session_id,
@@ -1433,14 +1765,34 @@ async def agent_turn(
                         )
                         waiting_ask = True
                         break
-                else:
-                    result = await run_tools(block.name, dict(block.input), ctx)
-                    result, persisted_path = persist_tool_result(
-                        workspace, str(block.id), block.name, result
-                    )
-                    probed = await probe_tool_output(block.name, result)
-                    result = probed["output"]
-                    if probed.get("flagged"):
+                outcomes = await asyncio.gather(
+                    *(execute_tool(b, d) for b, d in zip(batch, decisions, strict=True)),
+                    return_exceptions=True,
+                )
+                for block, outcome in zip(batch, outcomes, strict=True):
+                    if isinstance(outcome, ToolInterrupted):
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "tool_result",
+                                {
+                                    "tool_use_id": block.id,
+                                    "name": block.name,
+                                    "content": outcome.message,
+                                    "is_error": True,
+                                },
+                            )
+                        )
+                        raise TurnCancelled(produced) from outcome
+                check()
+                for block, decision, outcome in zip(batch, decisions, outcomes, strict=True):
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    if decision.behavior == "allow":
+                        instruction_blocks.extend(
+                            _nested_instructions_for(workspace, block.name, dict(block.input), ctx)
+                        )
+                    if outcome.flagged:
                         fire(
                             await store.append_event(
                                 session_id,
@@ -1448,32 +1800,49 @@ async def agent_turn(
                                 {"tool_use_id": block.id, "name": block.name},
                             )
                         )
-                check()
-                kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
-                payload = {"tool_use_id": block.id, "name": block.name, "content": result}
-                if decision.behavior == "allow" and persisted_path:
-                    payload["persisted_path"] = persisted_path
-                if kind == "MemoryRecall":
-                    try:
-                        parsed = json.loads(result)
-                        payload["chunk_ids"] = parsed.get("chunk_ids") or []
-                        payload["text"] = parsed.get("text") or result
-                    except json.JSONDecodeError:
-                        payload["text"] = result
-                res_ev = await store.append_event(session_id, kind, payload)
-                fire(res_ev)
-                if block.name == "ProposePatch" and decision.behavior == "allow":
-                    fire(
-                        await store.append_event(
-                            session_id, "patch_proposal", {"tool_use_id": block.id, "content": result}
+                    result = outcome.content
+                    if decision.behavior == "ask":
+                        stop_after_ask = True
+                    kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
+                    payload = {"tool_use_id": block.id, "name": block.name, "content": result}
+                    if decision.behavior == "allow" and outcome.persisted_path:
+                        payload["persisted_path"] = outcome.persisted_path
+                    if kind == "MemoryRecall":
+                        try:
+                            parsed = json.loads(result)
+                            payload["chunk_ids"] = parsed.get("chunk_ids") or []
+                            payload["text"] = parsed.get("text") or result
+                        except json.JSONDecodeError:
+                            payload["text"] = result
+                    res_ev = await store.append_event(session_id, kind, payload)
+                    fire(res_ev)
+                    if block.name == "ProposePatch" and decision.behavior == "allow":
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "patch_proposal",
+                                {"tool_use_id": block.id, "content": result},
+                            )
                         )
-                    )
-                if block.name == "ScheduleTask" and decision.behavior == "allow":
-                    fire(
-                        await store.append_event(
-                            session_id, "schedule_request", {"input": dict(block.input)}
+                    if block.name == "ScheduleTask" and decision.behavior == "allow":
+                        fire(
+                            await store.append_event(
+                                session_id, "schedule_request", {"input": dict(block.input)}
+                            )
                         )
+            if instruction_blocks:
+                # User-side message for the next round (rendered after the tool results),
+                # same path as injected follow-ups: persisted event, projected into the prompt.
+                fire(
+                    await store.append_event(
+                        session_id,
+                        PROJECT_INSTRUCTIONS_KIND,
+                        {
+                            "text": "\n\n".join(instruction_blocks),
+                            "keys": sorted(ctx["instructions_seen"]),
+                        },
                     )
+                )
             if waiting_ask:
                 break
             if stop_after_ask:
@@ -1490,10 +1859,12 @@ async def agent_turn(
                     )
                 )
                 break
+            await check_stuck()
             await maybe_compact(
                 store, session_id, client=client, workspace=workspace, system=system
             )
         else:
+            await deliver_child_results()
             try:
                 resp = await _create_with_overflow_retry(
                     client,
@@ -1518,7 +1889,7 @@ async def agent_turn(
                 return produced
             events = await store.list_events(session_id)
             last_seq = events[-1].seq if events else 0
-            record_usage(session_id, usage_input_tokens(getattr(resp, "usage", None)), last_seq)
+            record_response_usage(session_id, getattr(resp, "usage", None), last_seq)
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
             if texts:
                 fire(
@@ -1549,7 +1920,15 @@ async def agent_turn(
         raise
     finally:
         from orbweaver.hindsight import retain_turn
+        from orbweaver.subagent import settle_children
 
+        if ctx.get("children"):
+            try:
+                await settle_children(
+                    ctx, cancelled=bool(cancel is not None and cancel.is_set())
+                )
+            except Exception:
+                log.exception("settling background subagents failed")
         await retain_turn(
             session_id,
             user_text,
