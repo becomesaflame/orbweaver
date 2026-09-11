@@ -7,6 +7,7 @@ import json
 import logging
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -35,12 +36,18 @@ from orbweaver.config import settings
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
 from orbweaver.lints import read_lints
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
-from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
+from orbweaver.permissions import (
+    PermissionDecision,
+    TurnAborted,
+    can_use_tool,
+    denial_state_for,
+)
 from orbweaver.permissions.injection_probe import probe_tool_output
 from orbweaver.procs import BashInterrupted
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.todos import inject_session_todos, persist_todos
+from orbweaver.tools import partition_tool_calls
 from orbweaver.tooltext import format_read
 
 log = logging.getLogger(__name__)
@@ -1085,6 +1092,13 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     return f"unknown tool {name}"
 
 
+@dataclass(frozen=True)
+class _ToolOutcome:
+    content: str
+    persisted_path: str | None = None
+    flagged: bool = False
+
+
 class TurnCancelled(Exception):
     """Raised when the user stops or discards an in-flight turn."""
 
@@ -1327,6 +1341,22 @@ async def agent_turn(
         "subagent_depth": subagent_depth,
         "channel": resolved_channel,
     }
+    tool_slots = asyncio.Semaphore(max(1, int(settings.orbweaver_max_parallel_tools)))
+
+    async def execute_tool(block: Any, decision: PermissionDecision) -> _ToolOutcome:
+        """Run one permitted tool_use and probe its output; blocked calls get the gate text."""
+        if decision.behavior != "allow":
+            return _ToolOutcome(_blocked_tool_result(decision))
+        if block.name == "AskUser":
+            # Waiting for the user is handled in the round loop; only an empty
+            # question reaches here.
+            return _ToolOutcome("error: question is required")
+        async with tool_slots:
+            raw = await run_tools(block.name, dict(block.input), ctx)
+        text, persisted_path = persist_tool_result(workspace, str(block.id), block.name, raw)
+        probed = await probe_tool_output(block.name, text)
+        return _ToolOutcome(probed["output"], persisted_path, bool(probed.get("flagged")))
+
     pins = await pinned_prompt(store)
     system = build_agent_system(
         pins,
@@ -1402,57 +1432,65 @@ async def agent_turn(
                 break
             stop_after_ask = False
             waiting_ask = False
-            for block in tool_uses:
+            # #99: consecutive concurrency-safe calls (Read, Grep, ...) form one
+            # batch and run together; every unsafe call is a batch of one and a
+            # barrier. tool_call events for a batch are recorded up front and
+            # tool_result events in the original tool_use order.
+            for run in partition_tool_calls([b.name for b in tool_uses]):
+                batch = [tool_uses[i] for i in run]
                 check()
-                call_ev = await store.append_event(
-                    session_id,
-                    "tool_call",
-                    {"id": block.id, "name": block.name, "input": block.input},
-                )
-                fire(call_ev)
+                for block in batch:
+                    call_ev = await store.append_event(
+                        session_id,
+                        "tool_call",
+                        {"id": block.id, "name": block.name, "input": block.input},
+                    )
+                    fire(call_ev)
                 ctx["events"] = await store.list_events(session_id)
-                try:
-                    decision = await can_use_tool(block.name, dict(block.input), ctx)
-                except TurnAborted as e:
+                verdicts = await asyncio.gather(
+                    *(can_use_tool(b.name, dict(b.input), ctx) for b in batch),
+                    return_exceptions=True,
+                )
+                decisions: list[PermissionDecision] = []
+                for block, verdict in zip(batch, verdicts, strict=True):
+                    if isinstance(verdict, TurnAborted):
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "tool_result",
+                                {
+                                    "tool_use_id": block.id,
+                                    "name": block.name,
+                                    "content": verdict.message,
+                                },
+                            )
+                        )
+                        await record_abort(verdict)
+                        return produced
+                    if isinstance(verdict, BaseException):
+                        raise verdict
+                    decisions.append(verdict)
                     fire(
                         await store.append_event(
                             session_id,
-                            "tool_result",
+                            "permission_decision",
                             {
                                 "tool_use_id": block.id,
                                 "name": block.name,
-                                "content": e.message,
+                                "behavior": verdict.behavior,
+                                "reason": verdict.reason,
+                                "fast_path": verdict.fast_path,
                             },
                         )
                     )
-                    await record_abort(e)
-                    return produced
-                fire(
-                    await store.append_event(
-                        session_id,
-                        "permission_decision",
-                        {
-                            "tool_use_id": block.id,
-                            "name": block.name,
-                            "behavior": decision.behavior,
-                            "reason": decision.reason,
-                            "fast_path": decision.fast_path,
-                        },
-                    )
-                )
-                persisted_path = None
-                if decision.behavior != "allow":
-                    result = _blocked_tool_result(decision)
-                    if decision.behavior == "ask":
-                        stop_after_ask = True
-                elif block.name == "AskUser":
+                # AskUser is never concurrency-safe, so it is always a batch of one.
+                if len(batch) == 1 and batch[0].name == "AskUser" and decisions[0].behavior == "allow":
+                    block = batch[0]
                     question = str(dict(block.input).get("question") or "").strip()
-                    if not question:
-                        result = "error: question is required"
-                    elif not can_wait_for_user(ctx):
+                    if question and not can_wait_for_user(ctx):
                         await record_abort(_ask_user_headless_abort(question))
                         return produced
-                    else:
+                    if question:
                         fire(
                             await store.append_event(
                                 session_id,
@@ -1466,10 +1504,12 @@ async def agent_turn(
                         )
                         waiting_ask = True
                         break
-                else:
-                    try:
-                        result = await run_tools(block.name, dict(block.input), ctx)
-                    except ToolInterrupted as e:
+                outcomes = await asyncio.gather(
+                    *(execute_tool(b, d) for b, d in zip(batch, decisions, strict=True)),
+                    return_exceptions=True,
+                )
+                for block, outcome in zip(batch, outcomes, strict=True):
+                    if isinstance(outcome, ToolInterrupted):
                         fire(
                             await store.append_event(
                                 session_id,
@@ -1477,18 +1517,17 @@ async def agent_turn(
                                 {
                                     "tool_use_id": block.id,
                                     "name": block.name,
-                                    "content": e.message,
+                                    "content": outcome.message,
                                     "is_error": True,
                                 },
                             )
                         )
-                        raise TurnCancelled(produced) from e
-                    result, persisted_path = persist_tool_result(
-                        workspace, str(block.id), block.name, result
-                    )
-                    probed = await probe_tool_output(block.name, result)
-                    result = probed["output"]
-                    if probed.get("flagged"):
+                        raise TurnCancelled(produced) from outcome
+                check()
+                for block, decision, outcome in zip(batch, decisions, outcomes, strict=True):
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    if outcome.flagged:
                         fire(
                             await store.append_event(
                                 session_id,
@@ -1496,32 +1535,36 @@ async def agent_turn(
                                 {"tool_use_id": block.id, "name": block.name},
                             )
                         )
-                check()
-                kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
-                payload = {"tool_use_id": block.id, "name": block.name, "content": result}
-                if decision.behavior == "allow" and persisted_path:
-                    payload["persisted_path"] = persisted_path
-                if kind == "MemoryRecall":
-                    try:
-                        parsed = json.loads(result)
-                        payload["chunk_ids"] = parsed.get("chunk_ids") or []
-                        payload["text"] = parsed.get("text") or result
-                    except json.JSONDecodeError:
-                        payload["text"] = result
-                res_ev = await store.append_event(session_id, kind, payload)
-                fire(res_ev)
-                if block.name == "ProposePatch" and decision.behavior == "allow":
-                    fire(
-                        await store.append_event(
-                            session_id, "patch_proposal", {"tool_use_id": block.id, "content": result}
+                    result = outcome.content
+                    if decision.behavior == "ask":
+                        stop_after_ask = True
+                    kind = "MemoryRecall" if block.name == "MemorySearch" else "tool_result"
+                    payload = {"tool_use_id": block.id, "name": block.name, "content": result}
+                    if decision.behavior == "allow" and outcome.persisted_path:
+                        payload["persisted_path"] = outcome.persisted_path
+                    if kind == "MemoryRecall":
+                        try:
+                            parsed = json.loads(result)
+                            payload["chunk_ids"] = parsed.get("chunk_ids") or []
+                            payload["text"] = parsed.get("text") or result
+                        except json.JSONDecodeError:
+                            payload["text"] = result
+                    res_ev = await store.append_event(session_id, kind, payload)
+                    fire(res_ev)
+                    if block.name == "ProposePatch" and decision.behavior == "allow":
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "patch_proposal",
+                                {"tool_use_id": block.id, "content": result},
+                            )
                         )
-                    )
-                if block.name == "ScheduleTask" and decision.behavior == "allow":
-                    fire(
-                        await store.append_event(
-                            session_id, "schedule_request", {"input": dict(block.input)}
+                    if block.name == "ScheduleTask" and decision.behavior == "allow":
+                        fire(
+                            await store.append_event(
+                                session_id, "schedule_request", {"input": dict(block.input)}
+                            )
                         )
-                    )
             if waiting_ask:
                 break
             if stop_after_ask:
