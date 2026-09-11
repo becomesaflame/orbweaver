@@ -37,6 +37,7 @@ from orbweaver.lints import read_lints
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
 from orbweaver.permissions import TurnAborted, can_use_tool, denial_state_for
 from orbweaver.permissions.injection_probe import probe_tool_output
+from orbweaver.procs import BashInterrupted
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.todos import inject_session_todos, persist_todos
@@ -45,6 +46,7 @@ from orbweaver.tooltext import format_read, format_webfetch
 log = logging.getLogger(__name__)
 
 DEFAULT_MAX_ROUNDS = 48
+INTERRUPTED_BY_USER = "interrupted by user"
 LAST_ROUND_NUDGE = (
     "This is the last tool round of this turn. After these tool results, answer the user "
     "with what you have. Do not start new exploration. Spawn a subagent only if a narrower "
@@ -789,25 +791,49 @@ def _ask_user_headless_abort(question: str) -> TurnAborted:
     )
 
 
+class ToolInterrupted(Exception):
+    """A running tool was killed because the user stopped the turn."""
+
+    def __init__(self, message: str = INTERRUPTED_BY_USER) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+async def _bash_call(ws: Any, cancel: asyncio.Event | None, **kwargs: Any) -> str:
+    """ws.bash without blocking the loop; cancel-aware when the workspace supports it."""
+    run_async = getattr(ws, "bash_async", None)
+    if run_async is not None:
+        return await run_async(cancel=cancel, **kwargs)
+    return await asyncio.to_thread(ws.bash, **kwargs)
+
+
 async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """Execute one tool call. Blocking work runs off the event loop.
+
+    Everything that touches the filesystem, spawns a process, or makes a
+    synchronous HTTP request goes through ``asyncio.to_thread`` or an async
+    client, so one session's 10-minute ``pytest`` does not stall the gateway.
+    Foreground Bash honours ``ctx["cancel"]`` and raises ToolInterrupted.
+    """
     ws = ctx["workspace"]
     store: Store = ctx["store"]
     session_id: UUID = ctx["session_id"]
     if name == "Read":
         path = str(inp.get("path") or "")
         if is_image_path(path):
-            return format_image_read(ws, path)
+            return await asyncio.to_thread(format_image_read, ws, path)
         try:
-            raw = ws.read(path)
+            raw = await asyncio.to_thread(ws.read, path)
         except (OSError, PermissionError, UnicodeDecodeError, IsADirectoryError) as e:
             return f"error reading {inp.get('path')}: {e}"
         return format_read(raw, path=path, offset=inp.get("offset"), limit=inp.get("limit"))
     if name == "Write":
-        ws.write(inp["path"], inp["content"])
+        await asyncio.to_thread(ws.write, inp["path"], inp["content"])
         return f"wrote {inp['path']}"
     if name == "StrReplace":
         try:
-            return ws.str_replace(
+            return await asyncio.to_thread(
+                ws.str_replace,
                 str(inp.get("path") or ""),
                 str(inp.get("old_string") or ""),
                 str(inp.get("new_string") if inp.get("new_string") is not None else ""),
@@ -818,38 +844,41 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "NotebookEdit":
         from orbweaver.notebook import apply_notebook_edit
 
-        return apply_notebook_edit(ws, inp)
+        return await asyncio.to_thread(apply_notebook_edit, ws, inp)
     if name == "Delete":
         try:
-            return ws.delete(inp["path"])
+            return await asyncio.to_thread(ws.delete, inp["path"])
         except (OSError, PermissionError) as e:
             return f"error deleting {inp.get('path')}: {e}"
     if name == "ProposePatch":
-        result = ws.propose_patch(inp["path"], inp.get("old_string") or "", inp["new_string"])
+        result = await asyncio.to_thread(
+            ws.propose_patch, inp["path"], inp.get("old_string") or "", inp["new_string"]
+        )
         return json.dumps(result)[:200_000]
     if name == "Glob":
         try:
-            return "\n".join(ws.glob(inp["pattern"])[:200])
+            hits = await asyncio.to_thread(ws.glob, inp["pattern"])
+            return "\n".join(hits[:200])
         except (FileNotFoundError, RuntimeError, TimeoutError) as e:
             return str(e)
     if name == "Grep":
         from orbweaver.workspace import _ctx_int
 
         try:
-            return "\n".join(
-                ws.grep(
-                    inp["pattern"],
-                    inp.get("glob") or "**/*",
-                    file_type=inp.get("type") or None,
-                    after=_ctx_int(inp.get("A")),
-                    before=_ctx_int(inp.get("B")),
-                    context=_ctx_int(inp.get("C")),
-                )
+            hits = await asyncio.to_thread(
+                ws.grep,
+                inp["pattern"],
+                inp.get("glob") or "**/*",
+                file_type=inp.get("type") or None,
+                after=_ctx_int(inp.get("A")),
+                before=_ctx_int(inp.get("B")),
+                context=_ctx_int(inp.get("C")),
             )
+            return "\n".join(hits)
         except (FileNotFoundError, TimeoutError) as e:
             return str(e)
     if name == "ReadLints":
-        return read_lints(ws, inp, ctx.get("events"))
+        return await asyncio.to_thread(read_lints, ws, inp, ctx.get("events"))
     if name == "Bash":
         from orbweaver.git_ritual import annotate_bash_output, ritual_says_not_done
         from orbweaver.permissions.pipeline import bash_permissions
@@ -857,25 +886,32 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         perms = sorted(bash_permissions(inp))
         background = bool(inp.get("background"))
         job_id = inp.get("job_id")
-        result = ws.bash(
-            inp.get("command") or "",
-            timeout=inp.get("timeout"),
-            block_until_ms=inp.get("block_until_ms"),
-            background=background,
-            job_id=job_id,
-            unsandboxed=bool(inp.get("unsandboxed")),
-            permissions=perms,
-        )
+        command = inp.get("command") or ""
+        try:
+            result = await _bash_call(
+                ws,
+                ctx.get("cancel"),
+                command=command,
+                timeout=inp.get("timeout"),
+                block_until_ms=inp.get("block_until_ms"),
+                background=background,
+                job_id=job_id,
+                unsandboxed=bool(inp.get("unsandboxed")),
+                permissions=perms,
+            )
+        except BashInterrupted as e:
+            raise ToolInterrupted() from e
         if not background and not job_id:
-            result = annotate_bash_output(
-                Path(ws.root), inp.get("command") or "", result
+            result = await asyncio.to_thread(
+                annotate_bash_output, Path(ws.root), command, result
             )
             ctx["git_not_done"] = ritual_says_not_done(result)
         return result
     if name == "WebFetch":
         import httpx
 
-        r = httpx.get(inp["url"], timeout=20.0, follow_redirects=True)  # noqa: ASYNC210
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            r = await client.get(inp["url"])
         ctype = r.headers.get("content-type") or ""
         return format_webfetch(str(inp.get("url") or ""), r.status_code, ctype, r.text)
     if name == "Browser":
@@ -885,11 +921,11 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "WebSearch":
         from orbweaver.websearch import run_websearch
 
-        return run_websearch(inp)
+        return await asyncio.to_thread(run_websearch, inp)
     if name == "WorkspaceSearch":
         from orbweaver.codesearch import run_workspace_search
 
-        return run_workspace_search(ws, inp)
+        return await asyncio.to_thread(run_workspace_search, ws, inp)
     if name == "MemorySearch":
         from orbweaver.hindsight import enabled as hindsight_on
         from orbweaver.hindsight import format_recall
@@ -1434,7 +1470,22 @@ async def agent_turn(
                         waiting_ask = True
                         break
                 else:
-                    result = await run_tools(block.name, dict(block.input), ctx)
+                    try:
+                        result = await run_tools(block.name, dict(block.input), ctx)
+                    except ToolInterrupted as e:
+                        fire(
+                            await store.append_event(
+                                session_id,
+                                "tool_result",
+                                {
+                                    "tool_use_id": block.id,
+                                    "name": block.name,
+                                    "content": e.message,
+                                    "is_error": True,
+                                },
+                            )
+                        )
+                        raise TurnCancelled(produced) from e
                     result, persisted_path = persist_tool_result(
                         workspace, str(block.id), block.name, result
                     )

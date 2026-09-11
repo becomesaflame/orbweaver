@@ -105,10 +105,10 @@ class _Resp:
 async def test_run_tools_webfetch_extracts(monkeypatch, tmp_path):
     html = "<html><body><h1>Hello</h1><p>Comparable tools use 50+ steps.</p></body></html>"
 
-    def fake_get(url, **_k):
+    async def fake_get(_self, url, **_k):
         return _Resp(200, "text/html", html)
 
-    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr("httpx.AsyncClient.get", fake_get)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     out = await run_tools(
         "WebFetch",
