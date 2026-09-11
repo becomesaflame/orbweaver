@@ -126,11 +126,28 @@
     #composer-hint { padding:0 1rem 0.75rem; font-size:0.75rem; color:var(--muted); min-height:1.15rem; }
     .msg.injected { border-left-color:#8aa0c8; }
     .msg.ask { border-left-color:#8aa0c8; }
+    .msg.permission { border-left-color:#d9a441; }
+    .msg.permission .perm-title { font-weight:600; }
+    .msg.permission .perm-summary {
+      font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:0.82rem;
+      background:#1f1f1f; border-radius:6px; padding:0.35rem 0.5rem; margin:0.35rem 0;
+      white-space:pre-wrap; word-break:break-word;
+    }
+    .msg.permission .perm-reason { color:var(--muted); font-size:0.8rem; }
+    .msg.permission .perm-outcome { margin-top:0.35rem; font-size:0.85rem; color:#cfcfcf; }
+    .msg.permission.resolved { opacity:0.85; }
+    .msg.permission .perm-actions button { border:1px solid var(--line); }
+    .msg.permission .perm-actions button.allow { color:#8fd18f; }
+    .msg.permission .perm-actions button.deny { color:#e08a8a; }
     .msg-actions { display:flex; gap:0.25rem; margin-top:0.4rem; }
     .msg-actions button {
       font-size:0.75rem; color:var(--muted); padding:0.12rem 0.45rem; border-radius:6px;
     }
     .msg-actions button:hover { color:var(--ink); }
+    .msg-actions .restore-files {
+      display:flex; align-items:center; gap:0.25rem; font-size:0.75rem; color:var(--muted); cursor:pointer;
+    }
+    .msg.checkpoint { border-left-color:#8ac8a0; }
     .btn-new.secondary {
       background:transparent; color:var(--ink); border:1px solid var(--line); font-weight:600;
     }
@@ -1063,6 +1080,22 @@
       edit.title = pending ? "Pause and edit this prompt" : "Edit this prompt";
       edit.onclick = (ev) => { ev.stopPropagation(); editPrompt(text, seq, el); };
       actions.appendChild(edit);
+      if (!pending && seq != null) {
+        const lab = document.createElement("label");
+        lab.className = "restore-files";
+        lab.title = "Put the workspace back to how it was before this turn (git checkpoint)";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.className = "restore-files-box";
+        box.dataset.auto = "1";
+        box.checked = turnEditsFilesAfter(seq);
+        box.onclick = (ev) => ev.stopPropagation();
+        box.onchange = () => { box.dataset.auto = "0"; };
+        lab.appendChild(box);
+        lab.appendChild(document.createTextNode(" also restore files"));
+        lab.onclick = (ev) => ev.stopPropagation();
+        actions.appendChild(lab);
+      }
       if (pending) {
         const cancel = document.createElement("button");
         cancel.type = "button";
@@ -1072,6 +1105,32 @@
         actions.appendChild(cancel);
       }
       el.appendChild(actions);
+    }
+    const FILE_EDIT_TOOLS = new Set(["Write", "StrReplace", "Delete", "NotebookEdit", "Bash"]);
+    function turnEditsFilesAfter(seq) {
+      for (const node of $("log").querySelectorAll("[data-edits-files='1']")) {
+        const s = Number(node.dataset.seq);
+        if (Number.isFinite(s) && s >= seq) return true;
+      }
+      return false;
+    }
+    function syncRestoreDefaults() {
+      for (const box of $("log").querySelectorAll(".restore-files-box[data-auto='1']")) {
+        const msg = box.closest(".msg");
+        const seq = msg ? Number(msg.dataset.seq) : NaN;
+        if (Number.isFinite(seq)) box.checked = turnEditsFilesAfter(seq);
+      }
+    }
+    function restoreSummaryText(p) {
+      if (p.status === "skipped") return "files not restored: " + (p.note || "no checkpoint");
+      const restored = p.restored || [], deleted = p.deleted || [];
+      const parts = [];
+      if (restored.length) parts.push("restored " + restored.length + " file" + (restored.length === 1 ? "" : "s"));
+      if (deleted.length) parts.push("deleted " + deleted.length + " file" + (deleted.length === 1 ? "" : "s"));
+      const names = restored.concat(deleted.map((d) => "-" + d));
+      const shown = names.slice(0, 6).join(", ") + (names.length > 6 ? ", …" : "");
+      return "workspace " + (parts.length ? parts.join(", ") : "already matched the checkpoint")
+        + (shown ? " (" + shown + ")" : "");
     }
     function renderEvent(ev) {
       if (!ev || typeof ev !== "object") return;
@@ -1093,16 +1152,25 @@
     }
     function renderEventInner(ev, p) {
       const kind = ev.kind;
-      if (kind === "user" || kind === "assistant") {
-        const extra = p.injected ? "injected" : "";
+      if (kind === "checkpoint_restore") {
+        add("tool", restoreSummaryText(p), { seq: ev.seq, extraClass: "checkpoint", markdown: false });
+      } else if (kind === "user" || kind === "assistant") {
+        const extra = (p.injected || p.stuck_nudge) ? "injected" : "";
         const node = add(kind, p.text || "", { seq: ev.seq, extraClass: extra });
         if (kind === "user") attachUserActions(node, p.text || "", ev.seq, false);
       } else if (kind === "tool_call") {
-        renderToolCall(ev, p);
+        const card = renderToolCall(ev, p);
+        if (card && FILE_EDIT_TOOLS.has(p.name)) card.el.dataset.editsFiles = "1";
       } else if (kind === "tool_result" || kind === "MemoryRecall") {
         renderToolResult(ev, p);
       } else if (kind === "permission_decision") {
         renderPermission(ev, p);
+      } else if (kind === "permission_request") {
+        renderPermissionRequest(p, ev.seq);
+      } else if (kind === "permission_response") {
+        resolvePermissionCard(p.tool_use_id, permissionOutcomeLabel(p.decision, p.scope));
+      } else if (kind === "permission_rule_added") {
+        renderNote(ev, "Allowed for this session: " + (p.tool || "") + "(" + (p.subject || "*") + ")", "permission");
       } else if (kind === "injection_warning") {
         renderInjectionWarning(ev, p);
       } else if (kind === "ask_user") {
@@ -1130,8 +1198,88 @@
         add("assistant", p.text || "Scheduled task finished.", { seq: ev.seq, extraClass: extra });
       } else if (kind === "turn_interrupted") {
         renderStopped(ev.seq);
+      } else if (ev.kind === "subagent_event") {
+        const inner = p.event || {};
+        const tag = "\u21b3 subagent " + String(p.subagent_id || "").slice(0, 8) + " " + (inner.kind || "");
+        add("tool", tag + " " + JSON.stringify(inner.payload || {}).slice(0, 240), { seq: ev.seq });
       } else {
         renderGenericEvent(ev);
+      }
+    }
+    function permissionOutcomeLabel(decision, scope) {
+      if (decision === "allow") return scope === "session" ? "Allowed for this session" : "Allowed";
+      if (decision === "deny") return "Denied";
+      if (decision === "timeout") return "Timed out — not executed";
+      if (decision === "cancelled") return "Cancelled — not executed";
+      return String(decision || "resolved");
+    }
+    function permissionCard(toolUseId) {
+      if (!toolUseId) return null;
+      return $("log").querySelector('.msg.permission[data-tool-use-id="' + String(toolUseId).replace(/"/g, "") + '"]');
+    }
+    function resolvePermissionCard(toolUseId, label) {
+      const card = permissionCard(toolUseId);
+      if (!card) return;
+      card.classList.add("resolved");
+      card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = true; });
+      let out = card.querySelector(".perm-outcome");
+      if (!out) {
+        out = document.createElement("div");
+        out.className = "perm-outcome";
+        card.appendChild(out);
+      }
+      out.textContent = "→ " + label;
+    }
+    function renderPermissionRequest(p, seq) {
+      const d = document.createElement("div");
+      d.className = "msg assistant permission";
+      if (seq != null) d.dataset.seq = String(seq);
+      d.dataset.toolUseId = String(p.tool_use_id || "");
+      const title = document.createElement("div");
+      title.className = "perm-title";
+      title.textContent = "Approval needed: " + (p.name || "tool");
+      d.appendChild(title);
+      const summary = document.createElement("div");
+      summary.className = "perm-summary";
+      summary.textContent = p.summary || JSON.stringify(p.input || {}).slice(0, 400);
+      d.appendChild(summary);
+      if (p.reason) {
+        const why = document.createElement("div");
+        why.className = "perm-reason";
+        why.textContent = "Why: " + p.reason;
+        d.appendChild(why);
+      }
+      const actions = document.createElement("div");
+      actions.className = "msg-actions perm-actions";
+      const sid = currentSid();
+      const mk = (label, decision, scope, cls) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = label;
+        b.className = cls;
+        b.onclick = () => decidePermission(sid, p.tool_use_id, decision, scope, d);
+        actions.appendChild(b);
+      };
+      mk("Allow", "allow", "once", "allow");
+      mk("Allow for session", "allow", "session", "allow");
+      mk("Deny", "deny", "once", "deny");
+      d.appendChild(actions);
+      $("log").appendChild(d);
+      _scrollToBottom();
+      return d;
+    }
+    async function decidePermission(sid, toolUseId, decision, scope, card) {
+      if (!sid || !toolUseId) return;
+      card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = true; });
+      try {
+        await api("/v1/sessions/" + sid + "/turns/approve", {
+          method:"POST", body: JSON.stringify({ tool_use_id: toolUseId, decision, scope })
+        });
+        resolvePermissionCard(toolUseId, permissionOutcomeLabel(decision, scope) + " · waiting for the agent…");
+      } catch (e) {
+        resolvePermissionCard(toolUseId, "Could not send decision: " + String(e));
+        card.classList.remove("resolved");
+        card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = false; });
       }
     }
     function renderStopped(seq) {
@@ -1461,10 +1609,12 @@
           $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
         } else {
           for (const ev of evs) renderEvent(ev);
+          syncRestoreDefaults();
           if (pendingAskFromEvents(evs)) waitingAskSids.add(sid);
           else {
-            const last = evs[evs.length - 1];
-            if (last.kind !== "assistant") stoppedSids.add(sid);
+            const turns = evs.filter((e) => e.kind !== "checkpoint_restore");
+            const last = turns[turns.length - 1];
+            if (last && last.kind !== "assistant") stoppedSids.add(sid);
           }
         }
         $("status").textContent = "";
@@ -1637,11 +1787,17 @@
       }
       stoppedSids.delete(sid);
       if (pending || seq == null) { syncComposer(); return; }
+      const box = el ? el.querySelector(".restore-files-box") : null;
+      const restoreFiles = box ? box.checked : turnEditsFilesAfter(seq);
       try {
-        await api("/v1/sessions/" + sid + "/rewind", {
-          method:"POST", body: JSON.stringify({ from_seq: seq })
+        const r = await api("/v1/sessions/" + sid + "/rewind", {
+          method:"POST", body: JSON.stringify({ from_seq: seq, restore_files: restoreFiles })
         });
         dropFromSeq(seq);
+        if (r.checkpoint_restore) {
+          const cp = r.checkpoint_restore;
+          add("tool", restoreSummaryText(cp), { seq: cp.seq, extraClass: "checkpoint" });
+        }
         ensurePlaceholder();
         await refreshSessions();
       } catch (e) { $("status").textContent = String(e); }
@@ -1671,31 +1827,85 @@
       const origin = $("base").value.trim() || window.location.origin;
       const u = new URL("/v1/sessions/" + sid + "/ws", origin);
       u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-      const tok = $("token").value.trim();
-      if (tok) u.searchParams.set("token", tok);
       return u.toString();
     }
+    function openSessionWs(sid) {
+      // The JWT rides in Sec-WebSocket-Protocol ("bearer, <jwt>") rather than
+      // the URL so it never lands in access logs; the gateway echoes "bearer".
+      const tok = $("token").value.trim();
+      const protocols = tok ? ["bearer", tok] : [];
+      return new WebSocket(sessionWsUrl(sid), protocols);
+    }
+    function maxSeqInLog() {
+      let top = 0;
+      $("log").querySelectorAll("[data-seq]").forEach((n) => {
+        const s = Number(n.dataset.seq);
+        if (Number.isFinite(s) && s > top) top = s;
+      });
+      return top;
+    }
+    const RECONNECT_BASE_MS = 500;
+    const RECONNECT_CAP_MS = 10000;
+    // Runs one turn over the session WebSocket. If the socket drops after the
+    // turn has started, reconnects with backoff and sends
+    // {type:"subscribe", after_seq} so the server replays the gap; frames are
+    // deduplicated by seq and the promise settles only on turn_done (or a
+    // turn_status that says the turn is over).
     function streamTurn(sid, payload, onEvent) {
       return new Promise((resolve, reject) => {
         let settled = false;
-        let ws;
+        let ws = null;
+        let retryTimer = null;
+        let attempt = 0;
+        let started = false;    // saw at least one stored event for this turn
+        let replaying = false;  // between sending subscribe and receiving turn_status
+        let lastSeq = maxSeqInLog();
+        const seen = new Set();
+        const here = () => currentSid() === sid;
+        const setLink = (state) => {
+          if (!here()) return;
+          const w = $("log").querySelector(".msg.working .msg-body");
+          if (state === "reconnecting") {
+            $("status").textContent = "reconnecting… (" + attempt + ")";
+            if (w) w.textContent = "assistant: Working… (reconnecting)";
+          } else {
+            if ($("status").textContent.startsWith("reconnecting")) $("status").textContent = "working…";
+            if (w) w.textContent = "assistant: Working…";
+          }
+        };
         const finish = (fn, val) => {
           if (settled) return;
           settled = true;
+          if (retryTimer) clearTimeout(retryTimer);
           try { if (ws) ws.close(); } catch (e) {}
+          if ($("status").textContent.startsWith("reconnecting")) $("status").textContent = "working…";
           fn(val);
         };
-        try { ws = new WebSocket(sessionWsUrl(sid)); }
-        catch (e) { reject(e); return; }
-        ws.onopen = () => {
-          try { ws.send(JSON.stringify(payload)); }
-          catch (e) { finish(reject, e); }
+        const scheduleReconnect = () => {
+          const delay = Math.min(RECONNECT_CAP_MS, RECONNECT_BASE_MS * Math.pow(2, attempt));
+          attempt += 1;
+          setLink("reconnecting");
+          retryTimer = setTimeout(() => connect(true), delay);
         };
-        ws.onmessage = (ev) => {
-          let msg;
-          try { msg = JSON.parse(ev.data); }
-          catch (e) { finish(reject, e); return; }
-          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" || msg.kind === "idle") {
+        const onFrame = (msg) => {
+          if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" ||
+              msg.kind === "idle" || msg.kind === "injected" || msg.kind === "approval") {
+            return;
+          }
+          if (msg.kind === "turn_status") {
+            replaying = false;
+            attempt = 0;
+            if (msg.running) { setLink("connected"); return; }
+            const last = msg.last_turn_done;
+            if (!started) {
+              finish(reject, new Error("connection lost before the turn started"));
+            } else if (last && last.status === "error") {
+              finish(reject, new Error(last.detail || "turn failed"));
+            } else if (last) {
+              finish(resolve, { status: last.status || "ok", user_seq: last.user_seq });
+            } else {
+              finish(resolve, { status: "stopped", user_seq: null });
+            }
             return;
           }
           if (msg.kind === "error") {
@@ -1707,15 +1917,55 @@
             finish(resolve, { status: msg.status || "ok", user_seq: msg.user_seq });
             return;
           }
+          if (msg.seq != null) {
+            started = true;
+            if (seen.has(msg.seq)) return;
+            seen.add(msg.seq);
+            if (msg.seq > lastSeq) lastSeq = msg.seq;
+            if (replaying && here() && $("log").querySelector('[data-seq="' + msg.seq + '"]')) return;
+          }
           if (onEvent) onEvent(msg);
         };
-        ws.onerror = () => finish(reject, new Error("WebSocket error"));
-        ws.onclose = (ev) => {
+        function connect(resub) {
           if (settled) return;
-          if (ev.code === 4401) finish(reject, new Error("unauthorized"));
-          else if (ev.code === 4404) finish(reject, new Error("session not found"));
-          else finish(reject, new Error("WebSocket closed (" + ev.code + ")"));
-        };
+          retryTimer = null;
+          let sock;
+          try { sock = openSessionWs(sid); }
+          catch (e) {
+            if (resub) scheduleReconnect(); else reject(e);
+            return;
+          }
+          ws = sock;
+          sock.onopen = () => {
+            if (settled || ws !== sock) return;
+            try {
+              if (resub) {
+                replaying = true;
+                sock.send(JSON.stringify({ type: "subscribe", after_seq: lastSeq }));
+              } else {
+                sock.send(JSON.stringify(payload));
+              }
+            } catch (e) { try { sock.close(); } catch (e2) {} }
+          };
+          sock.onmessage = (ev) => {
+            if (settled || ws !== sock) return;
+            let msg;
+            try { msg = JSON.parse(ev.data); }
+            catch (e) { finish(reject, e); return; }
+            onFrame(msg);
+          };
+          sock.onerror = () => {};
+          sock.onclose = (ev) => {
+            if (settled || ws !== sock) return;
+            ws = null;
+            if (ev.code === 4401) { finish(reject, new Error("unauthorized")); return; }
+            if (ev.code === 4404) { finish(reject, new Error("session not found")); return; }
+            if (!started) { finish(reject, new Error("WebSocket closed (" + ev.code + ")")); return; }
+            replaying = false;
+            scheduleReconnect();
+          };
+        }
+        connect(false);
       });
     }
     async function continueTurn() {
@@ -1815,6 +2065,7 @@
         } else if (stillHere) {
           if (userEl && r.user_seq != null) userEl.dataset.seq = String(r.user_seq);
           if (userEl) attachUserActions(userEl, text, r.user_seq, false);
+          syncRestoreDefaults();
           if (r.status === "waiting_ask") waitingAskSids.add(sid);
           if (r.status === "stopped") stoppedSids.add(sid);
         }

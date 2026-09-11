@@ -5,7 +5,7 @@ import ipaddress
 import json
 import logging
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -29,8 +29,30 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from orbweaver import __version__
-from orbweaver.agent import TurnCancelled, agent_turn, normalize_channel, pending_ask_user
-from orbweaver.auth import mint_token, require_user
+from orbweaver.agent import (
+    APPROVAL_DECISIONS,
+    APPROVAL_SCOPES,
+    TurnCancelled,
+    agent_turn,
+    normalize_channel,
+    pending_ask_user,
+    resolve_approval,
+)
+from orbweaver.auth import (
+    WS_BEARER_SUBPROTOCOL,
+    check_jwt_secret,
+    decode_token,
+    mint_token,
+    require_user,
+    websocket_subprotocol_token,
+)
+from orbweaver.checkpoints import (
+    CheckpointError,
+    CheckpointHeadMismatch,
+    find_checkpoint,
+    restore_checkpoint,
+    turn_edits_files,
+)
 from orbweaver.config import settings
 from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
 from orbweaver.ratelimit import FileRateLimiter, get_rate_limiter
@@ -44,6 +66,11 @@ from orbweaver.store import (
     session_at_id,
 )
 from orbweaver.subagent import is_subagent_session
+from orbweaver.turns import RunningTurn
+from orbweaver.turns import acquire as acquire_turn
+from orbweaver.turns import get as get_running_turn
+from orbweaver.turns import is_running as turn_is_running
+from orbweaver.turns import release as release_turn
 from orbweaver.uris import (
     WorkspaceURIError,
     list_workspace_dirs,
@@ -71,6 +98,9 @@ WEB_DIR = _web_dir()
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # Refuse to serve with a forgeable JWT secret (issue #97). Raising here
+    # makes uvicorn log "Application startup failed" and exit non-zero.
+    check_jwt_secret(settings)
     store = get_store()
     connect = getattr(store, "connect", None)
     if connect:
@@ -88,14 +118,25 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
+def configure_cors(target: FastAPI, origins: list[str]) -> None:
+    """Allow credentialed cross-origin calls only from `origins`.
+
+    The default (empty list) is same-origin only: the bundled web UI is served
+    by this process, so browsers never need CORS for it. `*` with credentials
+    is rejected by browsers and would echo any Origin, so credentials are only
+    enabled for an explicit origin list.
+    """
+    target.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=bool(origins) and "*" not in origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
 app = FastAPI(title="Orbweaver", lifespan=_lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configure_cors(app, settings.cors_origins)
 
 
 _RATE_LIMIT_WINDOW_S = 60.0
@@ -227,8 +268,18 @@ class CancelTurnBody(BaseModel):
     discard: bool = False
 
 
+class ApproveBody(BaseModel):
+    tool_use_id: str
+    decision: str  # allow | deny
+    scope: str = "once"  # once | session
+
+
 class RewindBody(BaseModel):
     from_seq: int
+    # None: restore when a discarded turn called a file-editing tool.
+    restore_files: bool | None = None
+    # Restore even when the workspace HEAD moved since the checkpoint.
+    force: bool = False
 
 
 class JobBody(BaseModel):
@@ -248,21 +299,53 @@ def _user(request: Request) -> dict:
     return require_user(request)
 
 
-@dataclass
-class RunningTurn:
-    cancel: asyncio.Event
-    inject: asyncio.Event = field(default_factory=asyncio.Event)
-    discard: bool = False
-    user_seq: int = 0
+@dataclass(eq=False)
+class _WsSubscriber:
+    """One WebSocket client of a session.
+
+    Frames are queued in ``pending`` and written by a single writer task so
+    live broadcasts, replies, and replayed history never interleave. Every
+    ``seq`` delivered live is recorded in ``sent_seqs`` so a later
+    ``subscribe`` with ``after_seq`` does not replay it again.
+    """
+
+    ws: WebSocket
+    pending: deque[dict[str, Any]] = field(default_factory=deque)
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    sent_seqs: set[int] = field(default_factory=set)
+
+    def send(self, msg: dict[str, Any]) -> None:
+        self.pending.append(msg)
+        self.wake.set()
+
+    def replay(self, frames: list[dict[str, Any]], top: int) -> None:
+        """Queue ``frames`` ahead of live frames still waiting to be written.
+
+        Live frames with ``seq <= top`` are already covered by the replay and
+        are dropped; anything else queued (``turn_done``, ``pong``) stays
+        behind the replayed history so ordering matches the store.
+        """
+        kept = [
+            m
+            for m in self.pending
+            if not (isinstance(m.get("seq"), int) and m["seq"] <= top)
+        ]
+        self.pending.clear()
+        self.pending.extend(frames)
+        self.pending.extend(kept)
+        self.wake.set()
 
 
-_running_turns: dict[UUID, RunningTurn] = {}
-_ws_subscribers: dict[UUID, set[WebSocket]] = defaultdict(set)
+_last_turn_done: dict[UUID, dict[str, Any]] = {}
+_ws_subscribers: dict[UUID, set[_WsSubscriber]] = defaultdict(set)
+_detached_turns: set[asyncio.Task[Any]] = set()
 _GENERIC_TITLES = {"", "web", "session", "New chat", "vscode"}
 
 
 def reset_ws_subscribers_for_tests() -> None:
     _ws_subscribers.clear()
+    _last_turn_done.clear()
+    _detached_turns.clear()
 
 
 def _stored_channel(jsonld: dict[str, Any]) -> str:
@@ -270,19 +353,27 @@ def _stored_channel(jsonld: dict[str, Any]) -> str:
 
 
 def _broadcast(session_id: UUID, msg: dict[str, Any]) -> None:
-    sockets = list(_ws_subscribers.get(session_id) or ())
-    if not sockets:
-        return
-    loop = asyncio.get_running_loop()
+    for sub in list(_ws_subscribers.get(session_id) or ()):
+        sub.send(msg)
 
-    async def send_one(ws: WebSocket) -> None:
-        try:
-            await ws.send_json(msg)
-        except Exception:
-            _ws_subscribers[session_id].discard(ws)
 
-    for ws in sockets:
-        loop.create_task(send_one(ws))
+async def _ws_writer(session_id: UUID, sub: _WsSubscriber) -> None:
+    try:
+        while True:
+            while sub.pending:
+                msg = sub.pending.popleft()
+                seq = msg.get("seq")
+                if isinstance(seq, int):
+                    sub.sent_seqs.add(seq)
+                await sub.ws.send_json(msg)
+            sub.wake.clear()
+            await sub.wake.wait()
+    except Exception as e:
+        # The peer is gone (or mid-close); the receive loop sees the
+        # disconnect and unwinds. Nothing to send it anymore.
+        log.debug("websocket writer for %s stopped: %s", session_id, e)
+    finally:
+        _ws_subscribers[session_id].discard(sub)
 
 
 def _event_dict(e) -> dict[str, Any]:
@@ -619,17 +710,18 @@ async def _run_turn(
     *,
     resume: bool = False,
 ) -> dict[str, Any]:
-    if session_id in _running_turns:
+    state = acquire_turn(session_id, channel=_stored_channel(sess.jsonld) or "web")
+    if state is None:
         raise HTTPException(409, "turn already running")
-    if not resume:
-        await _maybe_autotitle(store, sess, user_text)
-    ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
-    if changed:
-        await store.put_entity(sess)
-    state = RunningTurn(cancel=asyncio.Event())
-    _running_turns[session_id] = state
+    _last_turn_done.pop(session_id, None)
     result: dict[str, Any] | None = None
+    failure: str | None = None
     try:
+        if not resume:
+            await _maybe_autotitle(store, sess, user_text)
+        ws, kind, changed = bind_workspace(sess.jsonld, settings.workspace_root)
+        if changed:
+            await store.put_entity(sess)
         events = await agent_turn(
             store,
             session_id,
@@ -672,24 +764,24 @@ async def _run_turn(
 
         from orbweaver.compact import ContextFullError
 
+        failure = str(getattr(e, "message", None) or e) or type(e).__name__
         if isinstance(e, ContextFullError):
             raise HTTPException(status_code=502, detail=e.message) from e
         if isinstance(e, anthropic.APIStatusError):
             raise HTTPException(status_code=502, detail=e.message) from e
         raise
     finally:
-        current = _running_turns.get(session_id)
-        if current is state:
-            _running_turns.pop(session_id, None)
+        release_turn(session_id, state)
         if result is not None:
-            _broadcast(
-                session_id,
-                {
-                    "kind": "turn_done",
-                    "status": result.get("status"),
-                    "user_seq": result.get("user_seq"),
-                },
-            )
+            done = {"status": result.get("status"), "user_seq": result.get("user_seq")}
+            _last_turn_done[session_id] = done
+            _broadcast(session_id, {"kind": "turn_done", **done})
+        else:
+            _last_turn_done[session_id] = {
+                "status": "error",
+                "user_seq": state.user_seq,
+                "detail": failure or "turn failed",
+            }
 
 
 @app.post("/v1/sessions/{session_id}/turns")
@@ -708,14 +800,28 @@ async def inject_turn(
     text = body.text.strip()
     if not text:
         raise HTTPException(400, "text is required")
-    state = _running_turns.get(session_id)
+    state = get_running_turn(session_id)
     if not state:
         raise HTTPException(409, "no turn is running")
-    store = get_store()
-    ev = await store.append_event(session_id, "user", {"text": text, "injected": True})
+    ev = await inject_into_turn(get_store(), session_id, state, text)
+    return {"status": "injected", "seq": ev.seq, "event": _event_dict(ev)}
+
+
+async def inject_into_turn(
+    store,
+    session_id: UUID,
+    state: RunningTurn,
+    text: str,
+    images: list[dict[str, str]] | None = None,
+) -> Any:
+    """Append a follow-up user event to a running turn and wake its LLM call."""
+    payload: dict[str, Any] = {"text": text, "injected": True}
+    if images:
+        payload["images"] = images
+    ev = await store.append_event(session_id, "user", payload)
     state.inject.set()
     _broadcast(session_id, _event_dict(ev))
-    return {"status": "injected", "seq": ev.seq, "event": _event_dict(ev)}
+    return ev
 
 
 @app.post("/v1/sessions/{session_id}/turns/continue")
@@ -736,12 +842,39 @@ async def continue_turn(session_id: UUID, _u: dict = Depends(_user)) -> dict[str
 async def cancel_turn(
     session_id: UUID, body: CancelTurnBody, _u: dict = Depends(_user)
 ) -> dict[str, Any]:
-    state = _running_turns.get(session_id)
+    state = get_running_turn(session_id)
     if not state:
         return {"status": "idle"}
     state.discard = body.discard
     state.cancel.set()
     return {"status": "cancelling", "discard": body.discard}
+
+
+def _approve(session_id: UUID, tool_use_id: str, decision: str, scope: str) -> dict[str, Any]:
+    decision = (decision or "").strip().lower()
+    scope = (scope or "once").strip().lower() or "once"
+    if decision not in APPROVAL_DECISIONS:
+        raise HTTPException(400, f"decision must be one of {sorted(APPROVAL_DECISIONS)}")
+    if scope not in APPROVAL_SCOPES:
+        raise HTTPException(400, f"scope must be one of {sorted(APPROVAL_SCOPES)}")
+    if not tool_use_id.strip():
+        raise HTTPException(400, "tool_use_id is required")
+    if not resolve_approval(session_id, tool_use_id, decision, scope):
+        raise HTTPException(404, "no pending approval for that tool_use_id")
+    return {
+        "status": "resolved",
+        "tool_use_id": tool_use_id,
+        "decision": decision,
+        "scope": scope,
+    }
+
+
+@app.post("/v1/sessions/{session_id}/turns/approve")
+async def approve_turn(
+    session_id: UUID, body: ApproveBody, _u: dict = Depends(_user)
+) -> dict[str, Any]:
+    """Answer a held `permission_request` for the running turn."""
+    return _approve(session_id, body.tool_use_id, body.decision, body.scope)
 
 
 @app.post("/v1/sessions/{session_id}/rewind")
@@ -750,7 +883,7 @@ async def rewind(
 ) -> dict[str, Any]:
     if body.from_seq < 1:
         raise HTTPException(400, "from_seq must be >= 1")
-    if session_id in _running_turns:
+    if turn_is_running(session_id):
         raise HTTPException(409, "turn already running")
     store = get_store()
     sess = await store.get_entity(session_id)
@@ -758,12 +891,51 @@ async def rewind(
         raise HTTPException(404, "session not found")
     events = await store.list_events(session_id)
     discarded = next((e for e in events if e.seq == body.from_seq), None)
+    dropped = [e for e in events if e.seq >= body.from_seq]
+    restore = body.restore_files
+    if restore is None:
+        restore = turn_edits_files(dropped)
+    summary = await _restore_workspace(sess, dropped, restore, force=body.force)
     await store.truncate_events(session_id, body.from_seq)
     text = ""
     if discarded and discarded.kind == "user":
         text = str(discarded.payload.get("text") or "")
         await _revert_autotitle_if_needed(store, sess, text)
-    return {"status": "ok", "text": text}
+    out: dict[str, Any] = {"status": "ok", "text": text, "restore_files": restore}
+    if summary is not None:
+        if summary.get("status") == "restored":
+            ev = await store.append_event(session_id, "checkpoint_restore", summary)
+            _broadcast(session_id, _event_dict(ev))
+            summary = {**summary, "seq": ev.seq}
+        out["checkpoint_restore"] = summary
+    return out
+
+
+async def _restore_workspace(
+    sess: Entity, dropped: list, restore: bool, *, force: bool
+) -> dict[str, Any] | None:
+    """Restore files from the first discarded turn's checkpoint, or explain why not."""
+    if not restore:
+        return None
+    checkpoint = find_checkpoint(dropped)
+    if checkpoint is None:
+        note = "no workspace checkpoint was recorded for these turns; files left as they are"
+        for ev in dropped:
+            cp = ev.payload.get("checkpoint") if ev.kind == "user" else None
+            if isinstance(cp, dict) and cp.get("unavailable"):
+                note = str(cp["unavailable"])
+                break
+        return {"status": "skipped", "note": note}
+    ws, _kind, _changed = bind_workspace(sess.jsonld, settings.workspace_root)
+    try:
+        result = await asyncio.to_thread(
+            restore_checkpoint, ws.root, checkpoint, force=force
+        )
+    except CheckpointHeadMismatch as e:
+        raise HTTPException(409, str(e)) from e
+    except CheckpointError as e:
+        raise HTTPException(500, f"checkpoint restore failed: {e}") from e
+    return result.payload()
 
 
 @app.post("/v1/sessions/{session_id}/correction")
@@ -776,17 +948,63 @@ async def correction(session_id: UUID, body: CorrectionBody, _u: dict = Depends(
     return {"status": "ok"}
 
 
-@app.websocket("/v1/sessions/{session_id}/ws")
-async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None = None) -> None:
-    await websocket.accept()
-    if not token:
-        await websocket.close(code=4401)
-        return
-    try:
-        from orbweaver.auth import decode_token
+_WS_AUTH_TIMEOUT_S = 10.0
 
+
+async def _ws_first_frame_token(websocket: WebSocket) -> str | None:
+    """Token from a first-message auth frame: {"type": "auth", "token": "<jwt>"}."""
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=_WS_AUTH_TIMEOUT_S)
+    except TimeoutError:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or str(data.get("type") or "") != "auth":
+        return None
+    tok = data.get("token")
+    return str(tok) if tok else None
+
+
+async def _ws_authenticate(websocket: WebSocket, query_token: str | None) -> bool:
+    """Accept the socket and resolve the bearer token.
+
+    Preferred: `Sec-WebSocket-Protocol: bearer, <jwt>` (echoed back as
+    `bearer`). Also accepted: a first frame `{"type": "auth", "token": ...}`.
+    Deprecated, removed in a future release: `?token=<jwt>` in the URL, which
+    ends up in access logs and proxies.
+    """
+    bearer_offered, sub_token = websocket_subprotocol_token(websocket)
+    await websocket.accept(subprotocol=WS_BEARER_SUBPROTOCOL if bearer_offered else None)
+    token: str | None
+    if bearer_offered:
+        token = sub_token
+    elif query_token:
+        log.warning(
+            "websocket auth via ?token= query parameter is deprecated and will be removed; "
+            "send `Sec-WebSocket-Protocol: bearer, <jwt>` or a first frame "
+            '{"type": "auth", "token": "<jwt>"} instead'
+        )
+        token = query_token
+    else:
+        token = await _ws_first_frame_token(websocket)
+    if not token:
+        return False
+    try:
         decode_token(token)
     except HTTPException:
+        return False
+    return True
+
+
+@app.websocket("/v1/sessions/{session_id}/ws")
+async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None = None) -> None:
+    try:
+        authed = await _ws_authenticate(websocket, token)
+    except WebSocketDisconnect:
+        return
+    if not authed:
         await websocket.close(code=4401)
         return
     store = get_store()
@@ -794,9 +1012,16 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
     if not sess:
         await websocket.close(code=4404)
         return
-    _ws_subscribers[session_id].add(websocket)
+    sub = _WsSubscriber(ws=websocket)
+    _ws_subscribers[session_id].add(sub)
+    writer = asyncio.create_task(_ws_writer(session_id, sub))
+    turn_task: asyncio.Task[Any] | None = None
+
+    def error(status: int, detail: Any) -> None:
+        sub.send({"kind": "error", "status": status, "status_code": status, "detail": detail})
+
     try:
-        await websocket.send_json({"kind": "subscribed", "session_id": str(session_id)})
+        sub.send({"kind": "subscribed", "session_id": str(session_id)})
         while True:
             raw = await websocket.receive_text()
             try:
@@ -806,20 +1031,54 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
             if not isinstance(data, dict):
                 continue
             typ = str(data.get("type") or "")
-            if typ in {"subscribe", "ping"}:
-                if typ == "ping":
-                    await websocket.send_json({"kind": "pong"})
+            if typ == "auth":
+                # Token already resolved by _ws_authenticate; a late auth
+                # frame (e.g. after subprotocol auth) is harmless.
+                continue
+            if typ == "ping":
+                sub.send({"kind": "pong"})
+                continue
+            if typ == "subscribe":
+                after_seq = data.get("after_seq")
+                if isinstance(after_seq, int) and not isinstance(after_seq, bool):
+                    await _ws_resubscribe(store, session_id, sub, after_seq)
                 continue
             if typ == "cancel":
-                state = _running_turns.get(session_id)
+                state = get_running_turn(session_id)
                 if state:
                     state.discard = bool(data.get("discard"))
                     state.cancel.set()
-                    await websocket.send_json(
-                        {"kind": "cancelling", "discard": state.discard}
-                    )
+                    sub.send({"kind": "cancelling", "discard": state.discard})
                 else:
-                    await websocket.send_json({"kind": "idle"})
+                    sub.send({"kind": "idle"})
+                continue
+            if typ == "inject":
+                text = str(data.get("text") or "").strip()
+                state = get_running_turn(session_id)
+                if not text:
+                    error(400, "text is required")
+                elif not state:
+                    error(409, "no turn is running")
+                else:
+                    ev = await inject_into_turn(store, session_id, state, text)
+                    sub.send({"kind": "injected", "seq": ev.seq})
+                continue
+            if typ == "approve":
+                # Only reachable from a socket that is not itself awaiting a turn
+                # (this loop blocks on _run_turn); the web UI uses the HTTP endpoint.
+                try:
+                    out = _approve(
+                        session_id,
+                        str(data.get("tool_use_id") or ""),
+                        str(data.get("decision") or ""),
+                        str(data.get("scope") or "once"),
+                    )
+                except HTTPException as e:
+                    await websocket.send_json(
+                        {"kind": "approval", "status": e.status_code, "detail": e.detail}
+                    )
+                    continue
+                await websocket.send_json({"kind": "approval", **out})
                 continue
             resume = bool(data.get("resume"))
             text = str(data.get("text") or "")
@@ -828,30 +1087,73 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
             if resume:
                 existing = await store.list_events(session_id)
                 if not existing:
-                    await websocket.send_json(
-                        {
-                            "kind": "error",
-                            "detail": "nothing to continue",
-                            "status": 400,
-                            "status_code": 400,
-                        }
-                    )
+                    error(400, "nothing to continue")
                     continue
-            try:
-                await _run_turn(store, sess, session_id, text, resume=resume)
-            except HTTPException as e:
-                await websocket.send_json(
-                    {
-                        "kind": "error",
-                        "status": e.status_code,
-                        "status_code": e.status_code,
-                        "detail": e.detail,
-                    }
-                )
+            if turn_task is not None and not turn_task.done():
+                error(409, "turn already running")
+                continue
+            # Run the turn as its own task so this loop keeps reading frames:
+            # cancel / ping / inject / subscribe work while the agent is busy,
+            # and the turn survives this socket closing.
+            turn_task = asyncio.create_task(
+                _ws_turn(sub, store, sess, session_id, text, resume=resume)
+            )
+            _detached_turns.add(turn_task)
+            turn_task.add_done_callback(_detached_turns.discard)
     except WebSocketDisconnect:
         return
     finally:
-        _ws_subscribers[session_id].discard(websocket)
+        _ws_subscribers[session_id].discard(sub)
+        writer.cancel()
+
+
+async def _ws_turn(
+    sub: _WsSubscriber,
+    store,
+    sess,
+    session_id: UUID,
+    text: str,
+    *,
+    resume: bool,
+) -> None:
+    try:
+        await _run_turn(store, sess, session_id, text, resume=resume)
+    except HTTPException as e:
+        sub.send(
+            {
+                "kind": "error",
+                "status": e.status_code,
+                "status_code": e.status_code,
+                "detail": e.detail,
+            }
+        )
+    except Exception as e:
+        log.exception("websocket turn failed for %s", session_id)
+        sub.send({"kind": "error", "status": 500, "status_code": 500, "detail": str(e)})
+
+
+async def _ws_resubscribe(store, session_id: UUID, sub: _WsSubscriber, after_seq: int) -> None:
+    """Replay stored events with ``seq > after_seq`` then report turn status.
+
+    ``sub`` has been a live subscriber since the socket was accepted, so every
+    event is either already sent (``sent_seqs``), waiting in ``sub.pending``
+    (dropped by ``replay`` because the stored copy is newer), or in the store
+    snapshot read here. Nothing after the snapshot can carry ``seq <= top``,
+    so the replay attaches to the live stream with no gap and no duplicate.
+    """
+    events = await store.list_events(session_id)
+    top = max((e.seq for e in events), default=after_seq)
+    frames = [
+        _event_dict(e) for e in events if e.seq > after_seq and e.seq not in sub.sent_seqs
+    ]
+    status: dict[str, Any] = {
+        "kind": "turn_status",
+        "running": turn_is_running(session_id),
+        "seq": top,
+        "last_turn_done": _last_turn_done.get(session_id),
+    }
+    frames.append(status)
+    sub.replay(frames, top)
 
 
 @app.post("/v1/stt")

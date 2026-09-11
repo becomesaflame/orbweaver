@@ -13,11 +13,13 @@ from orbweaver.sandbox.proxy import wrap_command_with_proxy
 from orbweaver.sandbox.ssh import (
     SANDBOX_OPENSSH,
     SANDBOX_SSH_DIR,
+    SshPolicy,
     ensure_ssh_sandbox,
     filter_ssh_argv,
     sandbox_resolv_conf_text,
     ssh_identity_bind_args,
     ssh_private_identity_files,
+    ssh_public_files,
 )
 
 
@@ -111,54 +113,136 @@ def test_bwrap_overlays_resolv_conf(tmp_path: Path):
     assert dest in {"/etc/resolv.conf", "/run/systemd/resolve/stub-resolv.conf"}
 
 
-def test_custom_identity_from_dir_and_host_config(tmp_path: Path, monkeypatch):
-    """Production github.com SSH uses IdentityFile ~/.ssh/lampropeltis-orbweaver, not id_ed25519."""
+def _fake_ssh_home(tmp_path: Path) -> tuple[Path, Path, Path]:
     home = tmp_path / "home"
     ssh = home / ".ssh"
     ssh.mkdir(parents=True)
     key = ssh / "lampropeltis-orbweaver"
-    key.write_text("fake-key", encoding="utf-8")
+    key.write_text("fake-private-key", encoding="utf-8")
+    (ssh / "lampropeltis-orbweaver.pub").write_text("ssh-ed25519 AAAA fake", encoding="utf-8")
+    (ssh / "id_ed25519").write_text("fake-default-key", encoding="utf-8")
+    (ssh / "known_hosts").write_text("github.com ssh-ed25519 AAAA\n", encoding="utf-8")
     (ssh / "config").write_text(
         "Host github.com\n  IdentityFile ~/.ssh/lampropeltis-orbweaver\n  IdentitiesOnly yes\n  ProxyJump evil\n",
         encoding="utf-8",
     )
+    return home, ssh, key
+
+
+def test_default_policy_binds_no_private_keys(tmp_path: Path, monkeypatch):
+    """Issue #95: every non-config file in ~/.ssh used to be re-bound, private keys included."""
+    home, ssh, key = _fake_ssh_home(tmp_path)
     monkeypatch.setattr("orbweaver.sandbox.ssh.Path.home", lambda: home)
+    assert ssh_private_identity_files(home) == ()
+    binds = ssh_identity_bind_args(home)
+    assert str(key.resolve()) not in binds
+    assert str((ssh / "id_ed25519").resolve()) not in binds
+    # Non-secret files stay readable.
+    for name in ("config", "known_hosts", "lampropeltis-orbweaver.pub"):
+        assert str((ssh / name).resolve()) in binds
+    assert set(ssh_public_files(home)) == {
+        ssh / "config",
+        ssh / "known_hosts",
+        ssh / "lampropeltis-orbweaver.pub",
+    }
     dest = ensure_ssh_sandbox(tmp_path / "tmp", proxied=True)
+    cfg = (dest / "config").read_text(encoding="utf-8")
+    assert "lampropeltis-orbweaver" not in cfg
+    assert "ProxyJump" not in cfg
+    assert "ProxyCommand" in cfg
+
+
+def test_bind_identities_uses_host_config_identityfile(tmp_path: Path, monkeypatch):
+    """Opt-in ssh.bindIdentities binds the host IdentityFile entries and id_* names, nothing else."""
+    home, ssh, key = _fake_ssh_home(tmp_path)
+    stray = ssh / "stray-secret"
+    stray.write_text("another private key", encoding="utf-8")
+    monkeypatch.setattr("orbweaver.sandbox.ssh.Path.home", lambda: home)
+    pol = SshPolicy(bind_identities=True)
+    priv = ssh_private_identity_files(home, ssh_policy=pol)
+    assert key.resolve() in priv
+    assert (ssh / "id_ed25519").resolve() in priv
+    assert stray.resolve() not in priv
+    binds = ssh_identity_bind_args(home, ssh_policy=pol)
+    assert str(key.resolve()) in binds
+    assert str(stray.resolve()) not in binds
+    dest = ensure_ssh_sandbox(tmp_path / "tmp", proxied=True, identity_files=priv)
     cfg = (dest / "config").read_text(encoding="utf-8")
     assert "lampropeltis-orbweaver" in cfg
     assert "ProxyJump" not in cfg
     assert "IdentitiesOnly" not in cfg
-    priv = ssh_private_identity_files(home)
-    assert key.resolve() in priv
-    binds = ssh_identity_bind_args(home)
-    assert str(key.resolve()) in binds
-    assert str((ssh / "config").resolve()) not in binds
-    assert str((ssh / "config").resolve()) not in cfg
 
 
-def test_identity_binds_after_deny_read_skip_config(tmp_path: Path, monkeypatch):
-    home = tmp_path / "home"
-    ssh = home / ".ssh"
-    ssh.mkdir(parents=True)
-    key = ssh / "id_ed25519"
-    key.write_text("fake-key", encoding="utf-8")
-    (ssh / "config").write_text("Host *\n  ProxyJump evil\n", encoding="utf-8")
+def test_explicit_identities_bind_exactly_those(tmp_path: Path, monkeypatch):
+    home, ssh, key = _fake_ssh_home(tmp_path)
+    monkeypatch.setattr("orbweaver.sandbox.ssh.Path.home", lambda: home)
+    pol = SshPolicy(identities=(ssh / "id_ed25519",))
+    priv = ssh_private_identity_files(home, ssh_policy=pol)
+    assert priv == ((ssh / "id_ed25519").resolve(),)
+    assert key.resolve() not in priv
+
+
+def test_ssh_policy_from_user_sandbox_json_not_workspace(tmp_path: Path, monkeypatch):
+    """The workspace .orbweaver/sandbox.json is agent-writable, so it cannot opt keys in."""
+    home, _ssh, key = _fake_ssh_home(tmp_path)
+    root = tmp_path / "ws"
+    (root / ".orbweaver").mkdir(parents=True)
+    (root / ".orbweaver" / "sandbox.json").write_text(
+        '{"ssh": {"bindIdentities": true, "identities": ["~/.ssh/id_ed25519"]}}', encoding="utf-8"
+    )
+    monkeypatch.setattr("orbweaver.sandbox.ssh.Path.home", lambda: home)
+    policy = load_sandbox_policy(root, environ={}, home=home)
+    assert policy.ssh == SshPolicy()
+    (home / ".orbweaver").mkdir()
+    (home / ".orbweaver" / "sandbox.json").write_text(
+        '{"ssh": {"bindIdentities": true}}', encoding="utf-8"
+    )
+    policy = load_sandbox_policy(root, environ={}, home=home)
+    assert policy.ssh.bind_identities is True
+    argv = build_bwrap_argv("true", root, root / ".orbweaver-tmp", policy=policy)
+    assert str(key.resolve()) in argv
+    env_policy = load_sandbox_policy(
+        root, environ={"ORBWEAVER_SANDBOX_SSH_IDENTITIES": "~/.ssh/id_ed25519"}, home=home
+    )
+    assert env_policy.ssh.identities == ((home / ".ssh" / "id_ed25519").resolve(),)
+
+
+def test_identity_binds_after_deny_read_tmpfs(tmp_path: Path, monkeypatch):
+    home, ssh, key = _fake_ssh_home(tmp_path)
     monkeypatch.setattr("orbweaver.sandbox.ssh.Path.home", lambda: home)
     policy = load_sandbox_policy(tmp_path, environ={}, home=home)
     argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp", policy=policy)
     ssh_dir = str(ssh.resolve())
-    key_path = str(key.resolve())
-    assert "--tmpfs" in argv
     tmpfs_at = None
     for i, a in enumerate(argv):
         if a == "--tmpfs" and i + 1 < len(argv) and argv[i + 1] == ssh_dir:
             tmpfs_at = i
     assert tmpfs_at is not None
-    assert key_path in argv
-    assert argv.index(key_path) > tmpfs_at
-    assert str((ssh / "config").resolve()) not in argv
-    binds = ssh_identity_bind_args(home)
-    assert str((ssh / "config").resolve()) not in binds
+    assert str(key.resolve()) not in argv
+    for name in ("config", "known_hosts", "lampropeltis-orbweaver.pub"):
+        public = str((ssh / name).resolve())
+        assert public in argv
+        assert argv.index(public) > tmpfs_at
+        assert argv[argv.index(public) - 1] == "--ro-bind-try"
+    assert_ro_bind_dests_creatable(argv)
+
+
+def test_ssh_agent_socket_bound_after_deny_tmpfs_and_exported(tmp_path: Path, monkeypatch):
+    """An agent socket under ~/.ssh must be re-bound on top of the tmpfs that hides the keys."""
+    home, ssh, key = _fake_ssh_home(tmp_path)
+    sock = ssh / "agent.sock"
+    sock.write_text("", encoding="utf-8")
+    monkeypatch.setattr("orbweaver.sandbox.ssh.Path.home", lambda: home)
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(sock))
+    policy = load_sandbox_policy(tmp_path, environ={"SSH_AUTH_SOCK": str(sock)}, home=home)
+    argv = build_bwrap_argv("true", tmp_path, tmp_path / "tmp", policy=policy)
+    ssh_dir = str(ssh.resolve())
+    tmpfs_at = argv.index(ssh_dir) - 1
+    assert argv[tmpfs_at] == "--tmpfs"
+    assert argv.index(str(sock)) > tmpfs_at
+    assert argv[argv.index("SSH_AUTH_SOCK") - 1] == "--setenv"
+    assert argv[argv.index("SSH_AUTH_SOCK") + 1] == str(sock)
+    assert str(key.resolve()) not in argv
 
 
 def test_ssh_agent_socket_allowlisted(tmp_path: Path, monkeypatch):

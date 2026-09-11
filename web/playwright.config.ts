@@ -27,6 +27,8 @@ export default defineConfig({
       ...process.env,
       ORBWEAVER_STORE: "memory",
       ORBWEAVER_CRON: "0",
+      // Local smoke run with the default JWT secret; serve refuses it otherwise.
+      ORBWEAVER_DEV_INSECURE: "1",
     },
   },
 });

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
 from uuid import UUID
 
 from orbweaver import __version__
-from orbweaver.agent import agent_turn
+from orbweaver.agent import TurnCancelled, agent_turn, resolve_approval
 from orbweaver.auth import mint_token
 from orbweaver.config import settings
 from orbweaver.image import (
@@ -24,6 +25,10 @@ from orbweaver.store import (
     new_uuid,
     session_at_id,
 )
+from orbweaver.turns import RunningTurn
+from orbweaver.turns import acquire as acquire_turn
+from orbweaver.turns import get as get_running_turn
+from orbweaver.turns import release as release_turn
 from orbweaver.workspace import WORKSPACE_KIND_LOCAL, apply_local_workspace_kind, bind_workspace
 
 log = logging.getLogger(__name__)
@@ -65,6 +70,85 @@ async def notify_telegram_chat(chat_id: int, text: str) -> None:
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text[:3500]},
         )
+
+
+APPROVAL_CALLBACK_PREFIX = "apr"
+_APPROVAL_BUTTONS: tuple[tuple[str, str, str], ...] = (
+    ("Allow", "allow", "once"),
+    ("Allow for session", "allow", "session"),
+    ("Deny", "deny", "once"),
+)
+
+
+def approval_request_text(payload: dict) -> str:
+    name = str(payload.get("name") or "tool")
+    summary = str(payload.get("summary") or "")
+    reason = str(payload.get("reason") or "")
+    lines = [f"Approval needed: {name}"]
+    if summary:
+        lines.append(summary[:1500])
+    if reason:
+        lines.append(f"Why: {reason[:600]}")
+    return "\n".join(lines)[:3500]
+
+
+def approval_keyboard(tool_use_id: str) -> dict:
+    """Telegram reply_markup with Allow / Allow for session / Deny buttons."""
+    row = []
+    for label, decision, scope in _APPROVAL_BUTTONS:
+        data = f"{APPROVAL_CALLBACK_PREFIX}:{decision}:{scope}:{tool_use_id}"
+        row.append({"text": label, "callback_data": data[:64]})
+    return {"inline_keyboard": [row]}
+
+
+def parse_approval_callback(data: str) -> tuple[str, str, str] | None:
+    """(decision, scope, tool_use_id) from an inline-keyboard callback, or None."""
+    parts = str(data or "").split(":", 3)
+    if len(parts) != 4 or parts[0] != APPROVAL_CALLBACK_PREFIX:
+        return None
+    _prefix, decision, scope, tool_use_id = parts
+    if decision not in {"allow", "deny"} or scope not in {"once", "session"} or not tool_use_id:
+        return None
+    return decision, scope, tool_use_id
+
+
+async def notify_telegram_approval(chat_id: int, payload: dict) -> None:
+    token = settings.telegram_bot_token
+    tool_use_id = str(payload.get("tool_use_id") or "")
+    if not token or not tool_use_id:
+        return
+    import httpx
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        await client.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": approval_request_text(payload),
+                "reply_markup": approval_keyboard(tool_use_id),
+            },
+        )
+
+
+def _approval_emitter(chat_id: int | None):
+    """agent_turn emit hook: push permission_request events to the chat as a keyboard."""
+    if chat_id is None:
+        return None
+
+    def emit(msg: dict) -> None:
+        if msg.get("kind") != "permission_request":
+            return
+        payload = dict(msg.get("payload") or {})
+
+        async def _send() -> None:
+            try:
+                await notify_telegram_approval(chat_id, payload)
+            except Exception:
+                log.exception("telegram approval keyboard failed")
+
+        asyncio.get_running_loop().create_task(_send())
+
+    return emit
 
 
 async def notify_telegram_photo(
@@ -222,32 +306,75 @@ async def _session_workspace(update, context):
     return store, session_id, ws, kind
 
 
+def _busy_reply(state: RunningTurn) -> str:
+    via = f" ({state.channel})" if state.channel else ""
+    return (
+        f"A turn is already running on this session{via}; your message was added to it. "
+        "Use Stop in the web UI or wait for it to finish."
+    )
+
+
 async def _run_turn(update, context, text: str, images: list[dict[str, str]] | None = None) -> None:
+    state: RunningTurn | None = None
+    session_id: UUID | None = None
     try:
         store, session_id, ws, kind = await _session_workspace(update, context)
-        events = await agent_turn(
-            store,
-            session_id,
-            text,
-            ws,
-            workspace_kind=kind,
-            headless=True,
-            interactive=True,
-            images=images,
-            system_extra=TELEGRAM_IMAGE_HINT,
-            channel="telegram",
-        )
-        reply = texts_for_reply(events) or "(no assistant text)"
+        chat = getattr(update, "effective_chat", None)
+        chat_id = chat.id if chat is not None else None
+        state = acquire_turn(session_id, channel="telegram")
+        if state is None:
+            # Same path as POST /turns/inject: the running turn picks the text up
+            # on its next LLM call instead of a second agent_turn racing it.
+            from orbweaver.app import inject_into_turn
+
+            running = get_running_turn(session_id)
+            if running is None:
+                reply = "A turn is already running on this session; send that again in a moment."
+            else:
+                await inject_into_turn(store, session_id, running, text, images)
+                reply = _busy_reply(running)
+            log.info("telegram: session %s busy, message injected into running turn", session_id)
+        else:
+            events = await agent_turn(
+                store,
+                session_id,
+                text,
+                ws,
+                workspace_kind=kind,
+                emit=_approval_emitter(chat_id),
+                headless=True,
+                interactive=True,
+                images=images,
+                system_extra=TELEGRAM_IMAGE_HINT,
+                channel="telegram",
+                cancel=state.cancel,
+                turn_state=state,
+            )
+            reply = texts_for_reply(events) or "(no assistant text)"
+    except TurnCancelled as e:
+        # Stop from the web UI reaches Telegram turns through the shared registry.
+        if session_id is not None:
+            await store.append_event(session_id, "turn_interrupted", {"reason": "stop"})
+        reply = texts_for_reply(e.produced) or "Turn stopped."
     except Exception as e:
         log.exception("telegram turn failed")
         reply = f"Turn failed: {e}"[:3500]
+    finally:
+        if state is not None and session_id is not None:
+            release_turn(session_id, state)
     if update.message:
         await update.message.reply_text(reply)
 
 
 async def start_telegram() -> None:
     from telegram import Update
-    from telegram.ext import Application, CommandHandler, MessageHandler, filters
+    from telegram.ext import (
+        Application,
+        CallbackQueryHandler,
+        CommandHandler,
+        MessageHandler,
+        filters,
+    )
 
     app = Application.builder().token(settings.telegram_bot_token).build()
 
@@ -342,8 +469,45 @@ async def start_telegram() -> None:
             return
         await _run_turn(update, context, text)
 
+    async def on_approval(update: Update, context) -> None:
+        query = update.callback_query
+        if query is None or not update.effective_user:
+            return
+        if not user_allowed(update.effective_user.id):
+            await query.answer("not allowlisted")
+            return
+        parsed = parse_approval_callback(query.data or "")
+        if parsed is None:
+            await query.answer()
+            return
+        decision, scope, tool_use_id = parsed
+        sid = context.user_data.get("session_id")
+        if not sid:
+            chat_id = update.effective_chat.id if update.effective_chat else None
+            ent = await session_for_telegram_user(get_store(), update.effective_user.id, chat_id)
+            sid = str(ent.id)
+            context.user_data["session_id"] = sid
+        resolved = resolve_approval(UUID(sid), tool_use_id, decision, scope)
+        if resolved:
+            label = {
+                ("allow", "once"): "Allowed",
+                ("allow", "session"): "Allowed for this session",
+                ("deny", "once"): "Denied",
+            }.get((decision, scope), decision)
+        else:
+            label = "No longer pending (timed out, cancelled, or already answered)"
+        await query.answer(label)
+        try:
+            original = str(getattr(query.message, "text", None) or "")
+            await query.edit_message_text(f"{original}\n\n→ {label}"[:4000])
+        except Exception:
+            log.debug("telegram approval message edit failed", exc_info=True)
+
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("version", on_version))
+    app.add_handler(
+        CallbackQueryHandler(on_approval, pattern=rf"^{APPROVAL_CALLBACK_PREFIX}:")
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, on_image_document))

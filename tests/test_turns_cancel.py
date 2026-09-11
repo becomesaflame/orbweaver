@@ -53,10 +53,10 @@ async def _open_session(client, headers):
 
 
 async def _wait_running():
-    from orbweaver.app import _running_turns
+    from orbweaver import turns
 
     for _ in range(100):
-        if _running_turns:
+        if turns.active():
             return
         await asyncio.sleep(0.01)
     raise AssertionError("turn did not start")
