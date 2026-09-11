@@ -15,8 +15,16 @@ from pathlib import Path
 from uuid import uuid4
 
 from orbweaver.config import settings
+from orbweaver.redact import redact_secrets
 from orbweaver.sandbox.policy import in_roots, load_sandbox_policy
-from orbweaver.tooltext import normalize_grep_pattern
+from orbweaver.tooltext import (
+    BASH_OUTPUT_CAP,
+    TRUNCATE_MAX_LINES,
+    format_bash_result,
+    needs_truncation,
+    normalize_grep_pattern,
+    truncate_head_tail,
+)
 from orbweaver.uris import resolve_workspace_uri, validate_workspace_uri
 
 log = logging.getLogger(__name__)
@@ -157,10 +165,10 @@ def _terminate_process(proc: subprocess.Popen) -> None:
             pass
 
 
-def _timeout_message(timeout: int, output: str) -> str:
-    body = (output or "")[-200_000:]
-    prefix = f"timeout: command exceeded {timeout}s"
-    return f"{prefix}\n{body}" if body else prefix
+def _timeout_message(timeout: int, output: str, *, returncode: int | None = None) -> str:
+    return format_bash_result(
+        output, returncode=returncode, elapsed_s=float(timeout), timed_out_after=timeout
+    )
 
 
 class _BashJob:
@@ -171,6 +179,7 @@ class _BashJob:
         self.proc = proc
         self.cleanup = cleanup
         self.started_at = time.monotonic()
+        self.finished_at: float | None = None
         self.status = "running"
         self.returncode: int | None = None
         self.output = ""
@@ -184,19 +193,22 @@ class _BashJob:
                 stdout, stderr = self.proc.communicate(timeout=self.timeout)
                 self.status = "exited"
                 self.returncode = self.proc.returncode
-                self.output = (_decode_captured(stdout) + _decode_captured(stderr))[-200_000:]
+                self.output = (_decode_captured(stdout) + _decode_captured(stderr))[-BASH_OUTPUT_CAP:]
             except subprocess.TimeoutExpired:
                 _terminate_process(self.proc)
                 stdout, stderr = self.proc.communicate(timeout=5)
                 self.status = "timeout"
                 self.returncode = self.proc.returncode
                 self.output = _timeout_message(
-                    self.timeout, _decode_captured(stdout) + _decode_captured(stderr)
+                    self.timeout,
+                    _decode_captured(stdout) + _decode_captured(stderr),
+                    returncode=self.returncode,
                 )
         except Exception as e:
             self.status = "error"
             self.output = str(e)
         finally:
+            self.finished_at = time.monotonic()
             if self.cleanup is not None:
                 try:
                     self.cleanup()
@@ -207,7 +219,7 @@ class _BashJob:
     def wait(self, seconds: float) -> bool:
         return self._done.wait(timeout=max(0.0, seconds))
 
-    def snapshot(self) -> str:
+    def payload(self) -> dict:
         payload: dict = {
             "job_id": self.job_id,
             "status": self.status,
@@ -217,9 +229,14 @@ class _BashJob:
         if self.status == "running":
             payload["elapsed_s"] = round(time.monotonic() - self.started_at, 3)
         else:
+            end = self.finished_at if self.finished_at is not None else time.monotonic()
+            payload["elapsed_s"] = round(end - self.started_at, 3)
             payload["returncode"] = self.returncode
             payload["output"] = self.output
-        return json.dumps(payload)
+        return payload
+
+    def snapshot(self) -> str:
+        return json.dumps(self.payload())
 
 
 class LocalWorkspace:
@@ -455,6 +472,7 @@ class LocalWorkspace:
         return hits
 
     def _raw_bash(self, command: str, timeout: int) -> str:
+        started = time.monotonic()
         try:
             proc = subprocess.run(
                 command,
@@ -467,7 +485,11 @@ class LocalWorkspace:
             )
         except subprocess.TimeoutExpired as e:
             return _timeout_message(timeout, _decode_captured(e.stdout) + _decode_captured(e.stderr))
-        return ((proc.stdout or "") + (proc.stderr or ""))[-200_000:]
+        return format_bash_result(
+            (proc.stdout or "") + (proc.stderr or ""),
+            returncode=proc.returncode,
+            elapsed_s=time.monotonic() - started,
+        )
 
     def _spawn_raw(self, command: str) -> subprocess.Popen:
         return subprocess.Popen(
@@ -485,7 +507,37 @@ class LocalWorkspace:
         if job is None:
             return json.dumps({"job_id": job_id, "status": "unknown", "error": "no such job"})
         job.wait(wait_s)
-        return job.snapshot()
+        payload = job.payload()
+        output = payload.get("output")
+        if isinstance(output, str):
+            payload.update(self._preview_job_output(job_id, output))
+        return json.dumps(payload)
+
+    def _preview_job_output(self, job_id: str, output: str) -> dict:
+        """Head + tail preview of oversized job output; the full text goes to the workspace.
+
+        Leaves room for the JSON envelope so the snapshot itself stays under the
+        persisted-result threshold instead of being persisted a second time as JSON.
+        """
+        text = redact_secrets(output)
+        threshold = int(settings.compact_tool_result_chars)
+        budget = max(1000, threshold * 3 // 4)
+        if not needs_truncation(text, max_chars=budget, max_lines=TRUNCATE_MAX_LINES):
+            return {"output": text}
+        rel: str | None = f".orbweaver/tool-results/{job_id}.txt"
+        try:
+            self.write(str(rel), text)
+        except (OSError, PermissionError):
+            rel = None
+        fields: dict = {
+            "output": truncate_head_tail(
+                text, max_chars=budget, max_lines=TRUNCATE_MAX_LINES, path=rel
+            ),
+            "output_chars": len(text),
+        }
+        if rel:
+            fields["persisted_path"] = rel
+        return fields
 
     def _start_job(self, command: str, timeout: int, proc: subprocess.Popen, cleanup=None) -> str:
         job_id = f"bj_{uuid4().hex[:12]}"

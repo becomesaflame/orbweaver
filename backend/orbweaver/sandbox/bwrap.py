@@ -7,6 +7,7 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,6 +24,7 @@ from orbweaver.sandbox.ssh import (
     ssh_config_overlay_args,
     ssh_identity_bind_args,
 )
+from orbweaver.tooltext import BASH_OUTPUT_CAP, format_bash_result
 
 log = logging.getLogger(__name__)
 
@@ -52,10 +54,10 @@ def _decode_captured(data) -> str:
     return str(data)
 
 
-def _timeout_message(timeout: int, output: str) -> str:
-    body = (output or "")[-200_000:]
-    prefix = f"timeout: command exceeded {timeout}s"
-    return f"{prefix}\n{body}" if body else prefix
+def _timeout_message(timeout: int, output: str, *, returncode: int | None = None) -> str:
+    return format_bash_result(
+        output, returncode=returncode, elapsed_s=float(timeout), timed_out_after=timeout
+    )
 
 
 def terminate_process(proc: subprocess.Popen) -> None:
@@ -275,6 +277,7 @@ def run_sandboxed(
 ) -> str:
     if is_containerized():
         return _raw(command, workspace_root, timeout)
+    started = time.monotonic()
     session = spawn_sandboxed(command, workspace_root, policy=policy, full_network=full_network)
     try:
         try:
@@ -283,17 +286,26 @@ def run_sandboxed(
             terminate_process(session.proc)
             stdout, stderr = session.proc.communicate(timeout=5)
             out = (stdout or "") + (stderr or "")
-            return _timeout_message(timeout, label_sandbox_output(out[-200_000:]))
+            return _timeout_message(
+                timeout,
+                label_sandbox_output(out[-BASH_OUTPUT_CAP:]),
+                returncode=session.proc.returncode,
+            )
     finally:
         session.close()
     out = (stdout or "") + (stderr or "")
     if session.proc.returncode != 0 and "operation not permitted" in out.lower() and "bwrap" in out.lower():
         log.warning("bwrap operation not permitted: %s", out[-500:])
         raise SandboxUnavailable(out[-800:])
-    return label_sandbox_output(out[-200_000:])
+    return format_bash_result(
+        label_sandbox_output(out[-BASH_OUTPUT_CAP:]),
+        returncode=session.proc.returncode,
+        elapsed_s=time.monotonic() - started,
+    )
 
 
 def _raw(command: str, workspace_root: Path, timeout: int) -> str:
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             command,
@@ -306,4 +318,8 @@ def _raw(command: str, workspace_root: Path, timeout: int) -> str:
         )
     except subprocess.TimeoutExpired as e:
         return _timeout_message(timeout, _decode_captured(e.stdout) + _decode_captured(e.stderr))
-    return ((proc.stdout or "") + (proc.stderr or ""))[-200_000:]
+    return format_bash_result(
+        (proc.stdout or "") + (proc.stderr or ""),
+        returncode=proc.returncode,
+        elapsed_s=time.monotonic() - started,
+    )

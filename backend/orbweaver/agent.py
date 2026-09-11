@@ -245,9 +245,11 @@ TOOL_SPEC = [
             "escalation. If the sandbox blocks the command, ask the user before setting "
             "permissions to [\"full_network\"] (arbitrary internet) or [\"all\"] "
             "(host writes/docker/sudo). Those overrides pause for approval. "
-            "unsandboxed true aliases [\"all\"]. Git commands get an automatic "
-            "status footer (branch, HEAD, rebase-in-progress); trust that over "
-            "success substrings in the command output."
+            "unsandboxed true aliases [\"all\"]. Every result starts with a header line "
+            "(`exit <code> in <seconds>s`, or `timed out after Ns`); trust it over success "
+            "substrings in the output. Oversized output is saved under "
+            ".orbweaver/tool-results/ and shown as head + tail around an omission marker. "
+            "Git commands get an automatic status footer (branch, HEAD, rebase-in-progress)."
         ),
         "input_schema": {
             "type": "object",

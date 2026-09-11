@@ -140,7 +140,7 @@ def test_sandboxed_git_init_remote_and_rm(live_root):
 def test_sandboxed_bash_timeout_expiry(live_root):
     ws = LocalWorkspace("workspace:default", str(live_root))
     out = ws.bash("sleep 5", timeout=1)
-    assert "timeout: command exceeded 1s" in out
+    assert "timed out after 1s" in out
 
 
 def test_sandboxed_bash_raised_timeout_completes(live_root):
