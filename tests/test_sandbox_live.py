@@ -147,25 +147,116 @@ def test_sandboxed_git_ls_remote_github(live_root):
     assert "refs/heads" in out or "HEAD" in out
 
 
-def test_sandboxed_git_init_remote_and_rm(live_root):
-    """Production clone: a later Bash turn could not write or rm .git/config and hooks."""
+def test_sandboxed_git_init_then_config_protected(live_root):
+    """Issue #94 (revises #23): git init works and creates .git/config + hooks. A
+    later turn cannot rewrite .git/config (config-execution escape) unless
+    allowGitConfig is set. .git init and commit/add still work."""
+    from orbweaver.sandbox.policy import SandboxPolicy
+
     init = run_sandboxed("git init", live_root, timeout=15)
     assert (live_root / ".git" / "config").is_file()
     assert (live_root / ".git" / "hooks").is_dir()
     assert "Read-only file system" not in init
-    remote = run_sandboxed(
+
+    # A later turn sees the now-existing config/hooks mounted read-only.
+    denied = run_sandboxed(
         "git remote add origin git@github.com:becomesaflame/orbweaver.git",
         live_root,
         timeout=15,
     )
-    assert "Device or resource busy" not in remote
-    assert "could not write config" not in remote.lower()
+    assert (
+        "could not" in denied.lower()
+        or "read-only" in denied.lower()
+        or "busy" in denied.lower()
+    )
+    assert "origin" not in run_sandboxed("git remote", live_root, timeout=10)
+
+    # allowGitConfig re-enables the git remote set-url workflow.
+    allow_pol = SandboxPolicy(allow_git_config=True)
+    allowed = run_sandboxed(
+        "git remote add origin git@github.com:becomesaflame/orbweaver.git",
+        live_root,
+        timeout=15,
+        policy=allow_pol,
+    )
+    assert "could not write config" not in allowed.lower()
     assert "origin" in run_sandboxed("git remote", live_root, timeout=10)
-    rm = run_sandboxed("rm -rf .git", live_root, timeout=15)
-    assert "Read-only file system" not in rm
-    assert "Device or resource busy" not in rm
-    assert "sandbox_denied" not in rm
-    assert not (live_root / ".git").exists()
+
+
+def test_sandboxed_git_config_is_readonly_but_commit_works(live_root):
+    """Issue #94: a pre-existing repo's .git/config and .git/hooks are read-only
+    inside the sandbox, but git add/commit still work on the rest of .git."""
+    import subprocess
+
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@e",
+    }
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(live_root), *args], check=True, env=env)
+
+    git("init", "-b", "main")
+    git("config", "user.name", "t")
+    git("config", "user.email", "t@e")
+    (live_root / "a.txt").write_text("a\n", encoding="utf-8")
+    git("add", "a.txt")
+    git("commit", "-m", "base")
+
+    append = run_sandboxed("echo escaped >> .git/config", live_root, timeout=15)
+    assert "Read-only file system" in append
+    hook = run_sandboxed("echo x > .git/hooks/pre-commit", live_root, timeout=15)
+    assert "Read-only file system" in hook
+
+    commit = run_sandboxed(
+        "printf b > b.txt && git add b.txt && "
+        "git -c user.name=t -c user.email=t@e commit -m two && git log --oneline",
+        live_root,
+        timeout=20,
+    )
+    assert "Read-only file system" not in commit
+    assert "two" in commit
+
+
+def test_sandboxed_env_excludes_gateway_secrets(live_root, monkeypatch):
+    """#93: `env` inside bubblewrap printed ANTHROPIC_API_KEY and ORBWEAVER_JWT_SECRET."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-FAKE")
+    monkeypatch.setenv("ORBWEAVER_JWT_SECRET", "x")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:FAKE")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
+    out = run_sandboxed("env", live_root, timeout=15)
+    assert "sandbox_denied" not in out
+    assert "sandbox_unavailable" not in out
+    assert "ANTHROPIC_API_KEY" not in out
+    assert "sk-ant-FAKE" not in out
+    assert "ORBWEAVER_JWT_SECRET" not in out
+    assert "TELEGRAM_BOT_TOKEN" not in out
+    assert "DATABASE_URL" not in out
+    assert "PATH=" in out
+    assert "HOME=" in out
+    # The proxy wrapper still exports its own proxy settings inside the sandbox.
+    assert "https_proxy=http://127.0.0.1:" in out
+    assert "ORBWEAVER_SSH_PROXY_HOST=127.0.0.1" in out
+
+
+def test_sandboxed_background_job_excludes_gateway_secrets(live_root, monkeypatch):
+    import json
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-FAKE")
+    monkeypatch.setenv("ORBWEAVER_JWT_SECRET", "x")
+    ws = LocalWorkspace("workspace:default", str(live_root))
+    started = json.loads(ws.bash("env", background=True, timeout=15))
+    assert started["status"] == "running"
+    finished = json.loads(ws.collect_job(started["job_id"], wait_s=10))
+    assert finished["status"] == "exited"
+    output = finished["output"]
+    assert "ANTHROPIC_API_KEY" not in output
+    assert "sk-ant-FAKE" not in output
+    assert "ORBWEAVER_JWT_SECRET" not in output
+    assert "PATH=" in output
 
 
 def test_sandboxed_bash_timeout_expiry(live_root):

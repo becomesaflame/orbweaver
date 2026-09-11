@@ -7,10 +7,12 @@ import os
 import shutil
 import signal
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from uuid import uuid4
 
 from orbweaver.config import settings
+from orbweaver.sandbox.environment import build_sandbox_env, setenv_args
 from orbweaver.sandbox.errors import label_sandbox_output
 from orbweaver.sandbox.policy import (
     PROTECTED_WRITE_REL,
@@ -139,6 +141,71 @@ def deny_read_overlay_args(policy: SandboxPolicy) -> list[str]:
         seen.add(dest)
         args.extend(chunk)
     return args
+# A writable root is `--bind` rw, but files that execute host commands when git
+# runs must stay read-only: `.git/config` (core.fsmonitor, core.sshCommand,
+# aliases, …), `.git/hooks/*`, and `.gitmodules`. The rest of `.git` stays
+# writable so `git add`/`git commit` still work in the sandbox (issue #94).
+# Discovery is a bounded walk; repos nested deeper than this are not protected
+# (matches sandbox-runtime's --max-depth cap and keeps per-command cost cheap).
+GIT_SCAN_MAX_DEPTH = 4
+_GIT_SCAN_PRUNE = {
+    ".git",
+    "node_modules",
+    ".orbweaver-tmp",
+    ".venv",
+    "venv",
+    "__pycache__",
+}
+
+
+def git_protected_paths(
+    root: Path,
+    max_depth: int = GIT_SCAN_MAX_DEPTH,
+    *,
+    allow_git_config: bool = False,
+) -> list[Path]:
+    """`.git/config`, `.git/hooks`, and `.gitmodules` for every repo at or under
+    `root`, up to `max_depth` directories deep. Missing paths are fine: the caller
+    uses `--ro-bind-try`, which skips them (and skips `.git/hooks` for worktrees
+    where `.git` is a file). With `allow_git_config`, `.git/config` stays writable
+    (hooks and .gitmodules do not)."""
+    out: list[Path] = []
+    try:
+        base = root.resolve()
+    except OSError:
+        return out
+    stack: list[tuple[Path, int]] = [(base, 0)]
+    while stack:
+        directory, depth = stack.pop()
+        git_dir = directory / ".git"
+        try:
+            if git_dir.is_dir():
+                if not allow_git_config:
+                    out.append(git_dir / "config")
+                out.append(git_dir / "hooks")
+        except OSError:
+            pass
+        gitmodules = directory / ".gitmodules"
+        try:
+            if gitmodules.is_file():
+                out.append(gitmodules)
+        except OSError:
+            pass
+        if depth >= max_depth:
+            continue
+        try:
+            for child in os.scandir(directory):
+                if child.name in _GIT_SCAN_PRUNE:
+                    continue
+                try:
+                    is_dir = child.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_dir:
+                    stack.append((Path(child.path), depth + 1))
+        except OSError:
+            continue
+    return out
 
 
 def _dir_chain(path: Path) -> list[str]:
@@ -169,6 +236,7 @@ def build_bwrap_argv(
     policy: SandboxPolicy | None = None,
     full_network: bool = False,
     host_root: bool = True,
+    environ: Mapping[str, str] | None = None,
 ) -> list[str]:
     exe = bwrap_path() or "bwrap"
     root = workspace_root.resolve()
@@ -219,16 +287,30 @@ def build_bwrap_argv(
             argv.extend(["--dir", d])
         argv.extend(["--ro-bind-try", str(sock_p), str(sock_p)])
     argv.extend(ssh_identity_bind_args(ssh_policy=pol.ssh))
-    for rw in pol.readwrite_roots(root, tmp):
+    writable_roots = pol.readwrite_roots(root, tmp)
+    for rw in writable_roots:
         argv.extend(["--bind", str(rw), str(rw)])
     for rel in PROTECTED_WRITE_REL:
         protected = root / rel
         argv.extend(["--ro-bind-try", str(protected), str(protected)])
-    agent_sock = os.environ.get("SSH_AUTH_SOCK", "").strip()
-    if agent_sock and Path(agent_sock) in set(pol.allow_unix_sockets):
-        # Agent forwarding: ssh inside the sandbox signs through the host agent.
-        argv.extend(["--setenv", "SSH_AUTH_SOCK", agent_sock])
-    argv.extend(["--setenv", "TMPDIR", str(tmp), "--chdir", str(root), "--", "bash", "-lc", command])
+    seen_git: set[str] = set()
+    for rw in writable_roots:
+        for git_path in git_protected_paths(rw, allow_git_config=pol.allow_git_config):
+            dest = str(git_path)
+            if dest in seen_git:
+                continue
+            seen_git.add(dest)
+            argv.extend(["--ro-bind-try", dest, dest])
+    # Do not inherit the gateway environment (API keys, JWT secret, bot token,
+    # DATABASE_URL). Clear it and set an explicit allowlist (#93).
+    env = build_sandbox_env(
+        environ if environ is not None else os.environ,
+        allow=pol.env_allow,
+        granted_sockets=pol.allow_unix_sockets,
+    )
+    env["TMPDIR"] = str(tmp)
+    argv.extend(setenv_args(env))
+    argv.extend(["--chdir", str(root), "--", "bash", "-lc", command])
     return argv
 
 

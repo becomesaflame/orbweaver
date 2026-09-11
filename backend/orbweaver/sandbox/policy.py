@@ -245,6 +245,12 @@ class SandboxPolicy:
     allow_unix_sockets: tuple[Path, ...] = ()
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
     ssh: SshPolicy = field(default_factory=SshPolicy)
+    # Keep .git/config writable inside the sandbox for `git remote set-url`
+    # workflows. .git/hooks and .gitmodules stay read-only either way (#94).
+    allow_git_config: bool = False
+    # Extra environment variable names/globs passed into the sandbox on top of
+    # DEFAULT_ENV_ALLOW. DEFAULT_ENV_EXCLUDE still wins (sandbox.json `env.allow`).
+    env_allow: tuple[str, ...] = ()
 
     def readwrite_roots(self, workspace_root: Path, tmp_dir: Path | None = None) -> tuple[Path, ...]:
         roots = [workspace_root.resolve()]
@@ -394,6 +400,17 @@ def _merge_file(
         ssh_raw = data.get("ssh")
         if isinstance(ssh_raw, dict):
             ssh = _merge_ssh(ssh, ssh_raw, relative_to=relative_to, home=home)
+    allow_git_config = policy.allow_git_config
+    git_raw = data.get("allowGitConfig", data.get("allow_git_config"))
+    if git_raw is not None:
+        if isinstance(git_raw, str):
+            allow_git_config = git_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            allow_git_config = bool(git_raw)
+    env_allow = list(policy.env_allow)
+    env_raw = data.get("env")
+    if isinstance(env_raw, dict):
+        env_allow = _merge_names(env_allow, env_raw.get("allow"))
     return replace(
         policy,
         additional_readonly=add_paths(policy.additional_readonly, "additionalReadonlyPaths"),
@@ -403,7 +420,23 @@ def _merge_file(
         allow_unix_sockets=add_paths(policy.allow_unix_sockets, "allowUnixSockets"),
         network=network,
         ssh=ssh,
+        allow_git_config=allow_git_config,
+        env_allow=tuple(env_allow),
     )
+
+
+def _merge_names(current: list[str], extra: Any) -> list[str]:
+    items = extra or []
+    if isinstance(items, str):
+        items = _parse_list(items)
+    if not isinstance(items, list):
+        return current
+    out = list(current)
+    for item in items:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
 
 
 def _filter_sockets(paths: Iterable[Path]) -> tuple[Path, ...]:
@@ -501,6 +534,7 @@ def load_sandbox_policy(
     bind_ids_raw = env.get("ORBWEAVER_SANDBOX_SSH_BIND_IDENTITIES")
     if bind_ids_raw is None or bind_ids_raw == "":
         bind_ids_raw = getattr(cfg, "orbweaver_sandbox_ssh_bind_identities", "")
+    extra_env_allow = env_list("ORBWEAVER_SANDBOX_ENV_ALLOW", "orbweaver_sandbox_env_allow")
 
     paths_ro = list(policy.additional_readonly)
     paths_rw = list(policy.additional_readwrite)
@@ -546,6 +580,13 @@ def load_sandbox_policy(
         if item not in deny_dom:
             deny_dom.append(item)
 
+    allow_git_config = policy.allow_git_config
+    git_env = env.get("ORBWEAVER_SANDBOX_ALLOW_GIT_CONFIG")
+    if git_env is None or git_env == "":
+        git_env = str(getattr(cfg, "orbweaver_sandbox_allow_git_config", "") or "")
+    if str(git_env).strip() != "":
+        allow_git_config = str(git_env).strip().lower() in {"1", "true", "yes"}
+
     policy = SandboxPolicy(
         additional_readonly=tuple(_unique_paths(paths_ro)),
         additional_readwrite=tuple(_unique_paths(paths_rw)),
@@ -559,6 +600,8 @@ def load_sandbox_policy(
             deny=tuple(deny_dom),
         ),
         ssh=SshPolicy(identities=tuple(_unique_paths(ssh_ids)), bind_identities=bind_identities),
+        allow_git_config=allow_git_config,
+        env_allow=tuple(_merge_names(list(policy.env_allow), extra_env_allow)),
     )
     policy = _with_hardcoded_denies(policy, home=home_dir, environ=env)
     deny = list(policy.deny_read)
