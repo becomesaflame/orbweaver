@@ -9,6 +9,7 @@ _ZERO = {
     "--unshare-pid",
     "--unshare-net",
     "--die-with-parent",
+    "--clearenv",
 }
 _ONE = {"--tmpfs", "--dir", "--dev", "--proc", "--chdir"}
 _TWO = {"--ro-bind", "--ro-bind-try", "--bind", "--setenv"}

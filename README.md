@@ -80,6 +80,8 @@ Linux Bash for `LocalWorkspace` runs in **bubblewrap**. The sandbox is write con
 
 Configure extra roots, sockets, and domains in `~/.orbweaver/sandbox.json`, `$WORKSPACE_ROOT/.orbweaver/sandbox.json`, or `ORBWEAVER_SANDBOX_CONFIG` (see `deploy/sandbox.json.example`). `denyRead` overlays skip paths that do not exist so a missing `~/.gnupg` cannot prevent the sandbox from starting.
 
+Sandboxed Bash does not inherit the gateway environment. bwrap starts with `--clearenv` and receives only an allowlist (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TZ`, `TMPDIR`, host proxy variables, and `SSH_AUTH_SOCK` when that socket is granted). Add names or globs with `env.allow` in `sandbox.json` or `ORBWEAVER_SANDBOX_ENV_ALLOW`; `*KEY*`, `*SECRET*`, `*TOKEN*`, `*PASSWORD*`, `ORBWEAVER_*`, `DATABASE_URL`, `ANTHROPIC_*`, `OPENAI_*`, `OPENROUTER_*`, `TELEGRAM_*`, and `HINDSIGHT_*` are never passed through.
+
 ### MCP servers
 
 Sessions can use external MCP tools. Configure stdio servers in `~/.orbweaver/mcp.json`, `$WORKSPACE_ROOT/.orbweaver/mcp.json`, or `ORBWEAVER_MCP_CONFIG` (see `deploy/mcp.json.example`). Later files override command/args; `env` maps merge so host tokens survive a workspace command override. Tools appear as `mcp_<server>_<tool>` and go through the same deny/ask/allow/classifier pipeline as other tools — they are not blanket-allowlisted. Put API tokens in the host file, not the workspace. Phase 6 snapshot packs must omit `mcp.json` (and its `env` blocks); those secrets stay on the destination host. The agent cannot Read or sandbox-write `.orbweaver/mcp.json`.

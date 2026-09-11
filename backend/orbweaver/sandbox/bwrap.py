@@ -7,10 +7,12 @@ import os
 import shutil
 import signal
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from uuid import uuid4
 
 from orbweaver.config import settings
+from orbweaver.sandbox.environment import build_sandbox_env, setenv_args
 from orbweaver.sandbox.errors import label_sandbox_output
 from orbweaver.sandbox.policy import (
     PROTECTED_WRITE_REL,
@@ -146,6 +148,7 @@ def build_bwrap_argv(
     policy: SandboxPolicy | None = None,
     full_network: bool = False,
     host_root: bool = True,
+    environ: Mapping[str, str] | None = None,
 ) -> list[str]:
     exe = bwrap_path() or "bwrap"
     root = workspace_root.resolve()
@@ -199,7 +202,16 @@ def build_bwrap_argv(
     for rel in PROTECTED_WRITE_REL:
         protected = root / rel
         argv.extend(["--ro-bind-try", str(protected), str(protected)])
-    argv.extend(["--setenv", "TMPDIR", str(tmp), "--chdir", str(root), "--", "bash", "-lc", command])
+    # Do not inherit the gateway environment (API keys, JWT secret, bot token,
+    # DATABASE_URL). Clear it and set an explicit allowlist (#93).
+    env = build_sandbox_env(
+        environ if environ is not None else os.environ,
+        allow=pol.env_allow,
+        granted_sockets=pol.allow_unix_sockets,
+    )
+    env["TMPDIR"] = str(tmp)
+    argv.extend(setenv_args(env))
+    argv.extend(["--chdir", str(root), "--", "bash", "-lc", command])
     return argv
 
 
