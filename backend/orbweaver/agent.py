@@ -735,6 +735,17 @@ def build_agent_system(
     ]
 
 
+def _tool_call_summary(name: str, inp: Any) -> str:
+    """One-line description of a tool call for UI cards; never raises."""
+    from orbweaver.permissions.pipeline import summarize_input
+
+    try:
+        summary = summarize_input(str(name), dict(inp) if isinstance(inp, dict) else {})
+    except Exception:  # summary is cosmetic; never fail the turn over it
+        summary = ""
+    return summary or str(name)
+
+
 def _blocked_tool_result(decision) -> str:
     if decision.behavior == "ask":
         return (
@@ -1374,7 +1385,12 @@ async def agent_turn(
                 call_ev = await store.append_event(
                     session_id,
                     "tool_call",
-                    {"id": block.id, "name": block.name, "input": block.input},
+                    {
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                        "summary": _tool_call_summary(block.name, block.input),
+                    },
                 )
                 fire(call_ev)
                 ctx["events"] = await store.list_events(session_id)
