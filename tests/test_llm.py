@@ -9,11 +9,13 @@ from orbweaver.llm import (
     OllamaMessagesClient,
     OpenAICompatClient,
     OpenAICompatError,
+    _to_ollama_tool,
     compact_llm_client,
     hosted_provider,
     make_agent_client,
     make_hosted_client,
     no_llm_echo,
+    normalize_openai_tool_parameters,
     select_provider,
 )
 from orbweaver.open_models import context_window_for
@@ -35,6 +37,39 @@ class _FakeHTTP:
 
     def json(self) -> dict:
         return self.payload
+
+
+def test_normalize_openai_tool_parameters_fills_required_array():
+    """GLM rejects object schemas with required=null / missing required (#141 Telegram)."""
+    assert normalize_openai_tool_parameters({"type": "object", "properties": {}}) == {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    }
+    assert normalize_openai_tool_parameters({"type": "object"})["required"] == []
+    assert normalize_openai_tool_parameters({}) == {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    }
+    assert normalize_openai_tool_parameters(None)["required"] == []
+    # Drop required entries that do not name a property (strict hosts hate that too).
+    assert normalize_openai_tool_parameters(
+        {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a", "missing"]}
+    )["required"] == ["a"]
+
+
+def test_operator_tools_wire_with_explicit_empty_required():
+    from orbweaver.channels.router import OPERATOR_TOOL_SPEC
+
+    by_name = {t["name"]: t for t in OPERATOR_TOOL_SPEC}
+    for name in ("ListSessions", "DetachSession"):
+        schema = by_name[name]["input_schema"]
+        assert schema["properties"] == {}
+        assert schema["required"] == []
+        wire = _to_ollama_tool(by_name[name])["function"]["parameters"]
+        assert wire["required"] == []
+        assert wire["properties"] == {}
 
 
 def _clear_providers(monkeypatch, *, anthropic: str = "", ollama: bool = False, openrouter: str = ""):
@@ -144,6 +179,10 @@ async def test_ollama_fake_client_maps_tools(monkeypatch):
     assert payload["model"] == "llama3.2"
     assert payload["messages"][0]["role"] == "system"
     assert payload["tools"][0]["function"]["name"] == "Read"
+    params = payload["tools"][0]["function"]["parameters"]
+    assert params["type"] == "object"
+    assert params["properties"] == {}
+    assert params["required"] == []
     uses = [b for b in resp.content if b.type == "tool_use"]
     assert uses[0].name == "Read"
     assert uses[0].input == {"path": "a.py"}
@@ -200,6 +239,7 @@ async def test_openrouter_fake_client_maps_tools(monkeypatch):
     assert user["role"] == "user"
     assert any(p.get("type") == "image_url" for p in user["content"])
     assert payload["tools"][0]["function"]["name"] == "Read"
+    assert payload["tools"][0]["function"]["parameters"]["required"] == []
     assert http.headers[0]["Authorization"] == "Bearer pk-prov-test"
     uses = [b for b in resp.content if b.type == "tool_use"]
     assert uses[0].name == "Read"

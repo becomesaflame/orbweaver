@@ -518,6 +518,9 @@ async def _run_turn(
     state: RunningTurn | None = None
     session_id: UUID | None = None
     status = "error"
+    # Always set before the post-finally reply so CancelledError (BaseException)
+    # during a gateway restart cannot leave ``reply`` unbound and swallow the turn.
+    reply = "Turn interrupted."
     try:
         bound = await _session_workspace(update, context, operator_only=operator_only)
         store, session_id = bound.store, bound.session_id
@@ -575,6 +578,26 @@ async def _run_turn(
                 {"kind": marker.kind, "payload": marker.payload, "id": str(marker.id), "seq": marker.seq},
             )
         reply = texts_for_reply(e.produced) or "Turn stopped."
+    except asyncio.CancelledError:
+        # Deploy restart / task cancel: still try to tell the chat what happened.
+        status = "stopped"
+        reply = "Turn interrupted (stop or gateway restart)."
+        if session_id is not None:
+            try:
+                store = get_store()
+                marker = await store.append_event(session_id, "turn_interrupted", {"reason": "cancelled"})
+                router.emit(
+                    session_id,
+                    {
+                        "kind": marker.kind,
+                        "payload": marker.payload,
+                        "id": str(marker.id),
+                        "seq": marker.seq,
+                    },
+                )
+            except Exception:
+                log.exception("telegram: could not record cancelled turn")
+        raise
     except Exception as e:
         log.exception("telegram turn failed")
         reply = f"Turn failed: {e}"[:3500]
@@ -585,11 +608,11 @@ async def _run_turn(
                 session_id,
                 {"kind": "turn_done", "status": status, "user_seq": state.user_seq, "channel": CHANNEL},
             )
-    if update.message:
-        try:
-            await update.message.reply_text(reply)
-        except Exception:
-            log.exception("telegram reply failed")
+        if update.message:
+            try:
+                await update.message.reply_text(reply)
+            except Exception:
+                log.exception("telegram reply failed")
 
 
 def start_turn(update, context, text: str, images: list[dict[str, str]] | None = None, **kw) -> asyncio.Task[Any]:

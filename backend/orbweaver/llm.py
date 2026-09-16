@@ -386,13 +386,37 @@ def _to_ollama_messages(system: Any, messages: list[dict[str, Any]]) -> list[dic
     return out
 
 
+def normalize_openai_tool_parameters(schema: Any) -> dict[str, Any]:
+    """Make a tool ``parameters`` object acceptable to strict OpenAI-compatible APIs.
+
+    GLM (and several other hosts) reject object schemas that omit ``required`` or
+    send ``required: null`` — the error is often ``at '/required': got null, want
+    array``. Parameter-free tools therefore need an explicit empty array. Also
+    fill in ``type`` / ``properties`` when an MCP server hands us ``{}``.
+    """
+    if not isinstance(schema, dict):
+        schema = {}
+    out = dict(schema)
+    out.setdefault("type", "object")
+    props = out.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+        out["properties"] = props
+    required = out.get("required")
+    if isinstance(required, list):
+        out["required"] = [r for r in required if isinstance(r, str) and r in props]
+    else:
+        out["required"] = []
+    return out
+
+
 def _to_ollama_tool(tool: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "function",
         "function": {
             "name": tool.get("name"),
             "description": tool.get("description") or "",
-            "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+            "parameters": normalize_openai_tool_parameters(tool.get("input_schema")),
         },
     }
 
