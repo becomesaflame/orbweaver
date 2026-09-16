@@ -165,7 +165,6 @@ async def test_send_session_photo_posts_when_chat_bound(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_run_turn_replies_when_agent_raises(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from uuid import uuid4
 
     from orbweaver.channels.telegram import _run_turn
 
@@ -179,11 +178,17 @@ async def test_run_turn_replies_when_agent_raises(tmp_path, monkeypatch):
         raise RuntimeError("tool_use ids were found without tool_result blocks")
 
     async def fake_ws(*_a, **_k):
-        return (
-            reset_store_for_tests(),
-            uuid4(),
-            LocalWorkspace("workspace:default", str(tmp_path)),
-            "local",
+        from orbweaver.channels.telegram import Bound
+
+        store = reset_store_for_tests()
+        op = await session_for_telegram_user(store, 42, chat_id=42)
+        return Bound(
+            store=store,
+            operator=op,
+            target=op,
+            ws=LocalWorkspace("workspace:default", str(tmp_path)),
+            kind="local",
+            chat_id=42,
         )
 
     monkeypatch.setattr("orbweaver.channels.telegram.agent_turn", boom)

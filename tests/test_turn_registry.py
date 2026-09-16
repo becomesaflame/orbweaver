@@ -52,6 +52,15 @@ def _session(sid, **extra):
     return Entity(id=sid, at_id=session_at_id(sid), at_type=SESSION_TYPE, jsonld=jsonld)
 
 
+async def _bound(store, sid, ws):
+    """A Telegram Bound whose operator and target are the same session."""
+    sess = await store.get_entity(sid)
+    if sess is None:
+        sess = _session(sid, channel="telegram", telegram_user_id=1, telegram_chat_id=1)
+        await store.put_entity(sess)
+    return tg.Bound(store=store, operator=sess, target=sess, ws=ws, kind="local", chat_id=1)
+
+
 class _ToolUse:
     def __init__(self, uid, name, inp):
         self.type = "tool_use"
@@ -246,8 +255,8 @@ async def test_telegram_handler_injects_instead_of_second_turn(tmp_path, monkeyp
     fake_turn = AsyncMock(return_value=[])
     monkeypatch.setattr(tg, "agent_turn", fake_turn)
 
-    async def fake_workspace(_update, _context):
-        return store, sid, _ws(tmp_path), "local"
+    async def fake_workspace(_update, _context, **_kw):
+        return await _bound(store, sid, _ws(tmp_path))
 
     monkeypatch.setattr(tg, "_session_workspace", fake_workspace)
     running = turns.acquire(sid, channel="web")
@@ -282,8 +291,8 @@ async def test_telegram_handler_holds_lock_while_turn_runs(tmp_path, monkeypatch
 
     monkeypatch.setattr(tg, "agent_turn", fake_turn)
 
-    async def fake_workspace(_update, _context):
-        return store, sid, _ws(tmp_path), "local"
+    async def fake_workspace(_update, _context, **_kw):
+        return await _bound(store, sid, _ws(tmp_path))
 
     monkeypatch.setattr(tg, "_session_workspace", fake_workspace)
     await tg._run_turn(_telegram_update(), MagicMock(), "hello")
@@ -304,8 +313,8 @@ async def test_telegram_releases_lock_when_turn_raises(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tg, "agent_turn", boom)
 
-    async def fake_workspace(_update, _context):
-        return store, sid, _ws(tmp_path), "local"
+    async def fake_workspace(_update, _context, **_kw):
+        return await _bound(store, sid, _ws(tmp_path))
 
     monkeypatch.setattr(tg, "_session_workspace", fake_workspace)
     update = _telegram_update()

@@ -568,17 +568,15 @@ def test_telegram_keyboard_roundtrip():
 
 
 @pytest.mark.asyncio
-async def test_telegram_emitter_sends_keyboard(monkeypatch):
+async def test_telegram_chat_sink_sends_keyboard(monkeypatch):
     sent: list[dict] = []
 
     async def fake_notify(chat_id, payload):
         sent.append({"chat_id": chat_id, **payload})
 
     monkeypatch.setattr(tg, "notify_telegram_approval", fake_notify)
-    emit = tg._approval_emitter(77)
-    assert emit is not None
-    emit({"kind": "assistant", "payload": {"text": "hi"}})
-    emit({"kind": "permission_request", "payload": {"tool_use_id": "tu-1", "name": "Bash"}})
+    sink = tg.make_chat_sink(77, uuid4())
+    sink({"kind": "assistant", "payload": {"text": "hi"}})
+    sink({"kind": "permission_request", "payload": {"tool_use_id": "tu-1", "name": "Bash"}})
     await asyncio.sleep(0)
     assert sent == [{"chat_id": 77, "tool_use_id": "tu-1", "name": "Bash"}]
-    assert tg._approval_emitter(None) is None

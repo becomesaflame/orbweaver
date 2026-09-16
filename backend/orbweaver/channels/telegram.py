@@ -1,14 +1,42 @@
+"""Telegram adapter: one operator session per user, routed through the session router.
+
+Each allowlisted Telegram user owns one *operator* session. Plain messages run
+on that session unless the chat is *attached* to another session
+(``/attach``, or the operator's ``AttachSession`` tool), in which case they run
+``agent_turn`` on the target: the same event stream the web UI or VS Code is
+looking at. A chat sink registered on both sessions pushes approval keyboards
+and finished-turn summaries here, so a turn started at the desk reports to the
+phone. Turns run as background tasks; ``/stop`` cancels the current one.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+from collections.abc import Coroutine
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from orbweaver import __version__
-from orbweaver.agent import TurnCancelled, agent_turn, resolve_approval
+from orbweaver.agent import (
+    TurnCancelled,
+    agent_turn,
+    pending_approvals,
+    pending_ask_user,
+    resolve_approval,
+)
 from orbweaver.auth import mint_token
+from orbweaver.channels import router
+from orbweaver.channels.router import (
+    ATTACHED_TURN_HINT,
+    OPERATOR_ROLE,
+    OPERATOR_SYSTEM_EXTRA,
+    AmbiguousSessionRef,
+    RouterError,
+)
 from orbweaver.config import settings
 from orbweaver.image import (
     PHOTO_MEDIA_TYPES,
@@ -38,6 +66,12 @@ TELEGRAM_IMAGE_HINT = (
     "To send a photo on Telegram, write an image file in the workspace and call SendPhoto. "
     "GenerateImage creates a file and, on Telegram sessions, sends it to the chat."
 )
+CHANNEL = "telegram"
+
+# chat_id -> sessions whose router sink delivers to that chat (operator + attached target).
+_bound: dict[int, set[UUID]] = {}
+# Background turn and delivery tasks, kept alive until done.
+_tasks: set[asyncio.Task[Any]] = set()
 
 
 def user_allowed(user_id: int) -> bool:
@@ -130,25 +164,167 @@ async def notify_telegram_approval(chat_id: int, payload: dict) -> None:
         )
 
 
-def _approval_emitter(chat_id: int | None):
-    """agent_turn emit hook: push permission_request events to the chat as a keyboard."""
-    if chat_id is None:
+# ------------------------------------------------------------------ chat sinks
+
+
+def _spawn(coro: Coroutine[Any, Any, Any], name: str) -> asyncio.Task[Any]:
+    task = asyncio.get_running_loop().create_task(coro, name=name)
+    _tasks.add(task)
+
+    def _done(t: asyncio.Task[Any]) -> None:
+        _tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            log.error("telegram task %s failed", name, exc_info=t.exception())
+
+    task.add_done_callback(_done)
+    return task
+
+
+def _sink_key(chat_id: int) -> str:
+    return f"telegram:{chat_id}"
+
+
+def chats_for_session(session_id: UUID) -> list[int]:
+    """Chats whose sink is bound to ``session_id`` (operator or attached)."""
+    return sorted(chat for chat, sessions in _bound.items() if session_id in sessions)
+
+
+def _turn_status_text(status: str) -> str:
+    return {
+        "stopped": "Turn stopped.",
+        "discarded": "Turn discarded.",
+        "error": "Turn failed.",
+        "waiting_ask": "Waiting for your answer.",
+    }.get(status, "Turn finished.")
+
+
+async def deliver_turn_result(chat_id: int, session_id: UUID, done: dict[str, Any]) -> None:
+    """A turn someone else started on a bound session finished: report it here."""
+    store = get_store()
+    events = await store.list_events(session_id)
+    try:
+        user_seq = int(done.get("user_seq") or 0)
+    except (TypeError, ValueError):
+        user_seq = 0
+    tail = [e for e in events if e.seq > user_seq]
+    text = texts_for_reply(tail) or _turn_status_text(str(done.get("status") or ""))
+    sess = await store.get_entity(session_id)
+    title = router.display_title(sess.jsonld or {}, events) if sess else str(session_id)[:8]
+    await notify_telegram_chat(chat_id, f"[{title}]\n{text}")
+
+
+def make_chat_sink(chat_id: int, session_id: UUID) -> router.Sink:
+    """Router sink: approval keyboards for any turn; results for turns run elsewhere.
+
+    ``turn_done`` frames from this adapter carry ``channel: telegram`` and are
+    skipped because the handler already replied to the user's message.
+    """
+
+    def sink(msg: dict[str, Any]) -> None:
+        kind = msg.get("kind")
+        if kind == "permission_request":
+            payload = dict(msg.get("payload") or {})
+            _spawn(notify_telegram_approval(chat_id, payload), f"tg-approval-{chat_id}")
+        elif kind == "turn_done" and msg.get("channel") != CHANNEL:
+            _spawn(deliver_turn_result(chat_id, session_id, dict(msg)), f"tg-deliver-{chat_id}")
+
+    return sink
+
+
+def bind_chat(chat_id: int, sessions: set[UUID]) -> None:
+    """Make ``chat_id``'s sink follow exactly ``sessions``."""
+    key = _sink_key(chat_id)
+    current = _bound.get(chat_id, set())
+    for sid in current - sessions:
+        router.remove_sink(sid, key)
+    for sid in sessions - current:
+        router.add_sink(sid, key, make_chat_sink(chat_id, sid))
+    if sessions:
+        _bound[chat_id] = set(sessions)
+    else:
+        _bound.pop(chat_id, None)
+
+
+def _jsonld_chat_id(jsonld: dict[str, Any]) -> int | None:
+    raw = jsonld.get("telegram_chat_id")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
         return None
 
-    def emit(msg: dict) -> None:
-        if msg.get("kind") != "permission_request":
-            return
-        payload = dict(msg.get("payload") or {})
 
-        async def _send() -> None:
-            try:
-                await notify_telegram_approval(chat_id, payload)
-            except Exception:
-                log.exception("telegram approval keyboard failed")
+def sync_chat_sinks(operator: Entity) -> None:
+    """Bind the operator's chat to its own session plus the attached target, if any."""
+    chat_id = _jsonld_chat_id(operator.jsonld or {})
+    if chat_id is None:
+        return
+    wanted = {operator.id}
+    target = router.attached_id(operator)
+    if target is not None:
+        wanted.add(target)
+    bind_chat(chat_id, wanted)
 
-        asyncio.get_running_loop().create_task(_send())
 
-    return emit
+def _on_attach_changed(operator: Entity, _target: UUID | None) -> None:
+    sync_chat_sinks(operator)
+
+
+def install_router_hooks() -> None:
+    router.add_attach_hook(_on_attach_changed)
+
+
+async def rehydrate_chat_sinks(store: Store) -> int:
+    """After a restart, rebuild sinks from persisted attach pointers."""
+    count = 0
+    for ent in await store.list_entities(SESSION_TYPE):
+        if ent.jsonld.get("telegram_user_id") is None:
+            continue
+        sync_chat_sinks(ent)
+        count += 1
+    return count
+
+
+def reset_for_tests() -> None:
+    _bound.clear()
+    _tasks.clear()
+
+
+# -------------------------------------------------------------- photos / images
+
+
+def _telegram_chat_id(sess: Entity | None) -> int | None:
+    """Chat bound to ``sess``: its own Telegram binding, else a chat attached to it."""
+    if not sess:
+        return None
+    own = _jsonld_chat_id(sess.jsonld or {})
+    if own is not None:
+        return own
+    chats = chats_for_session(sess.id)
+    return chats[0] if chats else None
+
+
+async def send_session_photo(ctx: dict, inp: dict) -> str:
+    path = str(inp.get("path") or "").strip()
+    caption = str(inp.get("caption") or "")[:1024]
+    if not path or not is_image_path(path):
+        return "path must be a workspace image (.jpg, .jpeg, .png, .webp, .gif)"
+    ws = ctx["workspace"]
+    try:
+        data = ws.read_bytes(path)
+    except (OSError, PermissionError, FileNotFoundError, IsADirectoryError) as e:
+        return f"read failed: {e}"
+    store = ctx["store"]
+    sess = await store.get_entity(ctx["session_id"])
+    chat_id = _telegram_chat_id(sess)
+    if chat_id is None:
+        return f"no telegram chat bound to this session; image remains at {path}"
+    media_type = sniff_media_type(data)
+    if media_type == "application/octet-stream":
+        media_type = "image/jpeg"
+    result = await notify_telegram_photo(chat_id, data, caption, Path(path).name, media_type)
+    if result != "ok":
+        return result
+    return json.dumps({"sent": True, "path": path})
 
 
 async def notify_telegram_photo(
@@ -174,40 +350,6 @@ async def notify_telegram_photo(
         if r.status_code >= 400:
             return f"telegram {endpoint} failed: {r.status_code} {r.text[:300]}"
     return "ok"
-
-
-def _telegram_chat_id(sess: Entity | None) -> int | None:
-    if not sess:
-        return None
-    raw = sess.jsonld.get("telegram_chat_id")
-    try:
-        return int(raw) if raw is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-async def send_session_photo(ctx: dict, inp: dict) -> str:
-    path = str(inp.get("path") or "").strip()
-    caption = str(inp.get("caption") or "")[:1024]
-    if not path or not is_image_path(path):
-        return "path must be a workspace image (.jpg, .jpeg, .png, .webp, .gif)"
-    ws = ctx["workspace"]
-    try:
-        data = ws.read_bytes(path)
-    except (OSError, PermissionError, FileNotFoundError, IsADirectoryError) as e:
-        return f"read failed: {e}"
-    store = ctx["store"]
-    sess = await store.get_entity(ctx["session_id"])
-    chat_id = _telegram_chat_id(sess)
-    if chat_id is None:
-        return f"no telegram chat bound to this session; image remains at {path}"
-    media_type = sniff_media_type(data)
-    if media_type == "application/octet-stream":
-        media_type = "image/jpeg"
-    result = await notify_telegram_photo(chat_id, data, caption, Path(path).name, media_type)
-    if result != "ok":
-        return result
-    return json.dumps({"sent": True, "path": path})
 
 
 async def generate_and_maybe_send(ctx: dict, inp: dict) -> str:
@@ -244,19 +386,30 @@ async def generate_and_maybe_send(ctx: dict, inp: dict) -> str:
     return json.dumps(payload)
 
 
+# ------------------------------------------------------------ operator session
+
+
+def _normalize_operator(jsonld: dict[str, Any], chat_id: int | None) -> bool:
+    """Bring an operator session's JSON-LD up to date. Returns True when it changed."""
+    changed = apply_local_workspace_kind(jsonld)
+    if chat_id is not None and jsonld.get("telegram_chat_id") != chat_id:
+        jsonld["telegram_chat_id"] = chat_id
+        changed = True
+    if jsonld.get("channel") != CHANNEL:
+        jsonld["channel"] = CHANNEL
+        changed = True
+    if jsonld.get("role") != OPERATOR_ROLE:
+        jsonld["role"] = OPERATOR_ROLE
+        changed = True
+    return changed
+
+
 async def session_for_telegram_user(
     store: Store, user_id: int, chat_id: int | None = None
 ) -> Entity:
     for ent in await store.list_entities(SESSION_TYPE):
         if ent.jsonld.get("telegram_user_id") == user_id:
-            changed = apply_local_workspace_kind(ent.jsonld)
-            if chat_id is not None and ent.jsonld.get("telegram_chat_id") != chat_id:
-                ent.jsonld["telegram_chat_id"] = chat_id
-                changed = True
-            if ent.jsonld.get("channel") != "telegram":
-                ent.jsonld["channel"] = "telegram"
-                changed = True
-            if changed:
+            if _normalize_operator(ent.jsonld, chat_id):
                 await store.put_entity(ent)
             return ent
     uid = new_uuid()
@@ -270,7 +423,8 @@ async def session_for_telegram_user(
             "workspace_uri": "workspace:default",
             "workspace_kind": WORKSPACE_KIND_LOCAL,
             "title": f"telegram:{user_id}",
-            "channel": "telegram",
+            "channel": CHANNEL,
+            "role": OPERATOR_ROLE,
             "telegram_user_id": user_id,
             "telegram_chat_id": chat_id if chat_id is not None else user_id,
             "status": "active",
@@ -280,54 +434,94 @@ async def session_for_telegram_user(
     return ent
 
 
-async def _session_workspace(update, context):
+@dataclass
+class Bound:
+    """Where a Telegram message runs: the operator's own session or its attached target."""
+
+    store: Store
+    operator: Entity
+    target: Entity
+    ws: Any
+    kind: str
+    chat_id: int | None
+
+    @property
+    def session_id(self) -> UUID:
+        return self.target.id
+
+    @property
+    def attached(self) -> bool:
+        return self.target.id != self.operator.id
+
+
+def _user_data(context) -> dict[str, Any]:
+    data = getattr(context, "user_data", None)
+    return data if isinstance(data, dict) else {}
+
+
+async def _operator_session(update, context) -> tuple[Store, Entity, int | None]:
     store = get_store()
-    sid = context.user_data.get("session_id")
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if not sid:
+    chat = getattr(update, "effective_chat", None)
+    chat_id = chat.id if chat is not None else None
+    data = _user_data(context)
+    ent: Entity | None = None
+    sid = data.get("session_id")
+    if sid:
+        try:
+            ent = await store.get_entity(UUID(str(sid)))
+        except ValueError:
+            ent = None
+        if ent is not None and _normalize_operator(ent.jsonld, chat_id):
+            await store.put_entity(ent)
+    if ent is None:
         ent = await session_for_telegram_user(store, update.effective_user.id, chat_id)
-        sid = str(ent.id)
-        context.user_data["session_id"] = sid
-    session_id = UUID(sid)
-    sess = await store.get_entity(session_id)
-    if sess:
-        changed = False
-        if chat_id is not None and sess.jsonld.get("telegram_chat_id") != chat_id:
-            sess.jsonld["telegram_chat_id"] = chat_id
-            changed = True
-        if sess.jsonld.get("channel") != "telegram":
-            sess.jsonld["channel"] = "telegram"
-            changed = True
-        ws, kind, kind_changed = bind_workspace(
-            sess.jsonld, settings.workspace_root, session_key=str(session_id)
-        )
-        if changed or kind_changed:
-            await store.put_entity(sess)
-    else:
-        ws, kind, _ = bind_workspace(
-            {"workspace_uri": "workspace:default"},
-            settings.workspace_root,
-            session_key=str(session_id),
-        )
-    return store, session_id, ws, kind
+        data["session_id"] = str(ent.id)
+    install_router_hooks()
+    sync_chat_sinks(ent)
+    return store, ent, chat_id
+
+
+async def _session_workspace(update, context, *, operator_only: bool = False) -> Bound:
+    store, operator, chat_id = await _operator_session(update, context)
+    target = operator if operator_only else await router.resolve_target(store, operator)
+    ws, kind, kind_changed = bind_workspace(
+        target.jsonld, settings.workspace_root, session_key=str(target.id)
+    )
+    if kind_changed:
+        await store.put_entity(target)
+    return Bound(store=store, operator=operator, target=target, ws=ws, kind=kind, chat_id=chat_id)
 
 
 def _busy_reply(state: RunningTurn) -> str:
     via = f" ({state.channel})" if state.channel else ""
     return (
         f"A turn is already running on this session{via}; your message was added to it. "
-        "Use Stop in the web UI or wait for it to finish."
+        "Send /stop to cancel it, or wait for it to finish."
     )
 
 
-async def _run_turn(update, context, text: str, images: list[dict[str, str]] | None = None) -> None:
+def _title_of(ent: Entity, events) -> str:
+    return router.display_title(ent.jsonld or {}, events)
+
+
+# ------------------------------------------------------------------- turns
+
+
+async def _run_turn(
+    update,
+    context,
+    text: str,
+    images: list[dict[str, str]] | None = None,
+    *,
+    operator_only: bool = False,
+) -> None:
     state: RunningTurn | None = None
     session_id: UUID | None = None
+    status = "error"
     try:
-        store, session_id, ws, kind = await _session_workspace(update, context)
-        chat = getattr(update, "effective_chat", None)
-        chat_id = chat.id if chat is not None else None
-        state = acquire_turn(session_id, channel="telegram")
+        bound = await _session_workspace(update, context, operator_only=operator_only)
+        store, session_id = bound.store, bound.session_id
+        state = acquire_turn(session_id, channel=CHANNEL)
         if state is None:
             # Same path as POST /turns/inject: the running turn picks the text up
             # on its next LLM call instead of a second agent_turn racing it.
@@ -337,30 +531,49 @@ async def _run_turn(update, context, text: str, images: list[dict[str, str]] | N
             if running is None:
                 reply = "A turn is already running on this session; send that again in a moment."
             else:
-                await inject_into_turn(store, session_id, running, text, images)
+                await inject_into_turn(
+                    store, session_id, running, text, images, via=CHANNEL if bound.attached else None
+                )
                 reply = _busy_reply(running)
             log.info("telegram: session %s busy, message injected into running turn", session_id)
         else:
+            extra = TELEGRAM_IMAGE_HINT
+            tools = None
+            via = None
+            if bound.attached:
+                extra += " " + ATTACHED_TURN_HINT
+                via = CHANNEL
+            else:
+                extra += " " + OPERATOR_SYSTEM_EXTRA
+                tools = await router.operator_tools(bound.ws, CHANNEL)
             events = await agent_turn(
                 store,
                 session_id,
                 text,
-                ws,
-                workspace_kind=kind,
-                emit=_approval_emitter(chat_id),
+                bound.ws,
+                workspace_kind=bound.kind,
+                emit=router.emitter(session_id),
                 headless=True,
                 interactive=True,
                 images=images,
-                system_extra=TELEGRAM_IMAGE_HINT,
-                channel="telegram",
+                system_extra=extra,
+                channel=CHANNEL,
                 cancel=state.cancel,
                 turn_state=state,
+                tools=tools,
+                via=via,
             )
             reply = texts_for_reply(events) or "(no assistant text)"
+            status = "waiting_ask" if pending_ask_user(await store.list_events(session_id)) else "ok"
     except TurnCancelled as e:
-        # Stop from the web UI reaches Telegram turns through the shared registry.
+        # Stop from the web UI (or /stop) reaches Telegram turns through the shared registry.
+        status = "stopped"
         if session_id is not None:
-            await store.append_event(session_id, "turn_interrupted", {"reason": "stop"})
+            marker = await store.append_event(session_id, "turn_interrupted", {"reason": "stop"})
+            router.emit(
+                session_id,
+                {"kind": marker.kind, "payload": marker.payload, "id": str(marker.id), "seq": marker.seq},
+            )
         reply = texts_for_reply(e.produced) or "Turn stopped."
     except Exception as e:
         log.exception("telegram turn failed")
@@ -368,8 +581,93 @@ async def _run_turn(update, context, text: str, images: list[dict[str, str]] | N
     finally:
         if state is not None and session_id is not None:
             release_turn(session_id, state)
+            router.emit(
+                session_id,
+                {"kind": "turn_done", "status": status, "user_seq": state.user_seq, "channel": CHANNEL},
+            )
     if update.message:
-        await update.message.reply_text(reply)
+        try:
+            await update.message.reply_text(reply)
+        except Exception:
+            log.exception("telegram reply failed")
+
+
+def start_turn(update, context, text: str, images: list[dict[str, str]] | None = None, **kw) -> asyncio.Task[Any]:
+    """Run the turn off the handler so /stop, approvals, and new messages keep flowing."""
+    return _spawn(_run_turn(update, context, text, images, **kw), "tg-turn")
+
+
+# ---------------------------------------------------------------- command text
+
+
+async def status_text(bound: Bound) -> str:
+    store = bound.store
+    lines = [f"Orbweaver {__version__}"]
+    if bound.attached:
+        events = await store.list_events(bound.target.id)
+        lines.append(f"attached to: {_title_of(bound.target, events)} ({str(bound.target.id)[:8]})")
+        lines.append(f"workspace: {bound.target.jsonld.get('workspace_uri') or 'workspace:default'}")
+    else:
+        lines.append(f"own session {str(bound.operator.id)[:8]} (workspace:default); not attached")
+        events = await store.list_events(bound.operator.id)
+    state = get_running_turn(bound.session_id)
+    if state is not None:
+        lines.append(f"a turn is running now (via {state.channel or 'unknown'})")
+    pending = pending_ask_user(events)
+    if pending is not None:
+        question = str(((pending.payload or {}).get("input") or {}).get("question") or "")
+        lines.append(f"waiting for your answer: {question}" if question else "waiting for your answer")
+    if bound.attached:
+        lines.append("/detach to return to your own session")
+    else:
+        lines.append("/sessions to see what you can attach to")
+    return "\n".join(lines)
+
+
+async def sessions_text(bound: Bound) -> str:
+    rows = await router.list_sessions(bound.store, exclude={bound.operator.id})
+    body = router.format_session_list(rows, router.attached_id(bound.operator))
+    return body + "\n\n/attach <id or title> to continue one here."
+
+
+async def attach_text(bound: Bound, ref: str) -> str:
+    store = bound.store
+    ref = ref.strip()
+    if not ref:
+        return await sessions_text(bound)
+    try:
+        target = await router.find_session(store, ref, exclude={bound.operator.id})
+    except AmbiguousSessionRef as e:
+        rows = [await router.session_row(store, m) for m in e.matches]
+        return "Several sessions match; pick one by id:\n" + router.format_session_list(rows)
+    if target is None:
+        return f"No session matches '{ref}'. /sessions lists them."
+    try:
+        await router.attach(store, bound.operator, target.id)
+    except RouterError as e:
+        return f"Cannot attach: {e}"
+    digest = await router.session_digest(store, target.id)
+    return (
+        "Attached. Your messages now run on this session; /detach to come back.\n\n"
+        + router.format_digest(digest)
+    )[:3500]
+
+
+async def detach_text(bound: Bound) -> str:
+    previous = await router.detach(bound.store, bound.operator)
+    if previous is None:
+        return "Not attached; you are on your own session."
+    return f"Detached from {str(previous)[:8]}. Back on your own session."
+
+
+def _approval_session(candidates: list[UUID], tool_use_id: str) -> UUID | None:
+    for sid in candidates:
+        if any(p.tool_use_id == tool_use_id for p in pending_approvals(sid)):
+            return sid
+    return None
+
+
+# ----------------------------------------------------------------- application
 
 
 async def start_telegram() -> None:
@@ -382,37 +680,105 @@ async def start_telegram() -> None:
         filters,
     )
 
-    app = Application.builder().token(settings.telegram_bot_token).build()
+    install_router_hooks()
+    try:
+        bound_count = await rehydrate_chat_sinks(get_store())
+        log.info("telegram: rebuilt chat sinks for %d operator session(s)", bound_count)
+    except Exception:
+        log.exception("telegram: rehydrating chat sinks failed")
 
-    async def on_start(update: Update, context) -> None:
+    app = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .concurrent_updates(True)
+        .build()
+    )
+
+    def _args_text(context) -> str:
+        args = getattr(context, "args", None) or []
+        return " ".join(str(a) for a in args).strip()
+
+    async def _guard(update: Update) -> bool:
         if not update.effective_user or not update.message:
-            return
+            return False
         if not user_allowed(update.effective_user.id):
             await update.message.reply_text("not allowlisted")
+            return False
+        return True
+
+    async def on_start(update: Update, context) -> None:
+        if not await _guard(update):
             return
-        store = get_store()
-        chat_id = update.effective_chat.id if update.effective_chat else None
-        ent = await session_for_telegram_user(store, update.effective_user.id, chat_id)
-        context.user_data["session_id"] = str(ent.id)
-        mint_token(f"telegram:{update.effective_user.id}", extra={"channel": "telegram"})
-        await update.message.reply_text(f"session {ent.id}\nOrbweaver {__version__}")
-        log.info("telegram session %s jwt issued", ent.id)
+        assert update.message and update.effective_user
+        bound = await _session_workspace(update, context)
+        mint_token(f"telegram:{update.effective_user.id}", extra={"channel": CHANNEL})
+        await update.message.reply_text(f"session {bound.operator.id}\n" + await status_text(bound))
+        log.info("telegram session %s jwt issued", bound.operator.id)
 
     async def on_version(update: Update, context) -> None:
         del context
-        if not update.effective_user or not update.message:
+        if not await _guard(update):
             return
-        if not user_allowed(update.effective_user.id):
-            await update.message.reply_text("not allowlisted")
-            return
+        assert update.message
         await update.message.reply_text(f"Orbweaver {__version__}")
+
+    async def on_status(update: Update, context) -> None:
+        if not await _guard(update):
+            return
+        assert update.message
+        bound = await _session_workspace(update, context)
+        await update.message.reply_text(await status_text(bound))
+
+    async def on_sessions(update: Update, context) -> None:
+        if not await _guard(update):
+            return
+        assert update.message
+        bound = await _session_workspace(update, context, operator_only=True)
+        await update.message.reply_text(await sessions_text(bound))
+
+    async def on_attach(update: Update, context) -> None:
+        if not await _guard(update):
+            return
+        assert update.message
+        bound = await _session_workspace(update, context, operator_only=True)
+        await update.message.reply_text(await attach_text(bound, _args_text(context)))
+
+    async def on_detach(update: Update, context) -> None:
+        if not await _guard(update):
+            return
+        assert update.message
+        bound = await _session_workspace(update, context, operator_only=True)
+        await update.message.reply_text(await detach_text(bound))
+
+    async def on_stop(update: Update, context) -> None:
+        if not await _guard(update):
+            return
+        assert update.message
+        bound = await _session_workspace(update, context)
+        state = get_running_turn(bound.session_id)
+        if state is None:
+            await update.message.reply_text("Nothing is running on this session.")
+            return
+        state.cancel.set()
+        await update.message.reply_text("Stopping the running turn.")
+
+    async def on_operator(update: Update, context) -> None:
+        """/op <text>: talk to the operator even while attached."""
+        if not await _guard(update):
+            return
+        assert update.message
+        text = _args_text(context)
+        if not text:
+            await update.message.reply_text("Usage: /op <message for the operator>")
+            return
+        start_turn(update, context, text, operator_only=True)
 
     async def on_text(update: Update, context) -> None:
         if not update.effective_user or not update.message or not update.message.text:
             return
         if not user_allowed(update.effective_user.id):
             return
-        await _run_turn(update, context, update.message.text)
+        start_turn(update, context, update.message.text)
 
     async def on_photo(update: Update, context) -> None:
         if not update.effective_user or not update.message or not update.message.photo:
@@ -426,14 +792,14 @@ async def start_telegram() -> None:
         except Exception as e:
             await update.message.reply_text(f"photo download failed: {e}")
             return
-        _store, _session_id, ws, _kind = await _session_workspace(update, context)
+        bound = await _session_workspace(update, context)
         try:
-            img = save_inbound_image(ws, data, f"photo_{update.message.message_id}")
+            img = save_inbound_image(bound.ws, data, f"photo_{update.message.message_id}")
         except Exception as e:
             await update.message.reply_text(f"photo processing failed: {e}")
             return
         caption = (update.message.caption or "").strip() or "[Photo]"
-        await _run_turn(update, context, caption, images=[img])
+        start_turn(update, context, caption, images=[img])
 
     async def on_image_document(update: Update, context) -> None:
         if not update.effective_user or not update.message or not update.message.document:
@@ -447,15 +813,15 @@ async def start_telegram() -> None:
         except Exception as e:
             await update.message.reply_text(f"image download failed: {e}")
             return
-        _store, _session_id, ws, _kind = await _session_workspace(update, context)
+        bound = await _session_workspace(update, context)
         stem = (doc.file_name or f"image_{update.message.message_id}").rsplit(".", 1)[0]
         try:
-            img = save_inbound_image(ws, data, stem)
+            img = save_inbound_image(bound.ws, data, stem)
         except Exception as e:
             await update.message.reply_text(f"image processing failed: {e}")
             return
         caption = (update.message.caption or "").strip() or f"[Image: {img['path']}]"
-        await _run_turn(update, context, caption, images=[img])
+        start_turn(update, context, caption, images=[img])
 
     async def on_voice(update: Update, context) -> None:
         if not update.message or not update.message.voice:
@@ -473,7 +839,7 @@ async def start_telegram() -> None:
             return
         if not update.effective_user:
             return
-        await _run_turn(update, context, text)
+        start_turn(update, context, text)
 
     async def on_approval(update: Update, context) -> None:
         query = update.callback_query
@@ -487,13 +853,13 @@ async def start_telegram() -> None:
             await query.answer()
             return
         decision, scope, tool_use_id = parsed
-        sid = context.user_data.get("session_id")
-        if not sid:
-            chat_id = update.effective_chat.id if update.effective_chat else None
-            ent = await session_for_telegram_user(get_store(), update.effective_user.id, chat_id)
-            sid = str(ent.id)
-            context.user_data["session_id"] = sid
-        resolved = resolve_approval(UUID(sid), tool_use_id, decision, scope)
+        _store, operator, _chat_id = await _operator_session(update, context)
+        candidates = [operator.id]
+        attached = router.attached_id(operator)
+        if attached is not None:
+            candidates.insert(0, attached)
+        target_sid = _approval_session(candidates, tool_use_id)
+        resolved = target_sid is not None and resolve_approval(target_sid, tool_use_id, decision, scope)
         if resolved:
             label = {
                 ("allow", "once"): "Allowed",
@@ -511,6 +877,12 @@ async def start_telegram() -> None:
 
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("version", on_version))
+    app.add_handler(CommandHandler("status", on_status))
+    app.add_handler(CommandHandler("sessions", on_sessions))
+    app.add_handler(CommandHandler("attach", on_attach))
+    app.add_handler(CommandHandler("detach", on_detach))
+    app.add_handler(CommandHandler("stop", on_stop))
+    app.add_handler(CommandHandler(["op", "operator"], on_operator))
     app.add_handler(
         CallbackQueryHandler(on_approval, pattern=rf"^{APPROVAL_CALLBACK_PREFIX}:")
     )
