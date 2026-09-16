@@ -101,6 +101,19 @@ Then **Install from VSIX** or **Run Extension** from the `vscode/` folder. Set `
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWLIST` (comma-separated user ids). Sessions use `LocalWorkspace` (bubblewrap). Leftover `workspace_kind=docker` rows are rewritten to `local` on the next turn. Voice notes go through `/v1/stt` when `faster-whisper` is installed (`pip install -e ".[stt]"`).
 
+Each Telegram user gets one **operator** session (`workspace:default`) and can point it at any other session through the **session router** (`orbweaver.channels.router`). While attached, messages run `agent_turn` on that session — the same event stream, workspace, model, todos, and session rules the web UI or VS Code is using — so work started at the desk continues from the phone, including answering a pending `AskUser` question. User events typed this way carry `via: "telegram"`. Turn events from any channel fan out through the router: Telegram-driven turns stream to open WebSocket clients, and a turn started in the web UI on an attached session sends its approval keyboard and final reply to the chat. Turns run as background tasks so commands keep working while the agent is busy.
+
+| Command | Effect |
+| --- | --- |
+| `/sessions` | List sessions (id prefix, title, age, running turn, waiting for an answer) |
+| `/attach <id\|prefix\|title>` | Route this chat to that session; replies with a digest |
+| `/detach` | Back to the operator's own session |
+| `/status` | Attached target, running turn, pending question |
+| `/stop` | Cancel the running turn on the current session |
+| `/op <text>` | Talk to the operator while attached |
+
+The operator's own turns get four extra allowlisted tools — `ListSessions`, `SessionDigest`, `AttachSession`, `DetachSession` — so "what was I doing on the airbed controller?" is answered by reading the other session's log and, on request, attaching to it. Attach pointers persist on the operator session (`attached_session`) and are rebound after a restart.
+
 ### Cron
 
 The host polls due jobs every 30s. A finished turn notifies the originating Telegram chat (success and abort) and appends a `cron_result` session event for web chat. Recurrence is `minute`, `hour`, or `day` (also `every hour`), or a 5-field cron expression (`minute hour day-of-month month day-of-week`, e.g. `0 9 * * mon`). Day-of-week `0` is Monday; names like `mon` work. Omit recurrence for a one-shot — those are deleted after they run.

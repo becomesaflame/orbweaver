@@ -262,11 +262,15 @@ async def test_telegram_run_turn_marks_interactive(monkeypatch):
 
     monkeypatch.setattr(tg, "agent_turn", fake_turn)
 
-    async def fake_workspace(_update, _context):
+    async def fake_workspace(_update, _context, **_kw):
+        from orbweaver.channels.telegram import session_for_telegram_user
+
         store = reset_store_for_tests()
-        return store, uuid4(), object(), "local"
+        op = await session_for_telegram_user(store, 42, chat_id=42)
+        return tg.Bound(store=store, operator=op, target=op, ws=object(), kind="local", chat_id=42)
 
     monkeypatch.setattr(tg, "_session_workspace", fake_workspace)
+    monkeypatch.setattr(tg.router, "operator_tools", AsyncMock(return_value=[]))
     update = MagicMock()
     update.message.reply_text = AsyncMock()
     await tg._run_turn(update, MagicMock(), "hello")

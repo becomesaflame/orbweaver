@@ -14,6 +14,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from orbweaver import __version__
+from orbweaver.channels.router import OPERATOR_TOOLS
 from orbweaver.checkpoints import checkpoint_user_turn, pin_user_turn
 from orbweaver.compact import (
     CONTEXT_FULL_MESSAGE,
@@ -1522,6 +1523,10 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         from orbweaver.channels.telegram import generate_and_maybe_send
 
         return await generate_and_maybe_send(ctx, inp)
+    if name in OPERATOR_TOOLS:
+        from orbweaver.channels.router import run_operator_tool
+
+        return await run_operator_tool(name, inp, ctx)
     if name.startswith("mcp_"):
         from orbweaver.mcp import call_mcp_tool
 
@@ -1878,12 +1883,15 @@ async def agent_turn(
     images: list[dict[str, str]] | None = None,
     channel: str | None = None,
     model: str | None = None,
+    via: str | None = None,
 ) -> list[Event]:
     """Run one agent turn.
 
     ``model`` overrides the session's stored model and the channel default
     (``ORBWEAVER_WEB_MODEL`` / ``_VSCODE_MODEL`` / ``_TELEGRAM_MODEL``); see
-    ``model_routing.resolve_turn_model``.
+    ``model_routing.resolve_turn_model``. ``via`` names the channel the user
+    typed on when it is not the session's home channel (a Telegram message
+    driving a web session); it is recorded on the user event for the UIs.
     """
     _raise_if_cancelled(cancel)
     wait_ok = interactive if interactive is not None else not headless
@@ -1907,6 +1915,8 @@ async def agent_turn(
             payload["ask_answer"] = True
         if images:
             payload["images"] = images
+        if via:
+            payload["via"] = normalize_channel(via)
         checkpoint: dict[str, Any] | None = None
         if subagent_depth == 0:
             checkpoint = await asyncio.to_thread(checkpoint_user_turn, workspace)

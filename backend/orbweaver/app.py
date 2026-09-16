@@ -46,6 +46,7 @@ from orbweaver.auth import (
     require_user,
     websocket_subprotocol_token,
 )
+from orbweaver.channels import router
 from orbweaver.checkpoints import (
     CheckpointError,
     CheckpointHeadMismatch,
@@ -362,9 +363,27 @@ def _stored_channel(jsonld: dict[str, Any]) -> str:
     return normalize_channel(str(jsonld.get("channel") or ""))
 
 
-def _broadcast(session_id: UUID, msg: dict[str, Any]) -> None:
+def _ws_sink(session_id: UUID, msg: dict[str, Any]) -> None:
+    """Router global sink: every live frame reaches this session's WebSocket clients.
+
+    A ``turn_done`` from another channel (Telegram driving this session) is
+    recorded so a later ``subscribe`` replay reports the right status.
+    """
+    if msg.get("kind") == "turn_done" and msg.get("channel"):
+        _last_turn_done[session_id] = {
+            "status": msg.get("status"),
+            "user_seq": msg.get("user_seq"),
+        }
     for sub in list(_ws_subscribers.get(session_id) or ()):
         sub.send(msg)
+
+
+router.add_global_sink(_ws_sink)
+
+
+def _broadcast(session_id: UUID, msg: dict[str, Any]) -> None:
+    """Fan out to WebSocket clients and any channel sink bound to the session."""
+    router.emit(session_id, msg)
 
 
 async def _ws_writer(session_id: UUID, sub: _WsSubscriber) -> None:
@@ -891,11 +910,14 @@ async def inject_into_turn(
     state: RunningTurn,
     text: str,
     images: list[dict[str, str]] | None = None,
+    via: str | None = None,
 ) -> Any:
     """Append a follow-up user event to a running turn and wake its LLM call."""
     payload: dict[str, Any] = {"text": text, "injected": True}
     if images:
         payload["images"] = images
+    if via:
+        payload["via"] = normalize_channel(via)
     ev = await store.append_event(session_id, "user", payload)
     state.inject.set()
     _broadcast(session_id, _event_dict(ev))
