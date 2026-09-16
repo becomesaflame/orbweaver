@@ -35,6 +35,8 @@ READ_ONLY_TOOLS = frozenset(
         "WebFetch",
         "ReadLints",
         "TodoWrite",
+        "ListSessions",
+        "SessionDigest",
     }
 )
 CONCURRENCY_SAFE_TOOLS = READ_ONLY_TOOLS

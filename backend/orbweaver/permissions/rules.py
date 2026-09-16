@@ -29,6 +29,12 @@ SAFE_ALLOWLIST = frozenset(
         "ReadLints",
         "Skill",
         "SubagentWait",
+        # Operator (session router) tools: read session metadata or move the
+        # channel's attach pointer; no workspace or network access.
+        "ListSessions",
+        "SessionDigest",
+        "AttachSession",
+        "DetachSession",
     }
 )
 
