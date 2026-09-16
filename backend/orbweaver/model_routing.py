@@ -30,6 +30,17 @@ KNOWN_CLAUDE_MODELS: tuple[str, ...] = (
     "claude-haiku-4-5",
 )
 
+CLAUDE_MODEL_LABELS: dict[str, str] = {
+    "claude-fable-5-1": "Claude Fable",
+    "claude-opus-5": "Claude Opus 5",
+    "claude-sonnet-5": "Claude Sonnet 5",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "claude-haiku-4-5": "Claude Haiku 4.5",
+}
+
+# Telegram ``/model default`` (and friends) clear the session override.
+CLEAR_MODEL_ALIASES = frozenset({"default", "clear", "reset", "none", "-"})
+
 WEB_CHANNEL = "web"
 VSCODE_CHANNEL = "vscode"
 TELEGRAM_CHANNEL = "telegram"
@@ -90,6 +101,82 @@ def is_supported_model(model: str | None) -> bool:
     return bool(ollama) and m == ollama
 
 
+def model_label(model: str) -> str:
+    """Short picker name; falls back to the id."""
+    mid = (model or "").strip()
+    if mid in CLAUDE_MODEL_LABELS:
+        return CLAUDE_MODEL_LABELS[mid]
+    spec = OPEN_MODELS.get(mid)
+    if spec is not None:
+        return spec.label
+    return mid
+
+
+def format_model_id(model: str) -> str:
+    """``Claude Opus 5 (claude-opus-5)`` when the label differs from the id."""
+    mid = (model or "").strip()
+    if not mid:
+        return ""
+    lab = model_label(mid)
+    return f"{lab} ({mid})" if lab != mid else mid
+
+
+def resolve_model_pick(
+    query: str, ids: list[str] | None = None
+) -> tuple[str | None, list[str]]:
+    """Match a user-typed model id, prefix, or label.
+
+    Returns ``(chosen, matches)``. ``chosen`` is ``""`` for clear-aliases,
+    an id when the match is unique, or ``None`` when nothing unique matched.
+    ``matches`` is the candidate list (empty means unknown).
+    """
+    q = (query or "").strip()
+    if not q:
+        return None, []
+    if q.lower() in CLEAR_MODEL_ALIASES:
+        return "", []
+    catalog = list(ids) if ids is not None else [row["id"] for row in supported_models()]
+    lowered = {mid.lower(): mid for mid in catalog}
+    if q.lower() in lowered:
+        return lowered[q.lower()], [lowered[q.lower()]]
+    label_exact = [mid for mid in catalog if model_label(mid).lower() == q.lower()]
+    if len(label_exact) == 1:
+        return label_exact[0], label_exact
+    needle = q.lower()
+
+    def _starts(mid: str) -> bool:
+        return mid.lower().startswith(needle) or model_label(mid).lower().startswith(needle)
+
+    def _contains(mid: str) -> bool:
+        return needle in mid.lower() or needle in model_label(mid).lower()
+
+    starts = [mid for mid in catalog if _starts(mid)]
+    if len(starts) == 1:
+        return starts[0], starts
+    if len(starts) > 1:
+        return None, starts
+    contains = [mid for mid in catalog if _contains(mid)]
+    if len(contains) == 1:
+        return contains[0], contains
+    return None, contains
+
+
+async def store_session_model(store: Any, sess: Any, model: str | None) -> None:
+    """Persist a per-session model override (empty string removes it)."""
+    if model is None:
+        return
+    jsonld = sess.jsonld
+    if model:
+        if jsonld.get("model") == model:
+            return
+        jsonld["model"] = model
+    elif "model" in jsonld:
+        del jsonld["model"]
+    else:
+        return
+    await store.put_entity(sess)
+
+
 def resolve_turn_model(
     *,
     override: str | None = None,
@@ -129,6 +216,7 @@ def supported_models() -> list[dict[str, Any]]:
         out.append(
             {
                 "id": mid,
+                "label": model_label(mid),
                 "provider": provider,
                 "available": provider != "none",
                 "context_window": context_window_for(mid, settings.context_window),

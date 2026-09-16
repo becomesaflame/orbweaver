@@ -600,6 +600,22 @@ def start_turn(update, context, text: str, images: list[dict[str, str]] | None =
 # ---------------------------------------------------------------- command text
 
 
+def _session_model_line(sess: Entity, *, channel: str = CHANNEL) -> str:
+    from orbweaver.model_routing import (
+        channel_default_model,
+        format_model_id,
+        resolve_turn_model,
+    )
+
+    stored = str(sess.jsonld.get("model") or "").strip()
+    effective = resolve_turn_model(session=sess.jsonld, channel=channel)
+    shown = format_model_id(effective)
+    if stored:
+        return f"model: {shown}"
+    default = format_model_id(channel_default_model(channel)) or shown
+    return f"model: default ({default})"
+
+
 async def status_text(bound: Bound) -> str:
     store = bound.store
     lines = [f"Orbweaver {__version__}"]
@@ -610,6 +626,7 @@ async def status_text(bound: Bound) -> str:
     else:
         lines.append(f"own session {str(bound.operator.id)[:8]} (workspace:default); not attached")
         events = await store.list_events(bound.operator.id)
+    lines.append(_session_model_line(bound.target))
     state = get_running_turn(bound.session_id)
     if state is not None:
         lines.append(f"a turn is running now (via {state.channel or 'unknown'})")
@@ -658,6 +675,72 @@ async def detach_text(bound: Bound) -> str:
     if previous is None:
         return "Not attached; you are on your own session."
     return f"Detached from {str(previous)[:8]}. Back on your own session."
+
+
+def _catalog_listing(catalog: list[dict], current: str) -> str:
+    from orbweaver.model_routing import model_label
+
+    lines: list[str] = []
+    for row in catalog:
+        mid = str(row.get("id") or "")
+        if not mid:
+            continue
+        mark = ">" if mid == current else " "
+        lab = str(row.get("label") or model_label(mid))
+        suffix = " (no key)" if row.get("available") is False else ""
+        if lab and lab != mid:
+            lines.append(f"{mark} {mid} — {lab}{suffix}")
+        else:
+            lines.append(f"{mark} {mid}{suffix}")
+    return "\n".join(lines)
+
+
+async def model_text(bound: Bound, args: str) -> str:
+    """``/model`` lists; ``/model <id>`` sets this chat; ``/model default`` clears."""
+    from orbweaver.model_routing import (
+        channel_default_model,
+        format_model_id,
+        resolve_model_pick,
+        store_session_model,
+        supported_models,
+    )
+
+    sess = bound.target
+    channel = CHANNEL
+    catalog = supported_models()
+    ids = [str(row["id"]) for row in catalog if row.get("id")]
+    stored = str(sess.jsonld.get("model") or "").strip()
+    default = channel_default_model(channel)
+    query = args.strip()
+    if not query:
+        header = [
+            _session_model_line(sess),
+            f"channel default: {format_model_id(default)}",
+            "",
+            "Available:",
+            _catalog_listing(catalog, stored or default),
+            "",
+            "/model <id> to switch · /model default to use the channel default",
+        ]
+        if bound.attached:
+            events = await bound.store.list_events(sess.id)
+            header.insert(0, f"this chat: {_title_of(sess, events)}")
+        return "\n".join(header)[:3500]
+
+    chosen, matches = resolve_model_pick(query, ids)
+    if chosen == "":
+        await store_session_model(bound.store, sess, "")
+        return f"This chat now uses the default: {format_model_id(default)}."
+    if chosen is None:
+        if not matches:
+            return f"Unknown model '{query}'. /model lists the supported ids."
+        listed = "\n".join(matches)
+        return f"Several models match '{query}'; pick one by id:\n{listed}"
+    row = next((r for r in catalog if r.get("id") == chosen), None)
+    if row is not None and row.get("available") is False:
+        return f"{format_model_id(chosen)} has no API key configured. /model lists what's available."
+    await store_session_model(bound.store, sess, chosen)
+    return f"This chat now uses {format_model_id(chosen)}."
 
 
 def _approval_session(candidates: list[UUID], tool_use_id: str) -> UUID | None:
@@ -749,6 +832,13 @@ async def start_telegram() -> None:
         assert update.message
         bound = await _session_workspace(update, context, operator_only=True)
         await update.message.reply_text(await detach_text(bound))
+
+    async def on_model(update: Update, context) -> None:
+        if not await _guard(update):
+            return
+        assert update.message
+        bound = await _session_workspace(update, context)
+        await update.message.reply_text(await model_text(bound, _args_text(context)))
 
     async def on_stop(update: Update, context) -> None:
         if not await _guard(update):
@@ -881,6 +971,7 @@ async def start_telegram() -> None:
     app.add_handler(CommandHandler("sessions", on_sessions))
     app.add_handler(CommandHandler("attach", on_attach))
     app.add_handler(CommandHandler("detach", on_detach))
+    app.add_handler(CommandHandler(["model", "models"], on_model))
     app.add_handler(CommandHandler("stop", on_stop))
     app.add_handler(CommandHandler(["op", "operator"], on_operator))
     app.add_handler(

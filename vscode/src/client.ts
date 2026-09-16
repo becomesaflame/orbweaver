@@ -37,6 +37,7 @@ export interface GatewayConfig {
 
 export interface ModelRow {
   id: string;
+  label?: string;
   provider?: string;
   available?: boolean;
   context_window?: number;

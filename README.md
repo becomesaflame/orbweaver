@@ -54,10 +54,10 @@ Each client channel has its own default; unset ones fall back to `ORBWEAVER_MODE
 | --- | --- |
 | `ORBWEAVER_WEB_MODEL` | web chat |
 | `ORBWEAVER_VSCODE_MODEL` | VS Code extension |
-| `ORBWEAVER_TELEGRAM_MODEL` | Telegram (no picker; env only) |
+| `ORBWEAVER_TELEGRAM_MODEL` | Telegram |
 | `ORBWEAVER_MODEL` | fallback for the above, cron, subagents |
 
-The web composer and the VS Code chat view have a model `<select>` fed by `GET /v1/models` (supported ids, whether a key is configured for each, and the channel defaults). Picking one stores it on the session (`model` on the session JSON-LD; also accepted on `POST /v1/sessions`, `PATCH /v1/sessions/{id}`, `POST …/turns` and the WebSocket `text` frame), so every later turn of that chat, from any client, uses it. "default" clears the override. A turn resolves its model as: turn `model` → session `model` → channel env → `ORBWEAVER_MODEL`; the context window and compaction budget follow the resolved model. `orbweaver.model` in VS Code settings seeds new chats when no picker choice was made. `/health` reports the web default.
+The web composer and the VS Code chat view have a model `<select>` fed by `GET /v1/models` (supported ids, a short label, whether a key is configured for each, and the channel defaults). Picking one stores it on the session (`model` on the session JSON-LD; also accepted on `POST /v1/sessions`, `PATCH /v1/sessions/{id}`, `POST …/turns` and the WebSocket `text` frame), so every later turn of that chat, from any client, uses it. "Default" clears the override. Telegram does the same with `/model` (list) and `/model <id>` (switch; prefixes and labels match when unique; `/model default` clears). A turn resolves its model as: turn `model` → session `model` → channel env → `ORBWEAVER_MODEL`; the context window and compaction budget follow the resolved model. `orbweaver.model` in VS Code settings seeds new chats when no picker choice was made. `/health` reports the web default.
 
 For a VPS, bind `ORBWEAVER_HOST=127.0.0.1` and publish the UI on your Tailscale interface (`tailscale serve http://127.0.0.1:8080`) instead of `0.0.0.0`.
 
@@ -108,7 +108,9 @@ Each Telegram user gets one **operator** session (`workspace:default`) and can p
 | `/sessions` | List sessions (id prefix, title, age, running turn, waiting for an answer) |
 | `/attach <id\|prefix\|title>` | Route this chat to that session; replies with a digest |
 | `/detach` | Back to the operator's own session |
-| `/status` | Attached target, running turn, pending question |
+| `/model` | List models for this chat (the attached session, or the operator's own) |
+| `/model <id>` | Switch this chat's model (prefix or label if unique); `/model default` clears |
+| `/status` | Attached target, current model, running turn, pending question |
 | `/stop` | Cancel the running turn on the current session |
 | `/op <text>` | Talk to the operator while attached |
 
