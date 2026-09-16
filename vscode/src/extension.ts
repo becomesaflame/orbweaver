@@ -168,11 +168,15 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private postModels(): void {
     const defaults: Record<string, string> = this.catalog?.defaults || {};
+    const fallback = defaults.vscode || defaults.fallback || "";
+    const rows = this.catalog?.models || [];
+    const defRow = rows.find((r) => r.id === fallback);
     this.post({
       type: "models",
-      models: this.catalog?.models || [],
+      models: rows,
       current: this.model,
-      default: defaults.vscode || defaults.fallback || "",
+      default: fallback,
+      defaultLabel: defRow?.label || fallback,
     });
   }
 
@@ -454,7 +458,7 @@ function paintModels(m) {
   modelSel.replaceChildren();
   const def = document.createElement("option");
   def.value = "";
-  def.textContent = m.default ? "default (" + m.default + ")" : "default model";
+  def.textContent = m.default ? "Default (" + (m.defaultLabel || m.default) + ")" : "Default model";
   modelSel.appendChild(def);
   const seen = new Set();
   for (const row of m.models || []) {
@@ -462,7 +466,9 @@ function paintModels(m) {
     seen.add(row.id);
     const o = document.createElement("option");
     o.value = row.id;
-    o.textContent = row.available === false ? row.id + " (no key)" : row.id;
+    const label = row.label || row.id;
+    o.textContent = row.available === false ? label + " (no key)" : label;
+    o.title = row.id;
     o.disabled = row.available === false;
     modelSel.appendChild(o);
   }

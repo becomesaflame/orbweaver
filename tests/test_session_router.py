@@ -487,6 +487,66 @@ async def test_command_texts(tmp_path):
     assert (await tg.detach_text(bound)).startswith("Not attached")
 
 
+def _picker_keys(monkeypatch):
+    monkeypatch.setattr(settings, "orbweaver_model", "claude-haiku-4-5")
+    monkeypatch.setattr(settings, "orbweaver_web_model", "claude-sonnet-4-6")
+    monkeypatch.setattr(settings, "orbweaver_telegram_model", "qwen3.6-35b")
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test")
+    monkeypatch.setattr(settings, "openrouter_api_key", "pk-prov-test")
+    monkeypatch.setattr(settings, "earthruntime_api_key", "")
+    monkeypatch.setattr(settings, "ollama_base_url", "")
+    monkeypatch.setattr(settings, "ollama_model", "")
+
+
+@pytest.mark.asyncio
+async def test_model_command_lists_sets_attached_and_clears(tmp_path, monkeypatch):
+    _picker_keys(monkeypatch)
+    store = reset_store_for_tests()
+    web = _session(uuid4(), title="Ship it", channel="web")
+    await store.put_entity(web)
+    update, context = _update(), _context()
+    bound = await tg._session_workspace(update, context)
+
+    listed = await tg.model_text(bound, "")
+    assert "Available:" in listed and "qwen3.6-35b" in listed
+    assert "/model <id>" in listed
+    status = await tg.status_text(bound)
+    assert "model: default" in status and "qwen3.6-35b" in status
+
+    set_msg = await tg.model_text(bound, "opus")
+    assert "claude-opus-5" in set_msg
+    op = await store.get_entity(bound.operator.id)
+    assert op.jsonld["model"] == "claude-opus-5"
+    assert "claude-opus-5" in await tg.status_text(bound)
+    assert "Unknown model" in await tg.model_text(bound, "gpt-4o")
+    assert "Several models match" in await tg.model_text(bound, "sonnet")
+
+    cleared = await tg.model_text(bound, "default")
+    assert "default" in cleared.lower()
+    op = await store.get_entity(bound.operator.id)
+    assert not op.jsonld.get("model")
+
+    await tg.attach_text(bound, "ship")
+    bound = await tg._session_workspace(update, context)
+    await tg.model_text(bound, "gpt-oss-120b")
+    assert (await store.get_entity(web.id)).jsonld["model"] == "gpt-oss-120b"
+    assert not (await store.get_entity(bound.operator.id)).jsonld.get("model")
+    listed = await tg.model_text(bound, "")
+    assert "this chat: Ship it" in listed
+    assert "> gpt-oss-120b" in listed
+
+
+@pytest.mark.asyncio
+async def test_model_command_is_used_on_the_next_telegram_turn(tmp_path, monkeypatch):
+    _picker_keys(monkeypatch)
+    llm = _install_llm(monkeypatch, _ScriptedAnthropic([_text("ok")]))
+    update, context = _update(), _context()
+    bound = await tg._session_workspace(update, context)
+    await tg.model_text(bound, "claude-opus-5")
+    await tg._run_turn(update, context, "hello")
+    assert llm.calls and llm.calls[0]["model"] == "claude-opus-5"
+
+
 @pytest.mark.asyncio
 async def test_start_turn_runs_in_background_and_stop_cancels(tmp_path, monkeypatch):
     _install_llm(monkeypatch, _ScriptedAnthropic([_text("slow answer")], delay=5.0))

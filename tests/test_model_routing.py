@@ -15,8 +15,11 @@ from orbweaver.config import settings
 from orbweaver.model_routing import (
     channel_default_model,
     current_model,
+    format_model_id,
     is_supported_model,
     model_defaults,
+    model_label,
+    resolve_model_pick,
     resolve_turn_model,
     supported_models,
 )
@@ -130,7 +133,11 @@ def test_supported_models_and_routing(channel_models):
     assert rows[WEB]["provider"] == "anthropic" and rows[WEB]["available"]
     assert rows[TELEGRAM]["provider"] == "openrouter" and rows[TELEGRAM]["available"]
     assert rows["gpt-oss-120b"]["context_window"] == 131_072
+    assert rows["gpt-oss-120b"]["label"] == "GPT-OSS 120B"
+    assert rows["claude-opus-5"]["label"] == "Claude Opus 5"
     assert rows[WEB]["context_window"] == settings.context_window
+    assert format_model_id("claude-opus-5") == "Claude Opus 5 (claude-opus-5)"
+    assert model_label("qwen3.6-35b") == "Qwen 3.6 35B"
 
 
 def test_supported_models_marks_missing_key(channel_models, monkeypatch):
@@ -138,6 +145,7 @@ def test_supported_models_marks_missing_key(channel_models, monkeypatch):
     rows = {m["id"]: m for m in supported_models()}
     assert rows["gpt-oss-120b"] == {
         "id": "gpt-oss-120b",
+        "label": "GPT-OSS 120B",
         "provider": "none",
         "available": False,
         "context_window": 131_072,
@@ -148,6 +156,29 @@ def test_ollama_model_is_supported_when_configured(monkeypatch):
     monkeypatch.setattr(settings, "ollama_model", "llama3.2")
     assert is_supported_model("llama3.2")
     assert "llama3.2" in {m["id"] for m in supported_models()}
+
+
+def test_resolve_model_pick_prefix_label_and_clear():
+    ids = [
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-opus-5",
+        "qwen3.6-35b",
+        "qwen3.8-27b",
+        "gpt-oss-120b",
+    ]
+    assert resolve_model_pick("default", ids) == ("", [])
+    assert resolve_model_pick("clear", ids) == ("", [])
+    assert resolve_model_pick("claude-opus-5", ids) == ("claude-opus-5", ["claude-opus-5"])
+    assert resolve_model_pick("opus", ids)[0] == "claude-opus-5"
+    assert resolve_model_pick("Claude Opus 5", ids)[0] == "claude-opus-5"
+    chosen, matches = resolve_model_pick("sonnet", ids)
+    assert chosen is None and set(matches) == {"claude-sonnet-5", "claude-sonnet-4-6"}
+    chosen, matches = resolve_model_pick("qwen", ids)
+    assert chosen is None and set(matches) == {"qwen3.6-35b", "qwen3.8-27b"}
+    assert resolve_model_pick("120b", ids)[0] == "gpt-oss-120b"
+    assert resolve_model_pick("nope", ids) == (None, [])
+    assert resolve_model_pick("", ids) == (None, [])
 
 
 # --- agent_turn -------------------------------------------------------------
@@ -231,6 +262,7 @@ async def test_models_endpoint_and_health_defaults(channel_models, auth_header):
         }
         ids = [m["id"] for m in body["models"]]
         assert {WEB, VSCODE, TELEGRAM, FALLBACK, "gpt-oss-120b"} <= set(ids)
+        assert any(m["id"] == "claude-opus-5" and m["label"] == "Claude Opus 5" for m in body["models"])
         health = await client.get("/health")
         assert health.json()["llm"]["model"] == WEB
         assert health.json()["llm"]["provider"] == "anthropic"

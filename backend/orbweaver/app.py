@@ -56,7 +56,12 @@ from orbweaver.checkpoints import (
 )
 from orbweaver.config import settings
 from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
-from orbweaver.model_routing import is_supported_model, model_defaults, supported_models
+from orbweaver.model_routing import (
+    is_supported_model,
+    model_defaults,
+    store_session_model,
+    supported_models,
+)
 from orbweaver.ratelimit import FileRateLimiter, get_rate_limiter
 from orbweaver.store import (
     SESSION_TYPE,
@@ -517,21 +522,6 @@ def _validated_model(raw: str | None) -> str | None:
     return model
 
 
-async def _store_session_model(store, sess, model: str | None) -> None:
-    """Persist a per-session model override (empty string removes it)."""
-    if model is None:
-        return
-    if model:
-        if sess.jsonld.get("model") == model:
-            return
-        sess.jsonld["model"] = model
-    elif "model" in sess.jsonld:
-        del sess.jsonld["model"]
-    else:
-        return
-    await store.put_entity(sess)
-
-
 @app.post("/v1/auth/token", include_in_schema=settings.orbweaver_allow_http_mint)
 async def token(body: LoginBody) -> dict[str, str]:
     if not settings.orbweaver_allow_http_mint:
@@ -766,7 +756,7 @@ async def patch_session(session_id: UUID, body: SessionPatch, _u: dict = Depends
         title = body.title.strip()[:80] or "New chat"
         sess.jsonld["title"] = title
         await store.put_entity(sess)
-    await _store_session_model(store, sess, model)
+    await store_session_model(store, sess, model)
     return {
         "id": str(sess.id),
         "title": _display_title(sess.jsonld),
@@ -886,7 +876,7 @@ async def turn(session_id: UUID, body: TurnBody, _u: dict = Depends(_user)) -> d
     if not sess:
         raise HTTPException(404, "session not found")
     model = _validated_model(body.model)
-    await _store_session_model(store, sess, model)
+    await store_session_model(store, sess, model)
     return await _run_turn(store, sess, session_id, body.text, model=model)
 
 
@@ -1200,7 +1190,7 @@ async def session_ws(websocket: WebSocket, session_id: UUID, token: str | None =
             except HTTPException as e:
                 error(e.status_code, e.detail)
                 continue
-            await _store_session_model(store, sess, model)
+            await store_session_model(store, sess, model)
             # Run the turn as its own task so this loop keeps reading frames:
             # cancel / ping / inject / subscribe work while the agent is busy,
             # and the turn survives this socket closing.

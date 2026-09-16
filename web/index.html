@@ -97,7 +97,7 @@
     .msg.tool { border-left:3px solid #888; color:#bbb; font-size:0.85rem; }
     .placeholder { color:var(--muted); padding:3rem 1rem; text-align:center; }
     #composer textarea {
-      flex:1; min-height:3.2rem; resize:vertical; background:#1f1f1f; color:var(--ink);
+      width:100%; min-height:3.2rem; resize:vertical; background:#1f1f1f; color:var(--ink);
       border:1px solid var(--line); border-radius:8px; padding:0.55rem 0.65rem; font:inherit;
     }
     #dock { border-top:1px solid var(--line); }
@@ -110,15 +110,16 @@
     }
     .q-lab { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; font-size:0.85rem; color:#ddd; }
     .q-item button { color:var(--muted); padding:0.1rem 0.4rem; }
-    #composer { display:flex; gap:0.5rem; padding:0.75rem 1rem 0.35rem; border-top:0; }
-    .composer-btns { display:flex; flex-direction:column; gap:0.35rem; justify-content:flex-end; }
+    #composer { display:flex; flex-direction:column; gap:0.45rem; padding:0.75rem 1rem 0.35rem; border-top:0; }
+    .composer-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:0.4rem; }
+    .composer-btns { display:flex; flex-wrap:wrap; gap:0.35rem; margin-left:auto; }
     #model {
-      width:100%; max-width:6.6rem; min-width:6.6rem; background:#1f1f1f; color:var(--muted); font:inherit;
-      font-size:0.75rem; border:1px solid var(--line); border-radius:8px; padding:0.3rem 0.35rem; cursor:pointer;
+      flex:1 1 11rem; max-width:16rem; min-width:10rem; background:#1f1f1f; color:var(--ink); font:inherit;
+      font-size:0.8rem; border:1px solid var(--line); border-radius:8px; padding:0.4rem 0.5rem; cursor:pointer;
     }
-    #model:hover { color:var(--ink); }
+    #model:hover { border-color:#555; }
     #model option:disabled { color:#666; }
-    #send { width:auto; background:var(--accent); color:#111; font-weight:650; padding:0.55rem 0.9rem; min-width:6.6rem; }
+    #send { width:auto; background:var(--accent); color:#111; font-weight:650; padding:0.45rem 0.9rem; min-width:5.2rem; }
     #send:hover { background:var(--accent); filter:brightness(1.05); }
     #send.stop { background:#6a4040; color:#f2f2f2; }
     #send.stop:hover { filter:none; background:#7a4a4a; }
@@ -408,14 +409,16 @@
       <div id="followups" class="hidden"></div>
       <div id="composer">
         <textarea id="text" placeholder="Message (Shift+Enter for newline)"></textarea>
-        <div class="composer-btns">
+        <div class="composer-toolbar">
           <select id="model" title="Model for this chat (default follows ORBWEAVER_WEB_MODEL)" aria-label="Model">
             <option value="">default model</option>
           </select>
-          <button type="button" id="queue-btn" class="ghost hidden" title="Run after this turn finishes">Queue</button>
-          <button type="button" id="inject" class="ghost hidden" title="Fold into the live turn (Ctrl+Enter)">Add to turn</button>
-          <button type="button" id="continue" class="ghost hidden" title="Resume the stopped turn">Continue</button>
-          <button type="button" id="send">Send</button>
+          <div class="composer-btns">
+            <button type="button" id="queue-btn" class="ghost hidden" title="Run after this turn finishes">Queue</button>
+            <button type="button" id="inject" class="ghost hidden" title="Fold into the live turn (Ctrl+Enter)">Add to turn</button>
+            <button type="button" id="continue" class="ghost hidden" title="Resume the stopped turn">Continue</button>
+            <button type="button" id="send">Send</button>
+          </div>
         </div>
       </div>
       <div id="composer-hint"></div>
@@ -447,6 +450,14 @@
       return String(modelDefaults.web || modelDefaults.fallback || "");
     }
     function pickedModel() { return $("model").value.trim(); }
+    function modelLabelFor(id) {
+      const row = modelCatalog.find((m) => m && m.id === id);
+      return (row && row.label) ? row.label : id;
+    }
+    function optionLabel(m) {
+      const label = (m && m.label) ? m.label : (m && m.id ? m.id : "");
+      return m && m.available === false ? label + " (no key)" : label;
+    }
     function effectiveModel() { return pickedModel() || defaultWebModel(); }
     function paintModelHeader() {
       const m = effectiveModel();
@@ -459,7 +470,8 @@
       sel.replaceChildren();
       const def = document.createElement("option");
       def.value = "";
-      def.textContent = defaultWebModel() ? "default (" + defaultWebModel() + ")" : "default model";
+      const fallback = defaultWebModel();
+      def.textContent = fallback ? "Default (" + modelLabelFor(fallback) + ")" : "Default model";
       sel.appendChild(def);
       const ids = new Set();
       for (const m of modelCatalog) {
@@ -467,7 +479,8 @@
         ids.add(m.id);
         const o = document.createElement("option");
         o.value = m.id;
-        o.textContent = m.available === false ? m.id + " (no key)" : m.id;
+        o.textContent = optionLabel(m);
+        o.title = m.id;
         o.disabled = m.available === false;
         sel.appendChild(o);
       }

@@ -12,7 +12,7 @@ test("web chat shell loads health version and composer", async ({ page }) => {
   const model = page.locator("#model");
   await expect(model).toBeVisible();
   await expect(model).toHaveValue("");
-  await expect(model.locator("option").first()).toHaveText(/^default/);
+  await expect(model.locator("option").first()).toHaveText(/^Default/i);
   await expect(page.locator("#app-model")).toHaveText(/^· \S+$/);
   await expect(page.locator("#settings")).toBeVisible();
   await expect(page.locator("#token")).toBeVisible();
