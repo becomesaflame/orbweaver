@@ -197,3 +197,42 @@ async def test_run_turn_replies_when_agent_raises(tmp_path, monkeypatch):
     assert replies
     assert "Turn failed" in replies[0]
     assert "tool_use" in replies[0]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_replies_before_cancelled_error_propagates(tmp_path, monkeypatch):
+    """Deploy SIGTERM cancels the task; the chat must still get a reply (#141 fallout)."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from orbweaver.channels.telegram import _run_turn
+
+    replies: list[str] = []
+
+    class _Msg:
+        async def reply_text(self, text):
+            replies.append(text)
+
+    async def cancelled(*_a, **_k):
+        raise asyncio.CancelledError()
+
+    async def fake_ws(*_a, **_k):
+        from orbweaver.channels.telegram import Bound
+
+        store = reset_store_for_tests()
+        op = await session_for_telegram_user(store, 42, chat_id=42)
+        return Bound(
+            store=store,
+            operator=op,
+            target=op,
+            ws=LocalWorkspace("workspace:default", str(tmp_path)),
+            kind="local",
+            chat_id=42,
+        )
+
+    monkeypatch.setattr("orbweaver.channels.telegram.agent_turn", cancelled)
+    monkeypatch.setattr("orbweaver.channels.telegram._session_workspace", fake_ws)
+    with pytest.raises(asyncio.CancelledError):
+        await _run_turn(SimpleNamespace(message=_Msg()), None, "still going")
+    assert replies
+    assert "interrupted" in replies[0].lower()

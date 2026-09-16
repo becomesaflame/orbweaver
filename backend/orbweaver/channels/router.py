@@ -427,7 +427,7 @@ OPERATOR_TOOL_SPEC: list[dict[str, Any]] = [
             "workspace, last activity, whether a turn is running, and whether one is waiting "
             "for the user's answer. Use this to find what the user was working on elsewhere."
         ),
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "SessionDigest",
@@ -458,7 +458,7 @@ OPERATOR_TOOL_SPEC: list[dict[str, Any]] = [
     {
         "name": "DetachSession",
         "description": "Return this chat to its own session (undo AttachSession).",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
 ]
 OPERATOR_TOOLS = frozenset(t["name"] for t in OPERATOR_TOOL_SPEC)
