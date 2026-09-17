@@ -152,17 +152,22 @@
     #stage { flex:1; min-width:0; display:flex; flex-direction:column; }
     header.chat-bar { padding:0.45rem 0.55rem 0.35rem; }
     header.chat-bar .lcd {
-      display:flex; gap:1rem; align-items:baseline; justify-content:space-between;
-      background:var(--lcd); padding:0.55rem 0.75rem;
+      display:flex; flex-direction:column; gap:0.4rem;
+      background:var(--lcd); padding:0.45rem 0.75rem 0.5rem;
       box-shadow: inset 2px 2px 5px #000, inset -1px -1px 0 #1a2a1c;
       min-height:2.6rem;
     }
+    .lcd-top {
+      display:flex; gap:1rem; align-items:center; justify-content:space-between;
+      min-width:0;
+    }
+    .lcd-copy { flex:1; min-width:0; display:flex; flex-direction:column; gap:0.12rem; }
     header.chat-bar h2 {
       font: 0.95rem/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       margin:0 -0.15rem; font-weight:650; color:var(--lcd-ink);
       text-shadow:0 0 8px rgba(120,255,160,0.3);
       overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-      flex:1; min-width:0;
+      min-width:0;
       /* Click the title to rename; #chat-title-edit swaps in place. */
       cursor:text; border-radius:2px; padding:0 0.15rem;
     }
@@ -171,15 +176,46 @@
     }
     header.chat-bar h2.hidden, #chat-title-edit.hidden { display:none; }
     #chat-title-edit {
-      flex:1; min-width:0; padding:0.1rem 0.25rem;
+      width:100%; min-width:0; padding:0.1rem 0.25rem;
       font: 0.95rem/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-weight:650;
     }
+    .lcd-where {
+      color:var(--lcd-dim);
+      font: 0.72rem/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+      padding:0 0.15rem;
+    }
+    .lcd-where:empty { display:none; }
     #status {
       color:var(--amber); font: 0.75rem/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:none; max-width:40%;
     }
     #status:empty { display:none; }
+    .ctx-meter {
+      display:flex; align-items:center; gap:0.55rem;
+      padding:0.05rem 0.15rem 0.1rem;
+    }
+    .ctx-meter.hidden { display:none; }
+    .ctx-lab {
+      color:var(--amber); font: 0.68rem/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing:0.12em; flex:none;
+    }
+    .ctx-track {
+      flex:1; height:0.55rem; background:#041204;
+      box-shadow: inset 1px 1px 3px #000, inset -1px -1px 0 #1a2a1c;
+      overflow:hidden;
+    }
+    .ctx-fill {
+      height:100%; width:0%;
+      background: repeating-linear-gradient(90deg, #78ffa0 0 5px, #041204 5px 7px);
+      box-shadow: 0 0 6px rgba(120,255,160,0.35);
+    }
+    .ctx-nums {
+      color:var(--lcd-ink);
+      font: 0.68rem/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      flex:none; min-width:7.5rem; text-align:right;
+    }
     #log {
       flex:1; overflow-y:auto; margin:0 0.45rem; padding:0.7rem 0.85rem;
       background:var(--lcd);
@@ -499,9 +535,19 @@
   <div id="stage">
     <header class="chat-bar">
       <div class="lcd">
-        <h2 id="chat-title" tabindex="0" role="button" title="Click to rename this chat">New chat</h2>
-        <input id="chat-title-edit" class="hidden" aria-label="Chat title" maxlength="80" autocomplete="off">
-        <span id="status"></span>
+        <div class="lcd-top">
+          <div class="lcd-copy">
+            <h2 id="chat-title" tabindex="0" role="button" title="Click to rename this chat">New chat</h2>
+            <input id="chat-title-edit" class="hidden" aria-label="Chat title" maxlength="80" autocomplete="off">
+            <div id="chat-where" class="lcd-where"></div>
+          </div>
+          <span id="status"></span>
+        </div>
+        <div id="ctx-meter" class="ctx-meter hidden" aria-label="Context window">
+          <span class="ctx-lab">CTX</span>
+          <div class="ctx-track" aria-hidden="true"><div id="ctx-fill" class="ctx-fill"></div></div>
+          <span id="ctx-nums" class="ctx-nums"></span>
+        </div>
       </div>
     </header>
     <div id="log"></div>
@@ -1463,7 +1509,7 @@
       }
       const p = ev.payload || {};
       const kind = ev.kind;
-      if (kind === "assistant_delta" || kind === "tool_use_progress") return;
+      if (kind === "assistant_delta" || kind === "tool_use_progress" || kind === "context") return;
       if (kind === "subscribed" || kind === "pong" || kind === "idle" || kind === "cancelling") return;
       if (p.child_session_id && kind !== "subagent_started" && kind !== "subagent_finished") {
         if (renderNested(p.child_session_id, () => renderEventInner(ev, p))) return;
@@ -1778,6 +1824,7 @@
       $("wkind").value = session.workspace_kind || $("wkind").value;
       persistWorkspace();
       setChatTitle(session.title);
+      paintWhereFromSession(session);
       history.replaceState(null, "", "#/s/" + session.id);
       paintSessions();
       paintModelPicker();
@@ -1969,6 +2016,35 @@
     function setChatTitle(text) {
       $("chat-title").textContent = text || "New chat";
     }
+    function paintContext(ctx) {
+      const where = $("chat-where");
+      const meter = $("ctx-meter");
+      if (!ctx || typeof ctx !== "object") {
+        where.textContent = "";
+        meter.classList.add("hidden");
+        return;
+      }
+      const parts = [];
+      if (ctx.workspace) parts.push(String(ctx.workspace));
+      if (ctx.branch) parts.push("branch " + ctx.branch);
+      if (parts.length) where.textContent = parts.join(" \u00b7 ");
+      const window = Number(ctx.window);
+      const tokens = Number(ctx.tokens);
+      if (!Number.isFinite(window) || window <= 0) {
+        meter.classList.add("hidden");
+        return;
+      }
+      const used = Number.isFinite(tokens) ? Math.max(0, tokens) : 0;
+      const pct = Math.max(0, Math.min(100, (used / window) * 100));
+      $("ctx-fill").style.width = pct + "%";
+      $("ctx-nums").textContent = used.toLocaleString("en-US") + " / " + window.toLocaleString("en-US");
+      meter.title = Math.round(pct) + "% of context window";
+      meter.classList.remove("hidden");
+    }
+    function paintWhereFromSession(session) {
+      if (!session) { paintContext(null); return; }
+      paintContext({ workspace: wsLabel(session.workspace_uri), branch: session.branch || "" });
+    }
     function startTitleEdit() {
       if (titleEditing) return;
       const sid = currentSid();
@@ -2073,6 +2149,7 @@
       const gen = ++historyGen;
       if (!sid) {
         $("status").textContent = "";
+        paintContext(null);
         resetLog();
         $("log").innerHTML = '<div class="placeholder">Start a new chat or pick one from the left.</div>';
         _resetAutoscroll();
@@ -2089,6 +2166,7 @@
         // still replace the transcript — otherwise the rail/title update and
         // the messages stay on the previous session.
         if (flightFor(sid) && logSid === sid) {
+          if (r.context) paintContext(r.context);
           syncComposer();
           return;
         }
@@ -2124,6 +2202,8 @@
           }
         }
         $("status").textContent = flight ? "working…" : "";
+        if (r.context) paintContext(r.context);
+        else paintWhereFromSession(currentSession());
         syncComposer();
         const cur = currentSession();
         if (cur) setChatTitle(cur.title);
@@ -2140,6 +2220,7 @@
       $("sid").value = next;
       persistSid();
       setChatTitle("Chat");
+      paintContext(null);
       loadHistory();
     });
 
@@ -2414,6 +2495,10 @@
         const onFrame = (msg) => {
           if (msg.kind === "subscribed" || msg.kind === "pong" || msg.kind === "cancelling" ||
               msg.kind === "idle" || msg.kind === "injected" || msg.kind === "approval") {
+            return;
+          }
+          if (msg.kind === "context") {
+            if (here()) paintContext(msg);
             return;
           }
           if (msg.kind === "turn_status") {
