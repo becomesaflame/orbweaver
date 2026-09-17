@@ -55,6 +55,7 @@ from orbweaver.checkpoints import (
     turn_edits_files,
 )
 from orbweaver.config import settings
+from orbweaver.drain import drain_state, is_local_admin
 from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
 from orbweaver.model_routing import (
     is_supported_model,
@@ -73,7 +74,7 @@ from orbweaver.store import (
     session_at_id,
 )
 from orbweaver.subagent import is_subagent_session
-from orbweaver.turns import RunningTurn
+from orbweaver.turns import GatewayDraining, RunningTurn, begin_drain
 from orbweaver.turns import acquire as acquire_turn
 from orbweaver.turns import get as get_running_turn
 from orbweaver.turns import is_running as turn_is_running
@@ -123,6 +124,7 @@ async def _lifespan(_app: FastAPI):
 
         asyncio.create_task(start_telegram())
     yield
+    begin_drain()
     from orbweaver.sandbox.shell import close_all_session_shells
 
     await asyncio.to_thread(close_all_session_shells)
@@ -205,7 +207,7 @@ def _rate_limit_key(request: Request) -> str:
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
-    if request.url.path in {"/health", "/"}:
+    if request.url.path in {"/health", "/"} or request.url.path.startswith("/v1/admin/"):
         return await call_next(request)
     key = _rate_limit_key(request)
     limiter = get_rate_limiter()
@@ -502,6 +504,25 @@ async def health() -> dict[str, Any]:
     }
 
 
+def _require_local_admin(request: Request) -> None:
+    if not is_local_admin(request):
+        raise HTTPException(403, "loopback only")
+
+
+@app.post("/v1/admin/drain")
+async def start_drain(request: Request) -> dict[str, Any]:
+    """Stop accepting new turns so a deploy can wait, then restart."""
+    _require_local_admin(request)
+    begin_drain()
+    return drain_state()
+
+
+@app.get("/v1/admin/drain")
+async def drain_status(request: Request) -> dict[str, Any]:
+    _require_local_admin(request)
+    return drain_state()
+
+
 @app.get("/v1/models")
 async def list_models(_u: dict = Depends(_user)) -> dict[str, Any]:
     """Models a client may pick per session or per turn, plus channel defaults."""
@@ -789,7 +810,10 @@ async def _run_turn(
     resume: bool = False,
     model: str | None = None,
 ) -> dict[str, Any]:
-    state = acquire_turn(session_id, channel=_stored_channel(sess.jsonld) or "web")
+    try:
+        state = acquire_turn(session_id, channel=_stored_channel(sess.jsonld) or "web")
+    except GatewayDraining as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     if state is None:
         raise HTTPException(409, "turn already running")
     _last_turn_done.pop(session_id, None)

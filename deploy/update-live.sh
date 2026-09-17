@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fast-forward the production checkout to origin/main and restart the gateway.
 # Intended for a self-hosted runner on the live host, after a green merge to main.
+# In-flight turns are drained before restart so Telegram/web work is not killed.
 set -euo pipefail
 
 LIVE="${ORBWEAVER_LIVE:-/home/orbweaver/orbweaver}"
@@ -12,6 +13,12 @@ git merge --ff-only origin/main
 
 if [[ -x backend/.venv/bin/pip ]]; then
   (cd backend && .venv/bin/pip install -e ".[dev]")
+fi
+
+if [[ -x backend/.venv/bin/python ]]; then
+  backend/.venv/bin/python -m orbweaver.cli drain \
+    --url http://127.0.0.1:8080 \
+    --timeout "${ORBWEAVER_DRAIN_TIMEOUT_S:-900}"
 fi
 
 uid="$(id -u)"

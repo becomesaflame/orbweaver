@@ -159,6 +159,9 @@ class Settings(BaseSettings):
     brave_search_api_key: str = ""
     orbweaver_host: str = "0.0.0.0"
     orbweaver_port: int = 8080
+    # How long `orbweaver drain` (and therefore deploy) waits for in-flight
+    # turns before restarting anyway. Approval-held turns count as running.
+    orbweaver_drain_timeout_s: float = 900.0
     orbweaver_allow_http_mint: bool = False
     orbweaver_trust_proxy: bool = False
     embedding_dim: int = 384

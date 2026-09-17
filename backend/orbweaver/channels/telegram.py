@@ -53,7 +53,7 @@ from orbweaver.store import (
     new_uuid,
     session_at_id,
 )
-from orbweaver.turns import RunningTurn
+from orbweaver.turns import GatewayDraining, RunningTurn
 from orbweaver.turns import acquire as acquire_turn
 from orbweaver.turns import get as get_running_turn
 from orbweaver.turns import release as release_turn
@@ -524,7 +524,12 @@ async def _run_turn(
     try:
         bound = await _session_workspace(update, context, operator_only=operator_only)
         store, session_id = bound.store, bound.session_id
-        state = acquire_turn(session_id, channel=CHANNEL)
+        try:
+            state = acquire_turn(session_id, channel=CHANNEL)
+        except GatewayDraining:
+            reply = "Orbweaver is updating; send that again in a minute."
+            status = "stopped"
+            return
         if state is None:
             # Same path as POST /turns/inject: the running turn picks the text up
             # on its next LLM call instead of a second agent_turn racing it.
