@@ -256,16 +256,32 @@ def test_bash_job_snapshot_previews_oversized_output(tmp_path: Path, monkeypatch
 
 
 def test_bash_raised_timeout_allows_over_30s(tmp_path: Path, monkeypatch):
+    """timeout=40 must reach subprocess.run (the old waiter default was 30s).
+
+    Sleeping 31s used to prove this at wall-clock cost; spy the argument instead.
+    """
+    import subprocess
+
     from orbweaver.config import settings
 
     monkeypatch.setattr(settings, "orbweaver_sandbox", False)
+    seen: list[object] = []
+    real_run = subprocess.run
+
+    def wrapped(*args, **kwargs):
+        if "timeout" in kwargs:
+            seen.append(kwargs["timeout"])
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", wrapped)
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     started = time.monotonic()
-    out = ws.bash("sleep 31; echo over-default", timeout=40)
+    out = ws.bash("echo over-default", timeout=40)
     elapsed = time.monotonic() - started
     assert "over-default" in out
     assert "timeout:" not in out
-    assert elapsed >= 31
+    assert 40 in seen
+    assert elapsed < 5
 
 
 def test_bash_background_start_and_collect(tmp_path: Path, monkeypatch):

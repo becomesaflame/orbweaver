@@ -18,26 +18,67 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: vscode/package-lock.json
-      - run: sudo apt-get update -qq && sudo apt-get install -y bubblewrap ripgrep
+      - uses: actions/cache@v4
+        id: apt-debs
+        with:
+          path: ~/.cache/apt-debs
+          key: apt-bwrap-rg-${{ runner.os }}-${{ runner.arch }}-v1
+      - name: Install bubblewrap and ripgrep
+        run: |
+          set -euo pipefail
+          cache="$HOME/.cache/apt-debs"
+          mkdir -p "$cache/partial"
+          shopt -s nullglob
+          debs=("$cache"/*.deb)
+          if [ "${#debs[@]}" -eq 0 ]; then
+            sudo apt-get update -qq
+            sudo apt-get -o Dir::Cache::archives="$cache" install -y --download-only bubblewrap ripgrep
+            sudo chown -R "$(id -u):$(id -g)" "$cache"
+            debs=("$cache"/*.deb)
+          fi
+          sudo dpkg -i "${debs[@]}"
       - run: pip install -e ".[dev]"
         working-directory: backend
       - run: python -m ruff check backend tests --config backend/pyproject.toml
-      - run: python -m mypy --config-file pyproject.toml orbweaver
+      - name: mypy and pytest
         working-directory: backend
-      - run: python -m pytest ../tests -q
-        working-directory: backend
+        run: |
+          set -uo pipefail
+          python -m mypy --config-file pyproject.toml orbweaver \
+            >"${RUNNER_TEMP}/mypy.log" 2>&1 &
+          mypy_pid=$!
+          pytest_ec=0
+          python -m pytest ../tests -q || pytest_ec=$?
+          mypy_ec=0
+          wait "$mypy_pid" || mypy_ec=$?
+          echo "::group::mypy"
+          cat "${RUNNER_TEMP}/mypy.log"
+          echo "::endgroup::"
+          if [ "$mypy_ec" -ne 0 ]; then
+            echo "mypy failed ($mypy_ec)" >&2
+          fi
+          if [ "$pytest_ec" -ne 0 ]; then
+            echo "pytest failed ($pytest_ec)" >&2
+          fi
+          if [ "$mypy_ec" -ne 0 ]; then
+            exit "$mypy_ec"
+          fi
+          exit "$pytest_ec"
       - run: npm ci
         working-directory: vscode
       - run: npx tsc -p . --noEmit
         working-directory: vscode
 
-  # Chromium-only web chat smoke. Set repository variable SKIP_PLAYWRIGHT=true
-  # if GitHub-hosted runners flake; ruff/mypy/tsc still gate the PR.
+  # Web chat smoke against the runner's preinstalled Google Chrome
+  # (channel: chrome). Set repository variable SKIP_PLAYWRIGHT=true if
+  # GitHub-hosted runners flake; ruff/mypy/tsc still gate the PR.
   playwright:
     if: vars.SKIP_PLAYWRIGHT != 'true'
     runs-on: ubuntu-latest
@@ -47,14 +88,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
       - run: pip install -e ".[dev]"
         working-directory: backend
       - run: npm install
-        working-directory: web
-      - run: npx playwright install --with-deps chromium
         working-directory: web
       - run: npx playwright test
         working-directory: web

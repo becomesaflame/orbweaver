@@ -18,7 +18,16 @@ export default defineConfig({
     screenshot: "only-on-failure",
     video: "off",
   },
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  projects: [
+    {
+      name: "chromium",
+      use: {
+        ...devices["Desktop Chrome"],
+        // GitHub-hosted Ubuntu already has Google Chrome; skip downloading Chromium.
+        ...(process.env.CI ? { channel: "chrome" } : {}),
+      },
+    },
+  ],
   webServer: {
     command: `python -m uvicorn orbweaver.app:app --host 127.0.0.1 --port ${port}`,
     url: `${baseURL}/health`,
