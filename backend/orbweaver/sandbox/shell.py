@@ -37,6 +37,7 @@ from orbweaver.sandbox.bwrap import SandboxUnavailable, terminate_process
 from orbweaver.sandbox.policy import SandboxPolicy, load_sandbox_policy
 
 if TYPE_CHECKING:
+    from orbweaver.sandbox.gh import GhProxy
     from orbweaver.sandbox.proxy import DomainProxy
 
 log = logging.getLogger(__name__)
@@ -308,7 +309,7 @@ class SessionShell:
         self.start_timeout = start_timeout
         self.proc: subprocess.Popen[str] | None = None
         self.proxy: DomainProxy | None = None
-        self.gh_proxy = None
+        self.gh_proxy: GhProxy | None = None
         self.last_used = time.monotonic()
         self.started_at: float | None = None
         self._lock = threading.Lock()

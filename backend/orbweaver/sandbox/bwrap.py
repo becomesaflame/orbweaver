@@ -501,7 +501,7 @@ def _prepare_sandbox(
     *,
     policy: SandboxPolicy | None,
     full_network: bool,
-) -> tuple[list[str], Any, int | None]:
+) -> tuple[list[str], Any, GhProxy | None, int | None]:
     """Start the domain proxy, open the seccomp fd, and build the bwrap argv.
 
     Returns (argv, proxy, gh_proxy, seccomp_fd); the caller must pass the fd to the child and close it."""
@@ -515,7 +515,7 @@ def _prepare_sandbox(
     pol = policy or load_sandbox_policy(workspace_root)
     inner = command
     proxy = None
-    gh_proxy = None
+    gh_proxy: GhProxy | None = None
     if not full_network:
         from orbweaver.sandbox.proxy import DomainProxy, wrap_command_with_proxy
 
@@ -523,22 +523,22 @@ def _prepare_sandbox(
         proxy = DomainProxy(sock, pol.network)
         proxy.start()
         inner = wrap_command_with_proxy(command, str(sock))
-    gh_sock: Path | None = Path(f"/tmp/ow-gh-{uuid4().hex[:12]}.sock")
+    gh_sock_path = Path(f"/tmp/ow-gh-{uuid4().hex[:12]}.sock")
     gh_proxy = GhProxy(
-        gh_sock,
+        gh_sock_path,
         workspace_root=workspace_root,
         extra_roots=pol.working_set_roots(workspace_root)[1:],
         environ=dict(os.environ),
     )
+    gh_sock: Path | None
     try:
-        started = gh_proxy.start()
+        gh_sock = gh_proxy.start()
     except OSError:
         log.exception("gh proxy failed to start")
         _close_sandbox_helpers(gh_proxy)
-        started = None
-    if started is None:
-        gh_proxy = None
         gh_sock = None
+    if gh_sock is None:
+        gh_proxy = None
     seccomp_fd: int | None = None
     try:
         if seccomp_enabled(exe):
