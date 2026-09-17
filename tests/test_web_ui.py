@@ -1,7 +1,7 @@
 """Web UI: vendored static assets are served, and tool_call events carry a summary."""
 
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import anthropic
 import pytest
@@ -11,6 +11,8 @@ from orbweaver.agent import _tool_call_summary, agent_turn
 from orbweaver.app import WEB_DIR, app
 from orbweaver.config import settings
 from orbweaver.store import reset_store_for_tests
+from orbweaver.turns import acquire as acquire_turn
+from orbweaver.turns import release as release_turn
 from orbweaver.workspace import LocalWorkspace
 
 VENDORED = ("marked.min.js", "purify.min.js")
@@ -61,7 +63,59 @@ async def test_index_references_vendored_scripts():
             assert "if (currentFlight()) return;" in r.text
             assert "const flights = new Map()" in r.text
             assert "if (inFlight) return;" not in r.text
+            # Rail activity: a live turn spins, a finished one stays highlighted
+            # until clicked. The gateway's `running` flag is what makes turns
+            # started elsewhere (Telegram, cron, another tab) animate here.
+            assert "function paintChatState(b, sid)" in r.text
+            assert "function paintActivity()" in r.text
+            assert "function setGatewayRunning(ids)" in r.text
+            assert 'classList.toggle("running", running)' in r.text
+            assert 'classList.toggle("done", done)' in r.text
+            assert "b.onclick = () => { markSeen(s.id); setActive(s); };" in r.text
+            assert "function markSeen(sid)" in r.text
+            assert "function trackUnseen()" in r.text
+            assert "function startActivityPoll()" in r.text
+            assert ".chat.running .chat-state .spin" in r.text
+            assert "@keyframes chat-spin" in r.text
+            assert ".chat.done {" in r.text
     assert (WEB_DIR / "vendor" / "README.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_reports_running_turns(tmp_path, monkeypatch, auth_header):
+    """The rail's spinner needs /v1/sessions to say which sessions have a live turn.
+
+    Without this the sidebar can only animate turns this browser tab started;
+    a turn from Telegram, cron, or a second tab would look idle.
+    """
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        made = await client.post(
+            "/v1/sessions",
+            json={"workspace_uri": "workspace:default", "workspace_kind": "local"},
+            headers=auth_header,
+        )
+        assert made.status_code == 200, made.text
+        sid = made.json()["id"]
+
+        idle = await client.get("/v1/sessions", headers=auth_header)
+        row = next(s for s in idle.json()["sessions"] if s["id"] == sid)
+        assert row["running"] is False
+
+        state = acquire_turn(UUID(sid), channel="telegram")
+        assert state is not None
+        try:
+            busy = await client.get("/v1/sessions", headers=auth_header)
+            row = next(s for s in busy.json()["sessions"] if s["id"] == sid)
+            assert row["running"] is True
+        finally:
+            release_turn(UUID(sid), state)
+
+        after = await client.get("/v1/sessions", headers=auth_header)
+        row = next(s for s in after.json()["sessions"] if s["id"] == sid)
+        assert row["running"] is False
 
 
 class _ToolUse:
