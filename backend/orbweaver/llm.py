@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 from typing import Any
 from uuid import uuid4
 
@@ -515,12 +517,15 @@ class OpenAICompatError(Exception):
         status_code: int = 0,
         body: dict[str, Any] | None = None,
         type: str = "",
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.body = body
         self.type = type
+        # Response headers, lowercased, so retry logic can read Retry-After.
+        self.headers = headers or {}
 
 
 class OpenAICompatClient:
@@ -563,12 +568,34 @@ class OpenAICompatClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        attempts = max(0, int(settings.orbweaver_llm_retries)) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._post_once(url, headers, payload)
+            except OpenAICompatError as e:
+                delay = retry_delay_for(e, attempt=attempt)
+                if delay is None or attempt >= attempts:
+                    raise
+                log.warning(
+                    "llm %s failed (HTTP %s); retry %d/%d in %.2fs",
+                    payload.get("model") or "?",
+                    getattr(e, "status_code", "?"),
+                    attempt,
+                    attempts - 1,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def _post_once(
+        self, url: str, headers: dict[str, str], payload: dict[str, Any]
+    ) -> dict[str, Any]:
         if self._http is not None:
             resp = await self._http.post(url, json=payload, headers=headers)
             data = _json_of(resp)
             status = int(getattr(resp, "status_code", 200) or 200)
             if status >= 400 or (isinstance(data, dict) and data.get("error")):
-                raise _openai_error(data, max(status, 400))
+                raise _openai_error(data, max(status, 400), headers=_resp_headers(resp))
             return data
         import httpx
 
@@ -579,11 +606,69 @@ class OpenAICompatClient:
             except Exception:
                 data = {"error": {"message": resp.text}}
             if resp.status_code >= 400:
-                raise _openai_error(data if isinstance(data, dict) else {}, resp.status_code)
+                raise _openai_error(
+                    data if isinstance(data, dict) else {},
+                    resp.status_code,
+                    headers=_resp_headers(resp),
+                )
             return data
 
 
-def _openai_error(data: dict[str, Any], status: int) -> OpenAICompatError:
+# Transient upstream statuses. 429 is the shared open-model pool shedding load;
+# 500/502/503/504 are gateway-level blips. 502 is deliberately *not* retried
+# here: Earth Runtime wraps context-overflow failures as 502, and compacting is
+# the right response to those, so that judgement stays with
+# compact.overflow.should_overflow_retry() rather than being burned on sleeps.
+_RETRY_STATUSES = frozenset({429, 500, 503, 504})
+
+
+def _resp_headers(resp: Any) -> dict[str, str]:
+    raw = getattr(resp, "headers", None)
+    if not raw:
+        return {}
+    try:
+        return {str(k).lower(): str(v) for k, v in dict(raw).items()}
+    except Exception:
+        return {}
+
+
+def retry_after_seconds(exc: BaseException) -> float | None:
+    """Honour a server-sent Retry-After (delta-seconds form) when present."""
+    headers = getattr(exc, "headers", None)
+    if not isinstance(headers, dict):
+        return None
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        secs = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None  # HTTP-date form: fall back to our own backoff.
+    return secs if secs >= 0 else None
+
+
+def retry_delay_for(exc: BaseException, *, attempt: int) -> float | None:
+    """Seconds to wait before retrying, or None if this error is not retryable.
+
+    ``attempt`` is 1-based. Exponential backoff with full jitter, clamped to
+    ``orbweaver_llm_retry_max_s``; a sane Retry-After wins over the backoff.
+    """
+    status = int(getattr(exc, "status_code", 0) or 0)
+    if status not in _RETRY_STATUSES:
+        return None
+    ceiling = max(0.0, float(settings.orbweaver_llm_retry_max_s))
+    after = retry_after_seconds(exc)
+    if after is not None:
+        return min(after, ceiling)
+    base = max(0.0, float(settings.orbweaver_llm_retry_base_s))
+    window = min(base * (2 ** (attempt - 1)), ceiling)
+    # Full jitter: spread concurrent turns instead of retrying in lockstep.
+    return random.uniform(0.0, window) if window > 0 else 0.0
+
+
+def _openai_error(
+    data: dict[str, Any], status: int, *, headers: dict[str, str] | None = None
+) -> OpenAICompatError:
     err = data.get("error") if isinstance(data, dict) else None
     extra = ""
     if isinstance(err, dict):
@@ -598,7 +683,11 @@ def _openai_error(data: dict[str, Any], status: int) -> OpenAICompatError:
         message = str(err or data or f"HTTP {status}")
         err_type = ""
     return OpenAICompatError(
-        message, status_code=status, body=data if isinstance(data, dict) else None, type=err_type
+        message,
+        status_code=status,
+        body=data if isinstance(data, dict) else None,
+        type=err_type,
+        headers=headers,
     )
 
 

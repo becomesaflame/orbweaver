@@ -14,6 +14,13 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://api.earthruntime.com/v1"
     earthruntime_api_key: str = ""
+    # Shared open-model pools shed load as 429 (and transient 5xx). Retry those
+    # in-process instead of surfacing a hard failure: the permission classifier
+    # fails closed onto a human approval prompt when its LLM call dies, so one
+    # rate-limited instant should not interrupt a turn. 0 disables retrying.
+    orbweaver_llm_retries: int = 3
+    orbweaver_llm_retry_base_s: float = 0.5
+    orbweaver_llm_retry_max_s: float = 8.0
     # Required in production: >= 32 bytes, not the default. `serve` refuses to
     # start otherwise unless ORBWEAVER_DEV_INSECURE=1.
     orbweaver_jwt_secret: str = "dev-secret-change-me"

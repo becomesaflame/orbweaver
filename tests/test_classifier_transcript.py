@@ -218,3 +218,56 @@ async def test_classify_stage2_ask(monkeypatch):
     assert result["verdict"] == "ask"
     assert result["should_block"] is False
     assert "need override" in result["reason"]
+
+
+# Production regression: the classifier's LLM call hit a 429 from the shared
+# open-model pool ("temporarily rate-limited upstream"). With no retry in
+# OpenAICompatClient._post the exception reached classify_action, which fails
+# closed, so a transient blip surfaced as "needs user approval" mid-turn.
+@pytest.mark.asyncio
+async def test_classifier_survives_a_transient_429(monkeypatch):
+    from orbweaver.config import settings
+    from orbweaver.llm import OpenAICompatClient
+    from orbweaver.permissions.classifier import classify_action
+
+    monkeypatch.setattr(settings, "orbweaver_llm_retries", 3)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_base_s", 0.0)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_max_s", 0.0)
+
+    calls = {"n": 0}
+
+    class _RateLimitedOnce:
+        """429 on the first POST, then a clean stage1 "allow" verdict."""
+
+        def __init__(self) -> None:
+            self.status_code = 200
+            self.headers: dict[str, str] = {}
+            self._body: dict = {}
+
+        async def post(self, url, json=None, headers=None, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                self.status_code = 429
+                self._body = {
+                    "error": {
+                        "message": (
+                            "Provider returned error (openai/gpt-oss-120b is "
+                            "temporarily rate-limited upstream)"
+                        )
+                    }
+                }
+            else:
+                self.status_code = 200
+                self._body = {"choices": [{"message": {"content": "<block>no</block>"}}]}
+            return self
+
+        def json(self):
+            return self._body
+
+    client = OpenAICompatClient("http://x/v1", "k", http=_RateLimitedOnce())
+    out = await classify_action([], "Read", {"path": "/var/log/syslog"}, client=client)
+
+    assert calls["n"] == 2, "the 429 should have been retried, not surfaced"
+    assert out["verdict"] == "allow"
+    assert out["stage"] == "fast"
+    assert "Classifier error" not in out["reason"]
