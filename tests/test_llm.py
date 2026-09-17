@@ -490,3 +490,225 @@ async def test_agent_turn_uses_openrouter_fake_client(tmp_path, monkeypatch):
     produced = await agent_turn(store, sid, "hi", ws)
     texts = [e.payload.get("text") for e in produced if e.kind == "assistant"]
     assert texts == ["open model ok"]
+
+
+# --- Transient upstream failures (429 / 5xx) retry in-process. -------------
+#
+# Production regression: a shared open-model pool answered 429 ("temporarily
+# rate-limited upstream") for a couple of seconds. _post had no retry, so the
+# permission classifier's LLM call died and the gate failed closed onto a
+# "needs user approval" prompt mid-turn.
+
+
+class _ScriptedHTTP:
+    """Replays a scripted list of (status, payload, headers) per POST."""
+
+    def __init__(self, script: list[tuple[int, dict, dict | None]]) -> None:
+        self.script = list(script)
+        self.calls = 0
+        self.status_code = 200
+        self.headers: dict[str, str] = {}
+        self._payload: dict = {}
+
+    async def post(self, url: str, json: dict, headers: dict | None = None, **_k):
+        status, payload, hdrs = self.script[min(self.calls, len(self.script) - 1)]
+        self.calls += 1
+        self.status_code = status
+        self._payload = payload
+        self.headers = hdrs or {}
+        return self
+
+    def json(self) -> dict:
+        return self._payload
+
+
+_OK = {"choices": [{"message": {"content": "recovered"}}]}
+_RATE_LIMITED = {
+    "error": {
+        "message": (
+            "Provider returned error (openai/gpt-oss-120b is temporarily "
+            "rate-limited upstream. Please retry shortly)"
+        )
+    }
+}
+
+
+@pytest.fixture
+def _fast_retries(monkeypatch):
+    """Keep backoff out of the test clock."""
+    monkeypatch.setattr(settings, "orbweaver_llm_retries", 3)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_base_s", 0.0)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_max_s", 0.0)
+
+
+@pytest.mark.asyncio
+async def test_post_retries_429_then_succeeds(_fast_retries):
+    http = _ScriptedHTTP([(429, _RATE_LIMITED, None), (200, _OK, None)])
+    client = OpenAICompatClient("http://x/v1", "k", http=http)
+    resp = await client.create(messages=[{"role": "user", "content": "hi"}])
+    assert http.calls == 2, "the 429 should not have surfaced"
+    assert resp.content[0].text == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_post_retries_transient_5xx(_fast_retries):
+    http = _ScriptedHTTP([(503, {"error": {"message": "upstream busy"}}, None), (200, _OK, None)])
+    client = OpenAICompatClient("http://x/v1", "k", http=http)
+    resp = await client.create(messages=[{"role": "user", "content": "hi"}])
+    assert http.calls == 2
+    assert resp.content[0].text == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_post_gives_up_after_the_configured_retries(_fast_retries):
+    http = _ScriptedHTTP([(429, _RATE_LIMITED, None)])
+    client = OpenAICompatClient("http://x/v1", "k", http=http)
+    with pytest.raises(OpenAICompatError) as ei:
+        await client.create(messages=[{"role": "user", "content": "hi"}])
+    assert ei.value.status_code == 429
+    # 3 retries on top of the first attempt, then the error is raised.
+    assert http.calls == 4
+    assert "rate-limited upstream" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_post_does_not_retry_client_errors(_fast_retries):
+    """401/400 are not transient; retrying them just delays the failure."""
+    for status in (400, 401, 403, 404):
+        http = _ScriptedHTTP([(status, {"error": {"message": "nope"}}, None)])
+        client = OpenAICompatClient("http://x/v1", "k", http=http)
+        with pytest.raises(OpenAICompatError):
+            await client.create(messages=[{"role": "user", "content": "hi"}])
+        assert http.calls == 1, f"HTTP {status} must not be retried"
+
+
+@pytest.mark.asyncio
+async def test_post_does_not_retry_502_so_overflow_can_compact(_fast_retries):
+    """Earth Runtime wraps context overflow as 502; compacting is the fix, not sleeping."""
+    http = _ScriptedHTTP([(502, {"error": {"message": "Provider returned error"}}, None)])
+    client = OpenAICompatClient("http://x/v1", "k", http=http)
+    with pytest.raises(OpenAICompatError) as ei:
+        await client.create(messages=[{"role": "user", "content": "hi"}])
+    assert http.calls == 1
+    # Still recognised as a possible overflow by the compaction path.
+    from orbweaver.compact import should_overflow_retry
+
+    assert should_overflow_retry(ei.value, near_limit=True)
+
+
+@pytest.mark.asyncio
+async def test_retries_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(settings, "orbweaver_llm_retries", 0)
+    http = _ScriptedHTTP([(429, _RATE_LIMITED, None), (200, _OK, None)])
+    client = OpenAICompatClient("http://x/v1", "k", http=http)
+    with pytest.raises(OpenAICompatError):
+        await client.create(messages=[{"role": "user", "content": "hi"}])
+    assert http.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_after_header_is_honoured(monkeypatch):
+    """A server-sent Retry-After wins over our backoff, clamped to the ceiling."""
+    monkeypatch.setattr(settings, "orbweaver_llm_retries", 2)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_base_s", 30.0)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_max_s", 5.0)
+    slept: list[float] = []
+
+    async def _fake_sleep(s: float) -> None:
+        slept.append(s)
+
+    monkeypatch.setattr("orbweaver.llm.asyncio.sleep", _fake_sleep)
+    http = _ScriptedHTTP([(429, _RATE_LIMITED, {"retry-after": "2"}), (200, _OK, None)])
+    client = OpenAICompatClient("http://x/v1", "k", http=http)
+    await client.create(messages=[{"role": "user", "content": "hi"}])
+    assert slept == [2.0], "Retry-After should be used verbatim under the ceiling"
+
+
+@pytest.mark.asyncio
+async def test_retry_after_is_clamped_to_the_ceiling(monkeypatch):
+    monkeypatch.setattr(settings, "orbweaver_llm_retries", 1)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_max_s", 3.0)
+    slept: list[float] = []
+
+    async def _fake_sleep(s: float) -> None:
+        slept.append(s)
+
+    monkeypatch.setattr("orbweaver.llm.asyncio.sleep", _fake_sleep)
+    # A provider asking for 10 minutes must not park the turn for 10 minutes.
+    http = _ScriptedHTTP([(429, _RATE_LIMITED, {"retry-after": "600"}), (200, _OK, None)])
+    client = OpenAICompatClient("http://x/v1", "k", http=http)
+    await client.create(messages=[{"role": "user", "content": "hi"}])
+    assert slept == [3.0]
+
+
+@pytest.mark.asyncio
+async def test_http_date_retry_after_falls_back_to_backoff(monkeypatch):
+    """Retry-After may be an HTTP-date; we do not parse those, so use backoff."""
+    monkeypatch.setattr(settings, "orbweaver_llm_retries", 1)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_base_s", 0.25)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_max_s", 8.0)
+    slept: list[float] = []
+
+    async def _fake_sleep(s: float) -> None:
+        slept.append(s)
+
+    monkeypatch.setattr("orbweaver.llm.asyncio.sleep", _fake_sleep)
+    http = _ScriptedHTTP(
+        [(429, _RATE_LIMITED, {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"}), (200, _OK, None)]
+    )
+    client = OpenAICompatClient("http://x/v1", "k", http=http)
+    await client.create(messages=[{"role": "user", "content": "hi"}])
+    assert len(slept) == 1
+    assert 0.0 <= slept[0] <= 0.25, "full-jitter backoff within the first window"
+
+
+def test_retry_delay_policy():
+    from orbweaver.llm import retry_delay_for
+
+    assert retry_delay_for(OpenAICompatError("x", status_code=401), attempt=1) is None
+    assert retry_delay_for(OpenAICompatError("x", status_code=502), attempt=1) is None
+    assert retry_delay_for(OpenAICompatError("x", status_code=429), attempt=1) is not None
+    # Backoff grows with the attempt number but never exceeds the ceiling.
+    err = OpenAICompatError("x", status_code=429)
+    for attempt in range(1, 8):
+        delay = retry_delay_for(err, attempt=attempt)
+        assert delay is not None
+        assert 0.0 <= delay <= settings.orbweaver_llm_retry_max_s
+
+
+@pytest.mark.asyncio
+async def test_retry_works_on_the_real_httpx_path(monkeypatch):
+    """The production path builds its own httpx.AsyncClient, not an injected stub.
+
+    The tests above inject ``http=``, which exercises a different branch of
+    _post_once. Drive the real branch through a MockTransport so a regression
+    that only breaks the httpx side cannot pass unnoticed.
+    """
+    import httpx
+
+    monkeypatch.setattr(settings, "orbweaver_llm_retries", 3)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_base_s", 0.0)
+    monkeypatch.setattr(settings, "orbweaver_llm_retry_max_s", 0.0)
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(429, json={"error": {"message": "rate-limited upstream"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok via httpx"}}]})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    class _Patched(real_client):  # type: ignore[misc,valid-type]
+        def __init__(self, *a, **k):
+            k["transport"] = transport
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Patched)
+    client = OpenAICompatClient("http://x/v1", "k")
+    resp = await client.create(messages=[{"role": "user", "content": "hi"}])
+    assert calls["n"] == 3
+    assert resp.content[0].text == "ok via httpx"
+

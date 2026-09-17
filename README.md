@@ -46,6 +46,20 @@ The agent loop speaks Anthropic Messages internally. For open-weight models it m
 
 Get a key from [earthruntime.com](https://earthruntime.com). The same catalog names work on `ORBWEAVER_CLASSIFIER_MODEL`, `ORBWEAVER_INJECTION_PROBE_MODEL`, and `ORBWEAVER_COMPACT_MODEL`: Claude ids stay on Anthropic, catalog names use Earth Runtime.
 
+Shared open-model pools shed load as HTTP 429 (`temporarily rate-limited
+upstream`). Those and transient 5xx are retried in-process with exponential
+backoff and full jitter, honouring `Retry-After` when the provider sends one:
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `ORBWEAVER_LLM_RETRIES` | `3` | Retries after the first attempt; `0` disables |
+| `ORBWEAVER_LLM_RETRY_BASE_S` | `0.5` | First backoff window, doubling per attempt |
+| `ORBWEAVER_LLM_RETRY_MAX_S` | `8.0` | Ceiling for any single wait |
+
+HTTP 502 is deliberately *not* retried: Earth Runtime wraps context-overflow
+failures as 502, and compacting the transcript is the right response, so that
+call stays with the overflow path.
+
 ### Per-channel models and the picker
 
 Each client channel has its own default; unset ones fall back to `ORBWEAVER_MODEL`, which cron jobs and subagents always use:
