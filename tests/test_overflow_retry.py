@@ -12,8 +12,10 @@ from orbweaver.compact import (
     extract_context_window_tokens,
     is_context_overflow,
     overflow_compact_budget,
+    should_overflow_retry,
 )
 from orbweaver.config import settings
+from orbweaver.llm import OpenAICompatError
 from orbweaver.store import Event, reset_store_for_tests
 from orbweaver.workspace import LocalWorkspace
 
@@ -171,5 +173,70 @@ async def test_prompt_too_long_gives_up_after_two_failures(tmp_path, monkeypatch
     assert CONTEXT_FULL_MESSAGE in texts[-1]
     assert "210000 tokens" not in texts[-1]
     assert "prompt_too_long" not in texts[-1]
+    assert len(client.calls) == 2
+    assert any(e.kind == "compact_boundary" for e in await store.list_events(sid))
+
+
+def _provider_returned_error() -> OpenAICompatError:
+    return OpenAICompatError(
+        "Provider returned error",
+        status_code=502,
+        body={
+            "error": {
+                "message": "Provider returned error",
+                "code": 502,
+                "metadata": {"raw": "error code: 502", "provider_name": "unknown"},
+            }
+        },
+        type="502",
+    )
+
+
+def test_provider_returned_error_is_not_overflow_on_a_small_prompt():
+    err = _provider_returned_error()
+    assert not is_context_overflow(err)
+    assert not should_overflow_retry(err, near_limit=False)
+    assert should_overflow_retry(err, near_limit=True)
+
+
+@pytest.mark.asyncio
+async def test_provider_returned_error_near_window_compacts_then_succeeds(
+    tmp_path, monkeypatch
+):
+    """Telegram gpt-oss: Earth Runtime 502 'Provider returned error' on a packed prompt.
+
+    Same command path as the live turn: OpenAICompatError, then compact+retry.
+    """
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+    monkeypatch.setattr(settings, "openrouter_api_key", "pk-test")
+    monkeypatch.setattr(settings, "orbweaver_compact_model", "claude-haiku-4-5")
+    ok = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok after compact")],
+        usage=None,
+    )
+    client = _OverflowClient([_provider_returned_error(), ok])
+    monkeypatch.setattr("orbweaver.llm.make_agent_client", lambda **_k: client)
+
+    huge = [
+        {
+            "name": "Read",
+            "description": "y" * 400_000,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    ]
+
+    async def fake_tools(*_a, **_k):
+        return huge
+
+    monkeypatch.setattr("orbweaver.agent.session_tools", fake_tools)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    await _seed_tool_history(store, sid, n=12)
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    produced = await agent_turn(store, sid, "continue", ws, model="gpt-oss-120b")
+    texts = [e.payload.get("text") for e in produced if e.kind == "assistant"]
+    assert texts == ["ok after compact"]
     assert len(client.calls) == 2
     assert any(e.kind == "compact_boundary" for e in await store.list_events(sid))

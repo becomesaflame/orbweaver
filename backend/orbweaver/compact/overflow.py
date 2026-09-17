@@ -65,6 +65,27 @@ def is_context_overflow(exc: BaseException) -> bool:
     return any(needle in text for needle in _OVERFLOW_NEEDLES)
 
 
+def should_overflow_retry(exc: BaseException, *, near_limit: bool) -> bool:
+    """Whether to compact-and-retry this LLM failure.
+
+    Earth Runtime often wraps an upstream context failure as HTTP 502
+    ``Provider returned error`` with no overflow needle. Retry that only when
+    our request estimate is already near the model window; a 502 on a small
+    prompt is a real outage.
+    """
+    if is_context_overflow(exc):
+        return True
+    if not near_limit:
+        return False
+    from orbweaver.llm import OpenAICompatError
+
+    if not isinstance(exc, OpenAICompatError):
+        return False
+    status = int(getattr(exc, "status_code", 0) or 0)
+    text = _error_text(exc).lower()
+    return status in {400, 413, 502} or "provider returned error" in text
+
+
 def extract_context_window_tokens(exc: BaseException) -> int | None:
     """Best-effort window size from an overflow error (the 'maximum' side)."""
     text = _error_text(exc)

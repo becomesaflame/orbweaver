@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID
 
 from orbweaver.store import Event
@@ -153,6 +155,41 @@ def usage_input_tokens(usage: object | None) -> int:
     total += _usage_int(usage, "cache_creation_input_tokens")
     total += _usage_int(usage, "cache_read_input_tokens")
     return total
+
+
+def json_tokens(value: Any) -> int:
+    """chars/4 estimate of a JSON-serializable payload (tool schemas, messages)."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return estimate_tokens(value)
+    try:
+        return estimate_tokens(json.dumps(value, default=str))
+    except (TypeError, ValueError):
+        return estimate_tokens(str(value))
+
+
+def static_prompt_tokens(system: Any = None, tools: Any = None) -> int:
+    """Tokens on every request that are not session events (system + tool schemas)."""
+    from orbweaver.llm import _system_text
+
+    n = 0
+    if system is not None:
+        n += estimate_tokens(_system_text(system))
+    if tools:
+        n += json_tokens(tools)
+    return n
+
+
+def request_token_estimate(
+    *,
+    system: Any = None,
+    tools: Any = None,
+    messages: list[dict[str, Any]] | None = None,
+    max_tokens: int = 0,
+) -> int:
+    """Approximate prompt + reserved completion tokens for one LLM call."""
+    return static_prompt_tokens(system, tools) + json_tokens(messages) + max(0, int(max_tokens or 0))
 
 
 def event_token_count(events: list[Event]) -> int:

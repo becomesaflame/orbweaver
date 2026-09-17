@@ -553,9 +553,15 @@ class OpenAICompatClient:
 
 def _openai_error(data: dict[str, Any], status: int) -> OpenAICompatError:
     err = data.get("error") if isinstance(data, dict) else None
+    extra = ""
     if isinstance(err, dict):
         message = str(err.get("message") or data)
         err_type = str(err.get("code") or err.get("type") or "")
+        meta = err.get("metadata")
+        if isinstance(meta, dict):
+            extra = str(meta.get("raw") or meta.get("provider_name") or "").strip()
+            if extra and extra not in message:
+                message = f"{message} ({extra[:500]})"
     else:
         message = str(err or data or f"HTTP {status}")
         err_type = ""
