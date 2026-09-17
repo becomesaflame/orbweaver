@@ -13,7 +13,11 @@ from orbweaver.compact import (
     rehydrate_messages,
     reset_compact_state,
 )
-from orbweaver.compact.project import ensure_tool_use_results, unpaired_tool_use_ids
+from orbweaver.compact.project import (
+    drop_orphan_tool_results,
+    ensure_tool_use_results,
+    unpaired_tool_use_ids,
+)
 from orbweaver.compact.usage import (
     compact_failures,
     estimate_prompt_tokens,
@@ -661,6 +665,57 @@ def test_events_to_messages_stubs_interrupted_tool_before_later_result():
     assert read_stub and read_stub[0].get("is_error") is True
     assert "interrupted" in str(read_stub[0].get("content") or "").lower()
     assert unpaired_tool_use_ids(messages) == []
+
+
+def test_drop_orphan_tool_results_removes_block_with_no_matching_use():
+    """Anthropic rejects a tool_result whose tool_use is not in the previous message."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_a", "name": "Read", "input": {}}],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_a", "content": "ok"}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_gone", "content": "answer"},
+                {"type": "text", "text": "next question"},
+            ],
+        },
+    ]
+    fixed = drop_orphan_tool_results(messages)
+    assert fixed[2]["content"] == [{"type": "text", "text": "next question"}]
+    assert unpaired_tool_use_ids(fixed) == []
+    # ensure_tool_use_results runs the drop first, so it repairs both directions.
+    assert ensure_tool_use_results(messages) == fixed
+    assert drop_orphan_tool_results(fixed) == fixed
+
+
+def test_drop_orphan_tool_results_drops_a_message_left_empty():
+    messages = [
+        {"role": "user", "content": "go"},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_gone", "content": "x"}]},
+        {"role": "assistant", "content": "done"},
+    ]
+    fixed = drop_orphan_tool_results(messages)
+    assert fixed == [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+
+def test_drop_orphan_tool_results_leaves_valid_messages_byte_identical():
+    """String content must not be rewritten into blocks; the prompt prefix cache depends on it."""
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_a", "name": "Read", "input": {}}],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_a", "content": "ok"}]},
+        {"role": "assistant", "content": "all set"},
+    ]
+    assert drop_orphan_tool_results(messages) == messages
 
 
 def test_ensure_tool_use_results_fills_gap_before_user_text():

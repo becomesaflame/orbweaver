@@ -15,10 +15,53 @@ from orbweaver.agent import (
 )
 from orbweaver.app import app
 from orbweaver.channels.telegram import texts_for_reply
+from orbweaver.compact.project import (
+    INTERRUPTED_TOOL,
+    events_to_messages,
+    unpaired_tool_use_ids,
+)
 from orbweaver.config import settings
 from orbweaver.permissions.pipeline import TurnAborted
 from orbweaver.store import Event, reset_store_for_tests
 from orbweaver.workspace import LocalWorkspace
+
+
+def orphan_tool_results(messages: list[dict]) -> list[str]:
+    """tool_use_ids Anthropic would reject: a tool_result with no tool_use before it.
+
+    Mirrors ``unexpected tool_use_id found in tool_result blocks: ...``.
+    """
+    orphans: list[str] = []
+    for i, msg in enumerate(messages):
+        content = msg.get("content")
+        if msg.get("role") != "user" or not isinstance(content, list):
+            continue
+        prev = messages[i - 1] if i else None
+        uses: set[str] = set()
+        if prev and prev.get("role") == "assistant" and isinstance(prev.get("content"), list):
+            uses = {
+                str(b.get("id"))
+                for b in prev["content"]
+                if isinstance(b, dict) and b.get("type") == "tool_use"
+            }
+        orphans += [
+            str(b.get("tool_use_id"))
+            for b in content
+            if isinstance(b, dict)
+            and b.get("type") == "tool_result"
+            and str(b.get("tool_use_id")) not in uses
+        ]
+    return orphans
+
+
+def _tool_results(messages: list[dict]) -> list[dict]:
+    return [
+        b
+        for m in messages
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    ]
 
 
 class _ToolUse:
@@ -277,6 +320,98 @@ async def test_telegram_run_turn_marks_interactive(monkeypatch):
     assert seen.get("interactive") is True
     assert seen.get("headless") is True
     update.message.reply_text.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ask_user_answer_does_not_orphan_its_tool_result(tmp_path, monkeypatch):
+    """Production 400 on session b3985a44: the answer was sent twice.
+
+    The answer is stored as a ``user`` event *and* as the AskUser ``tool_result``.
+    Projecting both paired the tool_use with an "interrupted" stub and left the real
+    result with no tool_use in the message before it, which Anthropic rejects with
+    ``unexpected tool_use_id found in tool_result blocks``.
+    """
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    ask = SimpleNamespace(
+        content=[_ToolUse("AskUser", {"question": "Which branch?"}, uid="toolu_ask")]
+    )
+    client = _RecordingAnthropic([ask])
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", lambda *a, **k: client)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = _ws(tmp_path)
+
+    await agent_turn(store, sid, "need a name", ws)
+    client._responses.append(
+        SimpleNamespace(content=[SimpleNamespace(type="text", text="using feature/x")])
+    )
+    await agent_turn(store, sid, "feature/x", ws)
+
+    sent = client.calls[-1]["messages"]
+    assert orphan_tool_results(sent) == []
+    assert unpaired_tool_use_ids(sent) == []
+    # The answer still reaches the model, once, as the AskUser result.
+    answers = [b for b in _tool_results(sent) if b["tool_use_id"] == "toolu_ask"]
+    assert [b["content"] for b in answers] == ["feature/x"]
+    assert INTERRUPTED_TOOL not in str(sent)
+
+
+def test_ask_answer_events_project_without_orphan_result():
+    """Event shape recorded in production: tool_call, ask_user, user(ask_answer), tool_result."""
+    sid = uuid4()
+
+    def ev(seq: int, kind: str, payload: dict) -> Event:
+        return Event(id=uuid4(), session_id=sid, seq=seq, kind=kind, payload=payload)
+
+    events = [
+        ev(1, "user", {"text": "sort out gh auth"}),
+        ev(2, "assistant", {"text": "No stored credentials anywhere I can find."}),
+        ev(3, "tool_call", {"id": "toolu_ask", "name": "AskUser", "input": {"question": "Token?"}}),
+        ev(4, "permission_decision", {"name": "AskUser", "behavior": "allow", "tool_use_id": "toolu_ask"}),
+        ev(5, "ask_user", {"question": "Token?", "tool_use_id": "toolu_ask", "name": "AskUser"}),
+        ev(6, "user", {"text": "drop it, I'll fix gh myself", "ask_answer": True}),
+        ev(7, "tool_result", {"tool_use_id": "toolu_ask", "name": "AskUser", "content": "drop it, I'll fix gh myself"}),
+        ev(8, "user", {"text": "did the gh auth issue get resolved?"}),
+    ]
+    messages = events_to_messages(events)
+    assert orphan_tool_results(messages) == []
+    assert unpaired_tool_use_ids(messages) == []
+    answers = [b for b in _tool_results(messages) if b["tool_use_id"] == "toolu_ask"]
+    assert [b["content"] for b in answers] == ["drop it, I'll fix gh myself"]
+    assert INTERRUPTED_TOOL not in str(messages)
+    # The follow-up question after the answer is still there.
+    assert "did the gh auth issue get resolved?" in str(messages)
+
+
+def test_ask_answer_with_image_keeps_the_image_and_pairs_the_result():
+    sid = uuid4()
+
+    def ev(seq: int, kind: str, payload: dict) -> Event:
+        return Event(id=uuid4(), session_id=sid, seq=seq, kind=kind, payload=payload)
+
+    events = [
+        ev(1, "tool_call", {"id": "toolu_ask", "name": "AskUser", "input": {"question": "Which one?"}}),
+        ev(2, "ask_user", {"question": "Which one?", "tool_use_id": "toolu_ask", "name": "AskUser"}),
+        ev(
+            3,
+            "user",
+            {
+                "text": "this one",
+                "ask_answer": True,
+                "images": [{"media_type": "image/png", "path": "shot.png"}],
+            },
+        ),
+        ev(4, "tool_result", {"tool_use_id": "toolu_ask", "name": "AskUser", "content": "this one"}),
+    ]
+    messages = events_to_messages(events)
+    assert orphan_tool_results(messages) == []
+    assert unpaired_tool_use_ids(messages) == []
+    assert any(
+        isinstance(b, dict) and b.get("type") == "image"
+        for m in messages
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+    )
 
 
 def test_ask_user_abort_message_is_specific():
