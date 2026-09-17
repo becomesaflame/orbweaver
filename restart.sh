@@ -9,6 +9,13 @@ uid="$(id -u orbweaver)"
 runtime="/run/user/${uid}"
 bus="unix:path=${runtime}/bus"
 
+LIVE="${ORBWEAVER_LIVE:-/home/orbweaver/orbweaver}"
+if [[ -x "${LIVE}/backend/.venv/bin/python" ]]; then
+  "${LIVE}/backend/.venv/bin/python" -m orbweaver.cli drain \
+    --url http://127.0.0.1:8080 \
+    --timeout "${ORBWEAVER_DRAIN_TIMEOUT_S:-900}"
+fi
+
 sudo -u orbweaver env \
   XDG_RUNTIME_DIR="${runtime}" \
   DBUS_SESSION_BUS_ADDRESS="${bus}" \

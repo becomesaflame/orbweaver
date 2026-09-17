@@ -11,7 +11,7 @@ from apscheduler.triggers.cron import CronTrigger
 from orbweaver.agent import TurnCancelled, agent_turn
 from orbweaver.config import settings
 from orbweaver.store import Job, get_store
-from orbweaver.turns import TurnBusy, running_turn
+from orbweaver.turns import GatewayDraining, TurnBusy, running_turn
 from orbweaver.workspace import bind_workspace
 
 log = logging.getLogger(__name__)
@@ -173,6 +173,14 @@ async def _run_job(store, job: Job) -> None:
                         job.id,
                         session_id,
                         busy.channel or "unknown channel",
+                    )
+                    job.due_at = datetime.now(UTC) + SKIP_RETRY
+                    await store.reschedule_job(job)
+                    return
+                except GatewayDraining:
+                    log.info(
+                        "cron: job %s skipped, gateway is draining; retry in 1 min",
+                        job.id,
                     )
                     job.due_at = datetime.now(UTC) + SKIP_RETRY
                     await store.reschedule_job(job)

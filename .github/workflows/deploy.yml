@@ -6,7 +6,8 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Do not cancel a deploy that is waiting for in-flight turns to finish.
+  cancel-in-progress: false
 
 permissions:
   contents: read

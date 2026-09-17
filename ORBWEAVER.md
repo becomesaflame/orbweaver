@@ -60,8 +60,9 @@ Actions `GITHUB_TOKEN` push, so deploy does start.
 Failed PR tests mean auto-merge waits (or the PR stays open). `main` stays
 on the last green SHA.
 
-The live host pulls `origin/main`, checks out `main`, and restarts
-`orbweaver.service`. Agents do not deploy.
+The live host pulls `origin/main`, checks out `main`, waits until running
+turns finish (`orbweaver drain`), then restarts `orbweaver.service`. Agents
+do not deploy.
 
 ## Production regressions
 
