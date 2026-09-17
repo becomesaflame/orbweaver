@@ -286,12 +286,33 @@ def test_sandboxed_bash_timeout_expiry(live_root):
     assert "timed out after 1s" in out
 
 
-def test_sandboxed_bash_raised_timeout_completes(live_root):
-    """A command that would miss the old 30s default must succeed when timeout is raised."""
+def test_sandboxed_bash_raised_timeout_completes(live_root, monkeypatch):
+    """A command that would miss the old 30s default must succeed when timeout is raised.
+
+    Spy the timeout that reaches the waiter instead of sleeping 31s.
+    """
+    from orbweaver.sandbox.bwrap import run_sandboxed as real_bwrap
+    from orbweaver.sandbox.shell import SessionShell
+
+    seen: list[object] = []
+
+    def wrap_bwrap(command, workspace_root, timeout=30, **kwargs):
+        seen.append(timeout)
+        return real_bwrap(command, workspace_root, timeout, **kwargs)
+
+    real_shell_run = SessionShell.run
+
+    def wrap_shell(self, command, timeout, *, cwd=None):
+        seen.append(timeout)
+        return real_shell_run(self, command, timeout, cwd=cwd)
+
+    monkeypatch.setattr("orbweaver.sandbox.bwrap.run_sandboxed", wrap_bwrap)
+    monkeypatch.setattr(SessionShell, "run", wrap_shell)
     ws = LocalWorkspace("workspace:default", str(live_root))
-    out = ws.bash("sleep 31; echo sandbox-over-default", timeout=40)
+    out = ws.bash("echo sandbox-over-default", timeout=40)
     assert "sandbox-over-default" in out
     assert "timeout:" not in out
+    assert 40 in seen, seen
 
 
 def test_sandboxed_bash_background_start_and_collect(live_root):

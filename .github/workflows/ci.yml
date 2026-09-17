@@ -18,6 +18,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -36,8 +38,9 @@ jobs:
       - run: npx tsc -p . --noEmit
         working-directory: vscode
 
-  # Chromium-only web chat smoke. Set repository variable SKIP_PLAYWRIGHT=true
-  # if GitHub-hosted runners flake; ruff/mypy/tsc still gate the PR.
+  # Web chat smoke against the runner's preinstalled Google Chrome
+  # (channel: chrome). Set repository variable SKIP_PLAYWRIGHT=true if
+  # GitHub-hosted runners flake; ruff/mypy/tsc still gate the PR.
   playwright:
     if: vars.SKIP_PLAYWRIGHT != 'true'
     runs-on: ubuntu-latest
@@ -47,14 +50,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
       - run: pip install -e ".[dev]"
         working-directory: backend
       - run: npm install
-        working-directory: web
-      - run: npx playwright install --with-deps chromium
         working-directory: web
       - run: npx playwright test
         working-directory: web
