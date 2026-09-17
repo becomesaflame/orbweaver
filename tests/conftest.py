@@ -8,6 +8,19 @@ from orbweaver.config import settings
 from orbweaver.ratelimit import reset_rate_limiter_for_tests
 from orbweaver.turns import reset_for_tests as reset_turns_for_tests
 
+# Linux AF_UNIX paths cap at 108 bytes. xdist inserts popen-gwN/ into tmp_path,
+# which pushes workspace-root proxy sockets over the limit under the default
+# pytest-of-<user>/... layout.
+_XDIST_BASETEMP = "/tmp/ow-pt"
+
+
+def pytest_configure(config):
+    n = getattr(config.option, "numprocesses", None)
+    if not n or n in (0, "0"):
+        return
+    if not config.option.basetemp:
+        config.option.basetemp = _XDIST_BASETEMP
+
 
 @pytest.fixture
 def auth_header() -> dict[str, str]:

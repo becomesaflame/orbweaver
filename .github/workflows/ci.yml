@@ -78,7 +78,7 @@ jobs:
             >"${RUNNER_TEMP}/mypy.log" 2>&1 &
           mypy_pid=$!
           pytest_ec=0
-          python -m pytest ../tests -q || pytest_ec=$?
+          python -m pytest ../tests -q -n 2 --basetemp=/tmp/ow-pt || pytest_ec=$?
           mypy_ec=0
           wait "$mypy_pid" || mypy_ec=$?
           echo "::group::mypy"
