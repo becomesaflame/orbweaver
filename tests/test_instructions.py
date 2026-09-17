@@ -423,6 +423,19 @@ def test_description_rule_loaded_via_skill_tool(tmp_path: Path):
     assert "deploy" in missing
 
 
+def test_worktree_first_rule_forbids_move_agent_to_root():
+    """Cursor's move_agent_to_root description tells agents to switch roots after
+    creating a worktree. This repo's always-on rule must contradict that by name
+    so isolation stays `git worktree add` plus working_directory."""
+    text = (Path(__file__).resolve().parents[1] / ".cursor/rules/worktree-first.mdc").read_text(
+        encoding="utf-8"
+    )
+    assert "alwaysApply: true" in text
+    assert "move_agent_to_root" in text
+    assert "Do not call" in text and "move_agent_to_root" in text
+    assert "working_directory" in text
+
+
 # ---------------------------------------------------------------- skills
 
 

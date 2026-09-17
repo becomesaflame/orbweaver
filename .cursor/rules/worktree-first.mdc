@@ -21,7 +21,11 @@ per the feature-branch flow in `ORBWEAVER.md`; that flow — version bump, tests
 draft PR, squash auto-merge — then runs from inside the worktree.
 
 Pass the worktree as `working_directory` (or `git -C`) on every command, because
-the shell's own cwd still starts at the original checkout.
+the shell's own cwd still starts at the original checkout. Do not call
+`move_agent_to_root` or `move_agent_to_cloned_root` after `git worktree add`.
+That Cursor tool's description may say to always switch roots after creating a
+worktree; ignore that sentence here. Switching the agent workspace is what this
+rule exists to prevent.
 
 Read-only work — answering questions, reading code, inspecting logs — needs no
 worktree.
@@ -46,6 +50,8 @@ instead of deleting unmerged work.
 ## Do not
 
 - Clone the repo, or switch the agent's workspace root, to get isolation.
-  `git worktree add` in the current repo is the whole mechanism.
+  `git worktree add` in the current repo is the whole mechanism. Do not call
+  `move_agent_to_root` (or `move_agent_to_cloned_root`) for a worktree you just
+  created.
 - Touch, reset, or `git worktree remove` a worktree you did not create.
 - Reuse someone else's topic branch. One worktree, one branch, one task.
