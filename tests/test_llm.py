@@ -6,6 +6,8 @@ from orbweaver.agent import agent_turn
 from orbweaver.compact.overflow import is_context_overflow
 from orbweaver.config import settings
 from orbweaver.llm import (
+    ANTHROPIC_TIMEOUT_S,
+    SONNET_MAX_TOKENS,
     OllamaMessagesClient,
     OpenAICompatClient,
     OpenAICompatError,
@@ -13,6 +15,7 @@ from orbweaver.llm import (
     compact_llm_client,
     hosted_provider,
     make_agent_client,
+    make_anthropic_client,
     make_hosted_client,
     no_llm_echo,
     normalize_openai_tool_parameters,
@@ -83,6 +86,36 @@ def _clear_providers(monkeypatch, *, anthropic: str = "", ollama: bool = False, 
     else:
         monkeypatch.setattr(settings, "ollama_base_url", "")
         monkeypatch.setattr(settings, "ollama_model", "")
+
+
+def _timeout_read_s(timeout: object) -> float:
+    if isinstance(timeout, (int, float)):
+        return float(timeout)
+    read = getattr(timeout, "read", None)
+    if isinstance(read, (int, float)):
+        return float(read)
+    return 0.0
+
+
+def test_make_anthropic_client_timeout_exceeds_sdk_default(monkeypatch):
+    _clear_providers(monkeypatch, anthropic="sk-ant-test")
+    client = make_anthropic_client()
+    assert client is not None
+    assert _timeout_read_s(client.timeout) >= ANTHROPIC_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sdk_rejects_nonstreaming_sonnet_budget():
+    """Same ValueError Telegram wrapped as 'Turn failed: Streaming is required...'."""
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key="sk-test")
+    with pytest.raises(ValueError, match="Streaming is required"):
+        await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=SONNET_MAX_TOKENS,
+            messages=[{"role": "user", "content": "hi"}],
+        )
 
 
 def test_anthropic_wins_over_ollama(monkeypatch):

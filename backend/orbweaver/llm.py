@@ -38,6 +38,13 @@ SONNET_MAX_TOKENS = 64_000
 OPUS_MAX_TOKENS = 32_000
 DEFAULT_MAX_TOKENS = 8_192
 
+# Anthropic's client default is 10 minutes. Sonnet's 64k output budget can take
+# longer than that even when streamed; the SDK also rejects non-streaming
+# create() once estimated time exceeds 10 minutes (see streaming_required_for_max_tokens).
+ANTHROPIC_TIMEOUT_S = 3600.0
+_SDK_NONSTREAMING_LIMIT_S = 600.0
+_SDK_TOKENS_PER_HOUR = 128_000
+
 
 def max_tokens_for_model(model: str) -> int:
     """Output budget for a model id (Claw Code: Sonnet 64k, Opus 32k)."""
@@ -53,6 +60,26 @@ def completion_max_tokens(model: str | None = None) -> int:
     """Tokens to request; stay at or under output_reserve so compact math holds."""
     raw = max_tokens_for_model(model or settings.orbweaver_model)
     return max(1, min(raw, settings.output_reserve))
+
+
+def streaming_required_for_max_tokens(max_tokens: Any) -> bool:
+    """True when Anthropic's SDK would reject non-streaming ``messages.create``.
+
+    The client computes ``expected_time = 3600 * max_tokens / 128000`` and raises
+    ``ValueError: Streaming is required...`` when that exceeds 10 minutes
+    (~21334 tokens). Sonnet 64k and Opus 32k both trip it; Haiku 8k does not.
+    """
+    try:
+        n = int(max_tokens)
+    except (TypeError, ValueError):
+        return False
+    if n <= 0:
+        return False
+    return (60 * 60 * n / _SDK_TOKENS_PER_HOUR) > _SDK_NONSTREAMING_LIMIT_S
+
+
+def is_streaming_required_error(exc: BaseException) -> bool:
+    return isinstance(exc, ValueError) and "Streaming is required" in str(exc)
 
 
 def _ollama_configured() -> bool:
@@ -170,7 +197,9 @@ def make_anthropic_client() -> Any | None:
     if settings.anthropic_workspace_id.strip():
         headers["anthropic-workspace-id"] = settings.anthropic_workspace_id.strip()
     return anthropic.AsyncAnthropic(
-        api_key=settings.anthropic_api_key, default_headers=headers or None
+        api_key=settings.anthropic_api_key,
+        timeout=ANTHROPIC_TIMEOUT_S,
+        default_headers=headers or None,
     )
 
 
@@ -845,13 +874,17 @@ class StreamAssembler:
         return _Response(content, self.usage)
 
 
+def client_can_stream(client: Any) -> bool:
+    return callable(getattr(getattr(client, "messages", None), "stream", None))
+
+
 def message_stream(client: Any, **kwargs: Any) -> Any | None:
-    """Return a stream context manager, or None if the client cannot stream."""
+    """Return a stream context manager, or None if the client cannot stream.
+
+    Open failures propagate so a long request does not silently fall back to
+    non-streaming ``create()``, which Anthropic rejects above ~21k max_tokens.
+    """
     stream_fn = getattr(getattr(client, "messages", None), "stream", None)
     if not callable(stream_fn):
         return None
-    try:
-        return stream_fn(**kwargs)
-    except Exception:
-        log.warning("messages.stream() failed to open", exc_info=True)
-        return None
+    return stream_fn(**kwargs)
