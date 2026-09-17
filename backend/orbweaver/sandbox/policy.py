@@ -40,7 +40,7 @@ HARDCODED_DENY_READ = DEFAULT_DENY_READ
 # ``.env`` files that are templates, not secrets.
 _ENV_TEMPLATE_SUFFIXES: tuple[str, ...] = (".example", ".sample", ".template", ".dist")
 _ENV_SCAN_PRUNE: frozenset[str] = frozenset(
-    {".git", ".venv", "venv", "node_modules", "__pycache__", ".orbweaver-tmp", "dist", "build"}
+    {".git", ".venv", "venv", "node_modules", "__pycache__", ".orbweaver-tmp", ".worktrees", "dist", "build"}
 )
 _ENV_SCAN_MAX_DEPTH = 3
 

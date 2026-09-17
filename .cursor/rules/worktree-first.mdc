@@ -11,34 +11,32 @@ the first edit, add your own worktree of **this** repo and work from it.
 
 ```bash
 git fetch origin
-git worktree add -b <topic> ../orbweaver-worktrees/<slug> origin/main
-cd ../orbweaver-worktrees/<slug>
+git worktree add -b <topic> .worktrees/<slug> origin/main
+cd .worktrees/<slug>
 ```
 
-The path is a sibling of the repo root (`/home/spark/orbweaver-worktrees/<slug>`),
-so no agent's `Grep`/`Glob` walks another agent's tree. Branch off `origin/main`,
-per the feature-branch flow in `ORBWEAVER.md`; that flow — version bump, tests,
-draft PR, squash auto-merge — then runs from inside the worktree.
+The path is **inside** the session workspace (`.worktrees/` is gitignored).
+Sandboxed Orbweaver Bash can only write that tree; a sibling
+`../orbweaver-worktrees/` sits outside it and fails. Branch off `origin/main`,
+per `ORBWEAVER.md`. File tools are rooted at the session workspace: edit
+`.worktrees/<slug>/...`. Pass the worktree as `working_directory` (or `git -C`)
+on every command — the shell cwd still starts at the original checkout.
 
-Pass the worktree as `working_directory` (or `git -C`) on every command, because
-the shell's own cwd still starts at the original checkout. Do not call
-`move_agent_to_root` or `move_agent_to_cloned_root` after `git worktree add`.
-That Cursor tool's description may say to always switch roots after creating a
-worktree; ignore that sentence here. Switching the agent workspace is what this
-rule exists to prevent.
+Do not call `move_agent_to_root` or `move_agent_to_cloned_root` after
+`git worktree add`. That Cursor tool's description may say to always switch
+roots after creating a worktree; ignore that sentence here.
 
 Read-only work — answering questions, reading code, inspecting logs — needs no
 worktree.
 
 ## Tear it down once the PR merges
 
-A worktree is scratch space for one task, not a place to keep work. As soon as
-auto-merge lands your PR, remove the worktree and both copies of the branch
-from outside the worktree:
+As soon as auto-merge lands your PR, remove the worktree and both copies of
+the branch from the original checkout:
 
 ```bash
 cd <original checkout>
-git worktree remove ../orbweaver-worktrees/<slug>
+git worktree remove .worktrees/<slug>
 git branch -D <topic>                  # -d refuses: squash-merge leaves no merge ancestry
 git push origin --delete <topic>       # this repo does not delete branches on merge
 ```

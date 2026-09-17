@@ -38,7 +38,7 @@ SKILL_DIRS = (
     Path(".claude") / "skills",
 )
 SKILL_FILE = "SKILL.md"
-EXCLUDED_DIRS = frozenset({".orbweaver", ".orbweaver-tmp", "node_modules", ".git"})
+EXCLUDED_DIRS = frozenset({".orbweaver", ".orbweaver-tmp", ".worktrees", "node_modules", ".git"})
 MAX_FILE_BYTES = 256_000
 HEADER = "# Workspace skills and rules"
 TRUNCATION_MARK = "[truncated]"

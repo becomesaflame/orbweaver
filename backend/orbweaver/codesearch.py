@@ -34,6 +34,7 @@ DEFAULT_SKIP_DIRS = frozenset(
         ".pytest_cache",
         ".ruff_cache",
         ".tox",
+        ".worktrees",
         "dist",
         "build",
     }

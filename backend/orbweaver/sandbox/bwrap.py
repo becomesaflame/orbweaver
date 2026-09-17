@@ -272,6 +272,7 @@ _GIT_SCAN_PRUNE = {
     ".git",
     "node_modules",
     ".orbweaver-tmp",
+    ".worktrees",
     ".venv",
     "venv",
     "__pycache__",

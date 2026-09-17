@@ -72,7 +72,7 @@ WARNING = INJECTION_WARNING
 
 DEFAULT_SKIP_DIRS = (
     "node_modules,vendor,third_party,.orbweaver/tool-results,.orbweaver-tmp,"
-    ".venv,venv,site-packages,__pycache__,.git,dist,build,target"
+    ".venv,venv,site-packages,__pycache__,.git,dist,build,target,.worktrees"
 )
 DEFAULT_BASH_NETWORK = [
     r"\bcurl\b",
