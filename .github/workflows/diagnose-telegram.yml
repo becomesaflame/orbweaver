@@ -1,0 +1,26 @@
+name: diagnose-telegram
+
+# Read-only dump of recent Telegram session events from the live host.
+# Runs on the self-hosted runner (lampropeltis) so we can see what the bot
+# actually said about gh auth. Does not restart the gateway or change files.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/diagnose-telegram.yml
+      - deploy/diagnose-telegram.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    runs-on: [self-hosted, linux]
+    env:
+      XDG_RUNTIME_DIR: /run/user/1000
+      DBUS_SESSION_BUS_ADDRESS: unix:path=/run/user/1000/bus
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dump Telegram history and gh auth context
+        run: bash deploy/diagnose-telegram.sh
