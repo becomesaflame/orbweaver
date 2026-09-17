@@ -81,9 +81,10 @@ from orbweaver.readstate import ReadState, read_state_for
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.stuck import NUDGE_KIND, StuckDetector
-from orbweaver.todos import inject_session_todos, persist_todos
+from orbweaver.todos import inject_session_todos, persist_todos, todos_from_events
 from orbweaver.tools import partition_tool_calls
 from orbweaver.tooltext import format_read
+from orbweaver.unfinished import UNFINISHED_PLAN_NUDGE, should_nudge_unfinished
 
 log = logging.getLogger(__name__)
 
@@ -927,7 +928,13 @@ def static_system(channel: str = "") -> str:
         "Finish with a user-visible answer when the work is done. Compact is the "
         "context valve; a high safety ceiling is not a reason to stop while still "
         "making progress. Spawn a subagent for a long isolated exploration so the "
-        "parent transcript stays focused — the child has its own ceiling."
+        "parent transcript stays focused — the child has its own ceiling. "
+        "Do not end a turn at the seam between research and the work: a request to "
+        "implement or fix something is the request to carry it through, so keep "
+        "going instead of closing with an offer to start. Do not ask whether to "
+        "begin, whether to commit, or whether to open the PR when the project's "
+        "process already answers that. Stop early only to report a real blocker or "
+        "a decision you cannot make — and say plainly what it is."
     )
 
 
@@ -2375,6 +2382,8 @@ async def agent_turn(
                 nudge = GIT_NOT_DONE_NUDGE
             elif ctx.pop("truncated_tool_nudge_pending", False):
                 nudge = TRUNCATED_TOOL_NUDGE
+            elif ctx.pop("unfinished_plan_nudge_pending", False):
+                nudge = UNFINISHED_PLAN_NUDGE
             await settle_probes()
             try:
                 resp = await _create_with_overflow_retry(
@@ -2413,6 +2422,16 @@ async def agent_turn(
                 if truncated:
                     continue
                 if getattr(resp, "stop_reason", None) == "end_turn":
+                    if should_nudge_unfinished(
+                        text="\n".join(texts),
+                        todos=todos_from_events(events),
+                        already_nudged=bool(ctx.get("unfinished_plan_nudged")),
+                        is_last_round=round_i >= max_rounds - 1,
+                    ):
+                        ctx["unfinished_plan_nudged"] = True
+                        ctx["unfinished_plan_nudge_pending"] = True
+                        log.info("unfinished plan: deferral with open todos, nudging")
+                        continue
                     break
                 if (
                     ctx.get("git_not_done")
