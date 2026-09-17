@@ -792,3 +792,49 @@ async def test_overflow_force_compacts_under_budget_without_llm(monkeypatch):
     live = live_events(stored)
     assert live[0].kind == "compact_boundary"
     assert all(e.kind != "tool_result" or e.seq >= keep_from for e in live[1:])
+
+
+def test_static_prompt_tokens_counts_tool_schemas():
+    from orbweaver.compact.usage import static_prompt_tokens
+
+    small = static_prompt_tokens("sys", [{"name": "Read", "input_schema": {}}])
+    huge = static_prompt_tokens("sys", [{"name": "Read", "description": "y" * 40_000}])
+    assert huge > small + 5_000
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_gpt_oss_counts_live_tools_not_12k_guess(monkeypatch):
+    """gpt-oss 128k: huge tool schemas must shrink the kept tail, not a 12k static guess.
+
+    Production Telegram: compact kept ~38k event tokens, then Earth Runtime 502'd
+    because system+tools+max_tokens still sat on the 131k cliff.
+    """
+    store = reset_store_for_tests()
+    reset_compact_state()
+    monkeypatch.setattr(settings, "event_budget_override", None)
+    sid = new_uuid()
+    await _session(store, sid)
+    blob = "x" * 4000
+    for i in range(40):
+        await store.append_event(sid, "user", {"text": blob + str(i)})
+    skipped = await maybe_compact(
+        store, sid, model="gpt-oss-120b", tools=[], system="sys"
+    )
+    assert skipped is None
+    huge_tools = [
+        {
+            "name": "Read",
+            "description": "y" * 320_000,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    ]
+    ev = await maybe_compact(
+        store, sid, model="gpt-oss-120b", tools=huge_tools, system="sys"
+    )
+    assert ev is not None
+    stored = await store.list_events(sid)
+    live = live_events(stored)
+    tail = [e for e in live if e.kind != "compact_boundary"]
+    assert event_token_count(tail) < event_token_count(
+        [e for e in stored if e.kind != "compact_boundary"]
+    )

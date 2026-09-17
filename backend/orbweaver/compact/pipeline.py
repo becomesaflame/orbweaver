@@ -22,6 +22,7 @@ from orbweaver.compact.usage import (
     event_token_count,
     record_compact_failure,
     record_compact_success,
+    static_prompt_tokens,
 )
 from orbweaver.config import settings
 from orbweaver.llm import compact_llm_client, hosted_provider
@@ -34,6 +35,41 @@ log = logging.getLogger(__name__)
 SKIP_SOURCES = frozenset({"compact", "session_notes"})
 
 
+def _compact_budgets(
+    *,
+    budget: int | None,
+    model: str | None,
+    system: Any,
+    tools: Any,
+    usage_overhead: int,
+) -> tuple[int, int]:
+    """Return (trigger_budget, keep_budget) for the live event tail.
+
+    Tests still pin ``event_budget_override`` / an explicit ``budget``. Production
+    passes the real tool list so gpt-oss (128k) does not keep a Claude-sized tail.
+    """
+    if budget is not None:
+        resolved = int(budget)
+        return resolved, max(1, resolved - usage_overhead)
+    if settings.event_budget_override is not None or tools is None:
+        resolved = int(settings.event_budget * settings.compact_ratio)
+        return resolved, max(1, resolved - usage_overhead)
+    from orbweaver.llm import completion_max_tokens
+    from orbweaver.model_routing import current_model
+    from orbweaver.open_models import context_window_for
+
+    turn_model = (model or "").strip() or current_model()
+    window = context_window_for(turn_model, settings.context_window)
+    output = completion_max_tokens(turn_model)
+    static = static_prompt_tokens(system, tools)
+    if system is None:
+        static += int(settings.orbweaver_pinned_token_cap) + int(settings.orbweaver_skills_token_cap)
+    overhead = max(static, usage_overhead)
+    room = max(256, window - output - overhead)
+    resolved = max(256, int(room * settings.compact_ratio))
+    return resolved, resolved
+
+
 async def maybe_compact(
     store: Store,
     session_id: UUID,
@@ -41,6 +77,8 @@ async def maybe_compact(
     client: Any | None = None,
     workspace: Any | None = None,
     system: Any | None = None,
+    tools: Any | None = None,
+    model: str | None = None,
     source: str = "turn",
     force: bool = False,
     budget: int | None = None,
@@ -53,29 +91,33 @@ async def maybe_compact(
     estimates undercount system+tools, images, and MCP schemas, so a
     session can hit Anthropic ``prompt_too_long`` without compacting.
 
-    Threshold is ``event_budget * compact_ratio`` (~85% of the 200k
-    window after reserves). Claw Code compares cumulative input tokens
-    to 100k (``CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS``). Overflow
-    retries pass force=True and a shrinking keep_recent_rounds tail
-    (4 → 2 → 1 → 0).
+    When ``tools`` is passed (the live request), the keep-tail is the room
+    left in the model window after real system/tool schemas and this model's
+    ``max_tokens``. Claude's 64k output reserve plus a 12k static guess left
+    gpt-oss on a 131k cliff: events fit the guessed budget, the HTTP request
+    did not.
 
-    Never deletes session events. Recursion sources (compact, session_notes) no-op.
+    Overflow retries pass force=True and a shrinking keep_recent_rounds tail
+    (4 → 2 → 1 → 0). Never deletes session events. Recursion sources
+    (compact, session_notes) no-op.
     """
     del workspace  # persist/rehydrate happen at ingest / prompt build
     if source in SKIP_SOURCES:
         return None
     events = await store.list_events(session_id)
     projected = prompt_events(events)
-    resolved_budget = (
-        int(budget) if budget is not None else int(settings.event_budget * settings.compact_ratio)
-    )
     prompt_tokens = estimate_prompt_tokens(session_id, projected)
+    event_tokens = event_token_count(projected)
+    usage_overhead = max(0, prompt_tokens - event_tokens)
+    resolved_budget, keep_budget = _compact_budgets(
+        budget=budget,
+        model=model,
+        system=system,
+        tools=tools,
+        usage_overhead=usage_overhead,
+    )
     if not force and prompt_tokens <= resolved_budget:
         return None
-    # Usage includes system/tools/images the payload estimate misses. Reserve
-    # that overhead so choose_keep_from_seq actually drops events.
-    overhead = max(0, prompt_tokens - event_token_count(projected))
-    keep_budget = max(1, resolved_budget - overhead)
 
     live = live_events(events)
     live_body = [e for e in live if e.kind not in BOUNDARY_KINDS]

@@ -333,6 +333,30 @@ async def test_openrouter_error_payload_raises(monkeypatch):
     assert is_context_overflow(ei.value)
 
 
+@pytest.mark.asyncio
+async def test_openrouter_error_includes_provider_metadata(monkeypatch):
+    http = _FakeHTTP(
+        {
+            "error": {
+                "message": "Provider returned error",
+                "code": 502,
+                "metadata": {"raw": "maximum context length is 131072", "provider_name": "er"},
+            }
+        },
+        status_code=502,
+    )
+    client = OpenAICompatClient("https://api.earthruntime.com/v1", "pk-prov-test", http=http)
+    with pytest.raises(OpenAICompatError) as ei:
+        await client.messages.create(
+            model="gpt-oss-120b",
+            max_tokens=16,
+            system="sys",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    assert "Provider returned error" in ei.value.message
+    assert "131072" in ei.value.message
+    assert is_context_overflow(ei.value)
+
 
 def test_compact_client_prefers_anthropic_when_compact_is_claude(monkeypatch):
     _clear_providers(monkeypatch, anthropic="sk-ant-test", openrouter="pk-prov-test")

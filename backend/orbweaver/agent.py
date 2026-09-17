@@ -33,10 +33,12 @@ from orbweaver.compact import (
 )
 from orbweaver.compact.overflow import (
     OVERFLOW_KEEP_ROUNDS,
-    is_context_overflow,
+    WINDOW_COMPACT_RATIO,
     overflow_compact_budget,
+    should_overflow_retry,
 )
 from orbweaver.compact.project import INTERRUPTED_TOOL
+from orbweaver.compact.usage import request_token_estimate
 from orbweaver.config import settings
 from orbweaver.hooks import apply_post_tool_use, hook_cancel_abort, run_pre_tool_use
 from orbweaver.image import format_image_read, hydrate_workspace_images, is_image_path
@@ -45,6 +47,7 @@ from orbweaver.lints import read_lints
 from orbweaver.llm import (
     StreamAssembler,
     client_can_stream,
+    completion_max_tokens,
     is_streaming_required_error,
     message_stream,
     prompt_cache_supported,
@@ -53,6 +56,7 @@ from orbweaver.llm import (
     with_tool_cache_breakpoint,
 )
 from orbweaver.memory import graph_neighborhood, pinned_prompt, remember, rewrite_search_query
+from orbweaver.open_models import context_window_for
 from orbweaver.permissions import (
     PermissionDecision,
     TurnAborted,
@@ -1604,6 +1608,12 @@ async def _create_with_overflow_retry(
             # cache read. Only Anthropic sees these; the Ollama shim drops them.
             messages = with_message_cache_breakpoint(messages)
             send_tools = with_tool_cache_breakpoint(tools)
+        window = context_window_for(model, settings.context_window)
+        max_tok = completion_max_tokens(model)
+        estimate = request_token_estimate(
+            system=system, tools=send_tools, messages=messages, max_tokens=max_tok
+        )
+        near_limit = estimate >= int(window * WINDOW_COMPACT_RATIO)
         try:
             return await _create_agent_message(
                 client,
@@ -1623,7 +1633,7 @@ async def _create_with_overflow_retry(
             raise
         except Exception as e:
             last_error = e
-            if not is_context_overflow(e):
+            if not should_overflow_retry(e, near_limit=near_limit):
                 raise
             if attempt >= retries:
                 break
@@ -1634,6 +1644,8 @@ async def _create_with_overflow_retry(
                 client=client,
                 workspace=workspace,
                 system=system,
+                tools=tools,
+                model=model,
                 source="overflow",
                 force=True,
                 budget=overflow_compact_budget(e),
@@ -2331,7 +2343,13 @@ async def agent_turn(
     )
     if not resume:
         await maybe_compact(
-            store, session_id, client=client, workspace=workspace, system=system
+            store,
+            session_id,
+            client=client,
+            workspace=workspace,
+            system=system,
+            tools=active_tools,
+            model=turn_model,
         )
         if turn_state is not None:
             for ev in reversed(await store.list_events(session_id)):
@@ -2580,7 +2598,13 @@ async def agent_turn(
                 break
             await check_stuck()
             await maybe_compact(
-                store, session_id, client=client, workspace=workspace, system=system
+                store,
+                session_id,
+                client=client,
+                workspace=workspace,
+                system=system,
+                tools=active_tools,
+                model=turn_model,
             )
         else:
             await settle_probes()
