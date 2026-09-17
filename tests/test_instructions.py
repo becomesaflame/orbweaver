@@ -128,7 +128,13 @@ def test_relative_to_root_and_excluded_dirs(tmp_path: Path):
     assert relative_to_root(tmp_path, str(tmp_path / "web" / "a.js")).as_posix() == "web/a.js"
     assert relative_to_root(tmp_path, "../outside.py") is None
     assert relative_to_root(tmp_path, "/etc/passwd") is None
-    for bad in (".orbweaver/rules/x.md", ".orbweaver-tmp/a", "node_modules/p/i.js", ".git/HEAD"):
+    for bad in (
+        ".orbweaver/rules/x.md",
+        ".orbweaver-tmp/a",
+        "node_modules/p/i.js",
+        ".git/HEAD",
+        ".worktrees/slug/backend/foo.py",
+    ):
         assert relative_to_root(tmp_path, bad) is None, bad
 
 
@@ -178,9 +184,11 @@ def test_nested_skips_excluded_and_root_docs(tmp_path: Path):
     _write(tmp_path / "AGENTS.md", "root doc\n")
     _write(tmp_path / ".orbweaver" / "AGENTS.md", "hidden\n")
     _write(tmp_path / "node_modules" / "AGENTS.md", "hidden\n")
+    _write(tmp_path / ".worktrees" / "slug" / "AGENTS.md", "nested checkout\n")
     seen: set[str] = set()
     assert nested_instruction_blocks(tmp_path, ".orbweaver/tool-results/x", seen) == []
     assert nested_instruction_blocks(tmp_path, "node_modules/pkg/index.js", seen) == []
+    assert nested_instruction_blocks(tmp_path, ".worktrees/slug/backend/foo.py", seen) == []
     # Root docs are already in the system prompt; touching a root file injects nothing.
     assert nested_instruction_blocks(tmp_path, "README.md", seen) == []
 

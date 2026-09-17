@@ -31,7 +31,7 @@ DETACHED_WARNING = (
     "Finish the rebase/merge or check out the branch and move the ref first."
 )
 ADD_ALL_WARNING = (
-    "git add -A/--all stages untracked junk (.venv, .orbweaver-tmp). "
+    "git add -A/--all stages untracked junk (.venv, .orbweaver-tmp, .worktrees). "
     "Add the files you changed instead."
 )
 NOT_DONE_MARK = "NOT_DONE"

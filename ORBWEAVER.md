@@ -13,7 +13,7 @@ Trusted git remote: `git@github.com:becomesaflame/orbweaver.git`.
 | Tree | Branch | Role |
 | --- | --- | --- |
 | `/home/orbweaver/workspaces/orbweaver` | whatever is checked out | Shared attach point; do not edit |
-| sibling `../orbweaver-worktrees/<slug>` | one feature branch | Per-agent work |
+| `.worktrees/<slug>` inside that workspace | one feature branch | Per-agent work |
 | `/home/orbweaver/orbweaver` | `main` only | Production gateway |
 
 `main` is production. Do not commit on it. Do not push it. GitHub Actions
@@ -26,21 +26,22 @@ Before the first edit:
 
 ```bash
 git fetch origin
-git worktree add -b <topic> ../orbweaver-worktrees/<slug> origin/main
-cd ../orbweaver-worktrees/<slug>
+git worktree add -b <topic> .worktrees/<slug> origin/main
+cd .worktrees/<slug>
 ```
 
-Sibling of the repo root, so searches do not walk another agent's tree. Branch
-off `origin/main`. Version bump, tests, draft PR, and squash auto-merge then
-run from inside that worktree. The shell cwd still starts at the original
-checkout: `cd` or `git -C` on every command. Read-only work needs no worktree.
+The path is **inside** the session workspace. Sandboxed Bash can only write
+that tree; `/home/orbweaver/workspaces/` itself is read-only, so a sibling
+`../orbweaver-worktrees/` fails. `.worktrees/` is gitignored. File tools are
+rooted at the session workspace: edit `.worktrees/<slug>/...`. Bash: `cd` or
+`git -C`. Branch off `origin/main`. Read-only work needs no worktree.
 
 Tear it down once the PR is `MERGED` (`gh pr view <n> --json state`), from
-outside the worktree. Report unmerged work instead of deleting it.
+the original checkout. Report unmerged work instead of deleting it.
 
 ```bash
 cd <original checkout>
-git worktree remove ../orbweaver-worktrees/<slug>
+git worktree remove .worktrees/<slug>
 git branch -D <topic>                  # -d refuses after a squash-merge
 git push origin --delete <topic>       # this repo does not delete branches on merge
 ```
@@ -53,7 +54,7 @@ branch you did not create.
 Work on a **feature branch** in your worktree. Do not commit on `main`. Do not
 `git checkout` a different branch in the shared tree.
 
-1. `git fetch origin && git worktree add -b <topic> ../orbweaver-worktrees/<slug> origin/main`
+1. `git fetch origin && git worktree add -b <topic> .worktrees/<slug> origin/main`
 2. Implement, run `python -m pytest tests -q` locally when practical.
 3. Bump `__version__` in `backend/orbweaver/__init__.py` (see Versioning).
 4. Push the feature branch. Open a **draft PR into `main`** as soon as there

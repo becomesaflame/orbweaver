@@ -19,3 +19,4 @@ blob-report/
 *.log
 data/
 .orbweaver/
+.worktrees/
