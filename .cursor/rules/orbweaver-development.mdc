@@ -17,8 +17,12 @@ After reviewable work on a **feature branch** (never `main`):
 3. Commit on the feature branch. Push it. Open a **draft PR into `main`** as
    soon as there is something to review.
 4. When the feature is ready: mark the PR ready and enable squash auto-merge
-   (`gh pr merge --squash --auto`). Do not click Merge. Do not force-push.
-   Do not rewrite history. Do not push `main`.
+   (`gh pr merge --squash --auto`). Do not click Merge. Do not push,
+   force-push, or rewrite `main`.
+
+Rebasing your own feature branch and `git push --force-with-lease` is fine and
+is preferred over merging `main` back in. When a parallel PR lands the version
+you bumped to, rebase onto `origin/main` and re-bump.
 
 The user's request to implement or fix something **is** the request to follow
 this pipeline through a PR. Do not stop at "say if you want a commit."
