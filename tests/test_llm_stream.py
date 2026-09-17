@@ -10,14 +10,24 @@ from orbweaver.compact.project import (
     events_to_messages,
     unpaired_tool_use_ids,
 )
+from orbweaver.config import settings
 from orbweaver.llm import (
     ASSISTANT_DELTA,
+    SONNET_MAX_TOKENS,
     TOOL_USE_PROGRESS,
     StreamAssembler,
+    is_streaming_required_error,
     message_stream,
+    streaming_required_for_max_tokens,
 )
 from orbweaver.store import reset_store_for_tests
 from orbweaver.workspace import LocalWorkspace
+
+STREAMING_REQUIRED = (
+    "Streaming is required for operations that may take longer than 10 minutes. "
+    "See https://platform.claude.com/docs/en/cli-sdks-libraries/sdks/python#long-requests "
+    "for more details"
+)
 
 
 def _ev(typ: str, **kw) -> SimpleNamespace:
@@ -137,6 +147,26 @@ def test_message_stream_none_without_stream():
     assert message_stream(_OnlyCreate(), model="x") is None
 
 
+def test_streaming_required_matches_anthropic_sdk_heuristic():
+    # expected_time = 3600 * max_tokens / 128000; error when that exceeds 600s.
+    assert not streaming_required_for_max_tokens(8_192)
+    assert not streaming_required_for_max_tokens(21_333)
+    assert streaming_required_for_max_tokens(21_334)
+    assert streaming_required_for_max_tokens(SONNET_MAX_TOKENS)
+    assert is_streaming_required_error(ValueError(STREAMING_REQUIRED))
+    assert not is_streaming_required_error(RuntimeError(STREAMING_REQUIRED))
+
+
+def test_message_stream_open_failure_propagates():
+    class _Boom:
+        messages = SimpleNamespace(
+            stream=lambda **_k: (_ for _ in ()).throw(RuntimeError("stream open boom"))
+        )
+
+    with pytest.raises(RuntimeError, match="stream open boom"):
+        message_stream(_Boom(), model="x", max_tokens=SONNET_MAX_TOKENS)
+
+
 @pytest.mark.asyncio
 async def test_agent_turn_fake_stream_text_then_tool_use(tmp_path, monkeypatch):
     (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
@@ -213,6 +243,9 @@ async def test_cancel_mid_stream_leaves_paired_stubs(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stream_error_falls_back_to_create(tmp_path, monkeypatch):
+    # Haiku's 8k budget is under the SDK's ~21k non-streaming cutoff, so create()
+    # is still a valid retry when the stream dies mid-message.
+    monkeypatch.setattr(settings, "orbweaver_model", "claude-haiku-4-5")
     started = [
         _ev("message_start", message=SimpleNamespace(usage=SimpleNamespace(input_tokens=3))),
         _ev("content_block_start", index=0, content_block=SimpleNamespace(type="text", text="")),
@@ -235,3 +268,85 @@ async def test_stream_error_falls_back_to_create(tmp_path, monkeypatch):
     assert texts == ["fallback ok"]
     assert client.create_calls
     assert stream.closed
+
+
+class _SdkGuardClient(StreamingClient):
+    """create() raises the same ValueError Anthropic's SDK raises for long requests."""
+
+    async def create(self, **kwargs):
+        self.create_calls.append(kwargs)
+        max_tokens = int(kwargs.get("max_tokens") or 0)
+        expected_time = 60 * 60 * max_tokens / 128_000
+        if expected_time > 60 * 10:
+            raise ValueError(STREAMING_REQUIRED)
+        if self.fallback is None:
+            raise RuntimeError("create fallback was not provided")
+        return self.fallback
+
+
+@pytest.mark.asyncio
+async def test_stream_error_does_not_fall_back_when_sdk_requires_streaming(
+    tmp_path, monkeypatch
+):
+    """Telegram 'Turn failed: Streaming is required...' — stream died, then create().
+
+    Sonnet's 64k budget trips Anthropic's 10-minute non-streaming guard. Falling
+    back to create() surfaces that ValueError instead of the stream failure.
+    """
+    monkeypatch.setattr(settings, "orbweaver_model", "claude-sonnet-4-6")
+    started = [
+        _ev("message_start", message=SimpleNamespace(usage=SimpleNamespace(input_tokens=3))),
+        _ev("content_block_start", index=0, content_block=SimpleNamespace(type="text", text="")),
+        _ev("content_block_delta", index=0, delta=SimpleNamespace(type="text_delta", text="partial")),
+    ]
+    stream = FakeStream(started, error=RuntimeError("mid-message boom"))
+    client = _SdkGuardClient(stream)
+
+    async def no_compact(*_a, **_k):
+        return None
+
+    monkeypatch.setattr("orbweaver.llm.make_agent_client", lambda **_k: client)
+    monkeypatch.setattr("orbweaver.agent.maybe_compact", no_compact)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    with pytest.raises(RuntimeError, match="mid-message boom"):
+        await agent_turn(store, sid, "hi", ws)
+    assert client.create_calls == []
+    assert stream.closed
+
+
+@pytest.mark.asyncio
+async def test_stream_open_failure_does_not_fall_back_when_sdk_requires_streaming(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(settings, "orbweaver_model", "claude-sonnet-4-6")
+
+    class _OpenFails:
+        def __init__(self):
+            self.messages = self
+            self.create_calls: list[dict] = []
+            self.stream_calls: list[dict] = []
+
+        def stream(self, **kwargs):
+            self.stream_calls.append(kwargs)
+            raise RuntimeError("stream open boom")
+
+        async def create(self, **kwargs):
+            self.create_calls.append(kwargs)
+            raise ValueError(STREAMING_REQUIRED)
+
+    client = _OpenFails()
+
+    async def no_compact(*_a, **_k):
+        return None
+
+    monkeypatch.setattr("orbweaver.llm.make_agent_client", lambda **_k: client)
+    monkeypatch.setattr("orbweaver.agent.maybe_compact", no_compact)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    with pytest.raises(RuntimeError, match="stream open boom"):
+        await agent_turn(store, sid, "hi", ws)
+    assert client.create_calls == []
+    assert client.stream_calls
