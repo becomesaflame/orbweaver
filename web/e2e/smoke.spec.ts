@@ -4,7 +4,9 @@ test("web chat shell loads health version and composer", async ({ page }) => {
   await page.goto("/");
   await expect(page.locator("h1")).toHaveText("Orbweaver");
   await expect(page.locator("#app-ver")).toHaveText(/^v\d+\.\d+\.\d+$/);
-  await expect(page.locator("#status")).toHaveText("disconnected");
+  await expect(page.locator("#status")).toHaveText("");
+  await expect(page.locator("#conn-label")).toHaveText("Offline");
+  await expect(page.locator("#app-model")).toHaveCount(0);
   await expect(page.locator("#text")).toBeVisible();
   await expect(page.locator("#send")).toHaveText("Send");
   // Model picker (#137): the composer select exists and defaults to the
@@ -13,14 +15,13 @@ test("web chat shell loads health version and composer", async ({ page }) => {
   await expect(model).toBeVisible();
   await expect(model).toHaveValue("");
   await expect(model.locator("option").first()).toHaveText(/^Default/i);
-  await expect(page.locator("#app-model")).toHaveText(/^· \S+$/);
   await expect(page.locator("#settings")).toBeVisible();
   await expect(page.locator("#token")).toBeVisible();
 });
 
 test("renders markdown, tool cards and diffs from session events", async ({ page }) => {
   await page.goto("/");
-  await expect(page.locator("#status")).toHaveText("disconnected");
+  await expect(page.locator("#status")).toHaveText("");
   // Vendored marked + DOMPurify are served by the /ui static mount.
   await expect
     .poll(() => page.evaluate(() => !!(window as any).marked && !!(window as any).DOMPurify))

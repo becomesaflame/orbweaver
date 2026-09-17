@@ -46,6 +46,12 @@ async def test_index_references_vendored_scripts():
             for name in VENDORED:
                 assert f"/ui/vendor/{name}" in r.text, (path, name)
             assert "function renderEvent(ev)" in r.text
+            # Winamp chrome: LCD title well, no duplicate model header, no player/EQ chrome.
+            assert 'class="lcd"' in r.text
+            assert "function paintConnection(ok)" in r.text
+            assert 'id="app-model"' not in r.text
+            assert "Agent EQ" not in r.text
+            assert ">PREV<" not in r.text
             # Switching chats must rebuild the log even if a turn is in flight
             # on the target session (live permission wait / streaming).
             assert "if (inFlight && inFlight.sid === sid && logSid === sid)" in r.text
