@@ -27,6 +27,12 @@ from orbweaver.procs import (
 )
 from orbweaver.sandbox.environment import build_sandbox_env, setenv_args
 from orbweaver.sandbox.errors import label_sandbox_output
+from orbweaver.sandbox.gh import (
+    SANDBOX_GH_SOCK,
+    GhProxy,
+    ensure_gh_sandbox,
+    gh_overlay_args,
+)
 from orbweaver.sandbox.policy import (
     PROTECTED_WRITE_REL,
     SandboxPolicy,
@@ -353,6 +359,7 @@ def build_bwrap_argv(
     seccomp_fd: int | None = None,
     limits: dict[str, int] | None = None,
     environ: Mapping[str, str] | None = None,
+    gh_sock: Path | None = None,
 ) -> list[str]:
     """Argv for one sandboxed `bash -lc command`.
 
@@ -399,6 +406,10 @@ def build_bwrap_argv(
     private_keys = ssh_private_identity_files(ssh_policy=pol.ssh)
     ensure_ssh_sandbox(tmp, proxied=not full_network, identity_files=private_keys)
     argv.extend(ssh_config_overlay_args(tmp))
+    host_env = dict(environ) if environ is not None else dict(os.environ)
+    if gh_sock is not None:
+        ensure_gh_sandbox(tmp)
+        argv.extend(gh_overlay_args(tmp, gh_sock, host_env))
     argv.extend(["--tmpfs", "/run"])
     if not _is_run_symlink():
         argv.extend(["--tmpfs", "/var/run"])
@@ -439,41 +450,49 @@ def build_bwrap_argv(
     )
     env["TMPDIR"] = str(tmp)
     argv.extend(setenv_args(env))
+    if gh_sock is not None:
+        argv.extend(["--setenv", "GH_PROXY_SOCK", SANDBOX_GH_SOCK])
     script = rlimit_prologue(limits) + command
     argv.extend(["--chdir", str(root), "--", "bash", "-lc", script])
     return argv
 
 
-class SandboxSession:
-    """A running bwrap process plus its domain proxy (kept alive until close)."""
+def _close_sandbox_helpers(*helpers: Any) -> None:
+    for helper in helpers:
+        if helper is None:
+            continue
+        try:
+            helper.close()
+        except Exception:
+            log.exception("failed to close sandbox helper")
 
-    def __init__(self, proc: subprocess.Popen, proxy) -> None:
+
+class SandboxSession:
+    """A running bwrap process plus its domain / gh proxies (kept alive until close)."""
+
+    def __init__(self, proc: subprocess.Popen, proxy, gh_proxy=None) -> None:
         self.proc = proc
         self.proxy = proxy
+        self.gh_proxy = gh_proxy
 
     def close(self) -> None:
-        if self.proxy is not None:
-            try:
-                self.proxy.close()
-            except Exception:
-                log.exception("failed to close sandbox proxy")
-            self.proxy = None
+        _close_sandbox_helpers(self.proxy, self.gh_proxy)
+        self.proxy = None
+        self.gh_proxy = None
 
 
 class AsyncSandboxSession:
-    """A running bwrap asyncio process plus its domain proxy."""
+    """A running bwrap asyncio process plus its domain / gh proxies."""
 
-    def __init__(self, proc: asyncio.subprocess.Process, proxy) -> None:
+    def __init__(self, proc: asyncio.subprocess.Process, proxy, gh_proxy=None) -> None:
         self.proc = proc
         self.proxy = proxy
+        self.gh_proxy = gh_proxy
 
     def close(self) -> None:
-        if self.proxy is not None:
-            try:
-                self.proxy.close()
-            except Exception:
-                log.exception("failed to close sandbox proxy")
-            self.proxy = None
+        _close_sandbox_helpers(self.proxy, self.gh_proxy)
+        self.proxy = None
+        self.gh_proxy = None
 
 
 def _prepare_sandbox(
@@ -485,7 +504,7 @@ def _prepare_sandbox(
 ) -> tuple[list[str], Any, int | None]:
     """Start the domain proxy, open the seccomp fd, and build the bwrap argv.
 
-    Returns (argv, proxy, seccomp_fd); the caller must pass the fd to the child and close it."""
+    Returns (argv, proxy, gh_proxy, seccomp_fd); the caller must pass the fd to the child and close it."""
     if is_containerized():
         raise SandboxUnavailable("containerized hosts use unsandboxed bash")
     exe = bwrap_path()
@@ -496,6 +515,7 @@ def _prepare_sandbox(
     pol = policy or load_sandbox_policy(workspace_root)
     inner = command
     proxy = None
+    gh_proxy = None
     if not full_network:
         from orbweaver.sandbox.proxy import DomainProxy, wrap_command_with_proxy
 
@@ -503,6 +523,22 @@ def _prepare_sandbox(
         proxy = DomainProxy(sock, pol.network)
         proxy.start()
         inner = wrap_command_with_proxy(command, str(sock))
+    gh_sock: Path | None = Path(f"/tmp/ow-gh-{uuid4().hex[:12]}.sock")
+    gh_proxy = GhProxy(
+        gh_sock,
+        workspace_root=workspace_root,
+        extra_roots=pol.working_set_roots(workspace_root)[1:],
+        environ=dict(os.environ),
+    )
+    try:
+        started = gh_proxy.start()
+    except OSError:
+        log.exception("gh proxy failed to start")
+        _close_sandbox_helpers(gh_proxy)
+        started = None
+    if started is None:
+        gh_proxy = None
+        gh_sock = None
     seccomp_fd: int | None = None
     try:
         if seccomp_enabled(exe):
@@ -513,15 +549,20 @@ def _prepare_sandbox(
                 )
             seccomp_fd = open_seccomp_fd(program)
         argv = build_bwrap_argv(
-            inner, workspace_root, tmp, policy=pol, full_network=full_network, seccomp_fd=seccomp_fd
+            inner,
+            workspace_root,
+            tmp,
+            policy=pol,
+            full_network=full_network,
+            seccomp_fd=seccomp_fd,
+            gh_sock=gh_sock,
         )
     except Exception:
-        if proxy is not None:
-            proxy.close()
+        _close_sandbox_helpers(proxy, gh_proxy)
         if seccomp_fd is not None:
             os.close(seccomp_fd)
         raise
-    return argv, proxy, seccomp_fd
+    return argv, proxy, gh_proxy, seccomp_fd
 
 
 def spawn_sandboxed(
@@ -531,7 +572,7 @@ def spawn_sandboxed(
     policy: SandboxPolicy | None = None,
     full_network: bool = False,
 ) -> SandboxSession:
-    argv, proxy, seccomp_fd = _prepare_sandbox(
+    argv, proxy, gh_proxy, seccomp_fd = _prepare_sandbox(
         command, workspace_root, policy=policy, full_network=full_network
     )
     try:
@@ -544,18 +585,16 @@ def spawn_sandboxed(
             pass_fds=(seccomp_fd,) if seccomp_fd is not None else (),
         )
     except FileNotFoundError as e:
-        if proxy is not None:
-            proxy.close()
+        _close_sandbox_helpers(proxy, gh_proxy)
         raise SandboxUnavailable(f"bwrap not found: {e}") from e
     except OSError as e:
-        if proxy is not None:
-            proxy.close()
+        _close_sandbox_helpers(proxy, gh_proxy)
         raise SandboxUnavailable(f"bwrap failed to start: {e}") from e
     finally:
         # bwrap inherited its own copy; the program is fully read before exec.
         if seccomp_fd is not None:
             os.close(seccomp_fd)
-    return SandboxSession(proc, proxy)
+    return SandboxSession(proc, proxy, gh_proxy)
 
 
 async def spawn_sandboxed_async(
@@ -566,7 +605,7 @@ async def spawn_sandboxed_async(
     full_network: bool = False,
 ) -> AsyncSandboxSession:
     """spawn_sandboxed for the event loop: the process is an asyncio subprocess."""
-    argv, proxy, seccomp_fd = await asyncio.to_thread(
+    argv, proxy, gh_proxy, seccomp_fd = await asyncio.to_thread(
         _prepare_sandbox, command, workspace_root, policy=policy, full_network=full_network
     )
     try:
@@ -578,17 +617,15 @@ async def spawn_sandboxed_async(
             pass_fds=(seccomp_fd,) if seccomp_fd is not None else (),
         )
     except FileNotFoundError as e:
-        if proxy is not None:
-            proxy.close()
+        _close_sandbox_helpers(proxy, gh_proxy)
         raise SandboxUnavailable(f"bwrap not found: {e}") from e
     except OSError as e:
-        if proxy is not None:
-            proxy.close()
+        _close_sandbox_helpers(proxy, gh_proxy)
         raise SandboxUnavailable(f"bwrap failed to start: {e}") from e
     finally:
         if seccomp_fd is not None:
             os.close(seccomp_fd)
-    return AsyncSandboxSession(proc, proxy)
+    return AsyncSandboxSession(proc, proxy, gh_proxy)
 
 
 def run_sandboxed(

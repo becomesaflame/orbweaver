@@ -308,6 +308,7 @@ class SessionShell:
         self.start_timeout = start_timeout
         self.proc: subprocess.Popen[str] | None = None
         self.proxy: DomainProxy | None = None
+        self.gh_proxy = None
         self.last_used = time.monotonic()
         self.started_at: float | None = None
         self._lock = threading.Lock()
@@ -331,13 +332,14 @@ class SessionShell:
         token = uuid4().hex
         # Same proxy relay, seccomp filter, cleared environment and rlimits as a
         # one-shot run_sandboxed: the persistent shell is not a weaker sandbox.
-        argv, proxy, seccomp_fd = _bwrap._prepare_sandbox(
+        argv, proxy, gh_proxy, seccomp_fd = _bwrap._prepare_sandbox(
             _server_command(token),
             self.root,
             policy=self.policy,
             full_network=self.full_network,
         )
         self.proxy = proxy
+        self.gh_proxy = gh_proxy
         try:
             self.proc = subprocess.Popen(
                 argv,
@@ -438,6 +440,12 @@ class SessionShell:
             except Exception:
                 log.exception("failed to close session shell proxy")
             self.proxy = None
+        if self.gh_proxy is not None:
+            try:
+                self.gh_proxy.close()
+            except Exception:
+                log.exception("failed to close session shell gh proxy")
+            self.gh_proxy = None
 
     # -- protocol ----------------------------------------------------------
 
