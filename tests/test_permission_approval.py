@@ -580,3 +580,45 @@ async def test_telegram_chat_sink_sends_keyboard(monkeypatch):
     sink({"kind": "permission_request", "payload": {"tool_use_id": "tu-1", "name": "Bash"}})
     await asyncio.sleep(0)
     assert sent == [{"chat_id": 77, "tool_use_id": "tu-1", "name": "Bash"}]
+
+
+class _FakeQuery:
+    """Minimal CallbackQuery double: records edits, can fail the text edit."""
+
+    def __init__(self, text="Approval needed: Bash", fail_text_edit=False):
+        self.message = SimpleNamespace(text=text)
+        self.fail_text_edit = fail_text_edit
+        self.edits: list[str] = []
+        self.markup_edits: list[object] = []
+
+    async def edit_message_text(self, text):
+        if self.fail_text_edit:
+            raise RuntimeError("message is not modified")
+        self.edits.append(text)
+
+    async def edit_message_reply_markup(self, reply_markup=None):
+        self.markup_edits.append(reply_markup)
+
+
+def test_telegram_approval_result_labels():
+    assert tg.approval_result_label("allow", "once") == "Allowed"
+    assert tg.approval_result_label("allow", "session") == "Allowed for this session"
+    assert tg.approval_result_label("deny", "once") == "Denied"
+
+
+@pytest.mark.asyncio
+async def test_telegram_answered_approval_loses_its_buttons():
+    # One press ends the choice: editMessageText without reply_markup drops the
+    # Allow / Allow for session / Deny keyboard from the message.
+    query = _FakeQuery()
+    await tg.close_approval_message(query, tg.approval_result_label("allow", "session"))
+    assert query.edits == ["Approval needed: Bash\n\n\u2192 Allowed for this session"]
+    assert query.markup_edits == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_buttons_removed_even_when_the_text_edit_fails():
+    query = _FakeQuery(fail_text_edit=True)
+    await tg.close_approval_message(query, tg.approval_result_label("deny", "once"))
+    assert query.edits == []
+    assert query.markup_edits == [None]

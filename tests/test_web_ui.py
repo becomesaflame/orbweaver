@@ -78,6 +78,11 @@ async def test_index_references_vendored_scripts():
             assert ".chat.running .chat-state .spin" in r.text
             assert "@keyframes chat-spin" in r.text
             assert ".chat.done {" in r.text
+            # An answered approval drops its Allow / Deny buttons rather than
+            # leaving them on screen (disabled) for a second click.
+            assert "function clearPermissionActions(card)" in r.text
+            assert 'card.querySelectorAll(".perm-actions").forEach((n) => n.remove())' in r.text
+            assert '.perm-actions button").forEach((b) => { b.disabled = true; })' not in r.text
     assert (WEB_DIR / "vendor" / "README.md").is_file()
 
 
