@@ -96,8 +96,14 @@ that resolve the same line twice:
 
 ```bash
 git fetch origin && git rebase origin/main   # resolve __init__.py to a number above main
+git diff origin/main -- backend/orbweaver/__init__.py   # must still show your bump
 git push --force-with-lease
 ```
+
+A rebase that reports success can leave you with **no** bump at all. If the PR
+that landed first used the number you bumped to, your hunk is already applied,
+git drops it silently, and there is no conflict to notice. An empty diff on
+that second line means re-bump to the next free number before pushing.
 
 Do **not** put the version in the PR title (or the squash-merge commit title
 template). Parallel PRs each bump against the same `origin/main` base, so the
