@@ -1539,11 +1539,16 @@
       if (!toolUseId) return null;
       return $("log").querySelector('.msg.permission[data-tool-use-id="' + String(toolUseId).replace(/"/g, "") + '"]');
     }
+    function clearPermissionActions(card) {
+      // One decision ends the choice: drop the buttons instead of greying them out,
+      // so a resolved card cannot be clicked again (here or from another channel).
+      if (card) card.querySelectorAll(".perm-actions").forEach((n) => n.remove());
+    }
     function resolvePermissionCard(toolUseId, label) {
       const card = permissionCard(toolUseId);
       if (!card) return;
       card.classList.add("resolved");
-      card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = true; });
+      clearPermissionActions(card);
       let out = card.querySelector(".perm-outcome");
       if (!out) {
         out = document.createElement("div");
@@ -1571,28 +1576,37 @@
         why.textContent = "Why: " + p.reason;
         d.appendChild(why);
       }
-      const actions = document.createElement("div");
-      actions.className = "msg-actions perm-actions";
       const sid = currentSid();
-      const mk = (label, decision, scope, cls) => {
-        const b = document.createElement("button");
-        b.type = "button";
-        b.textContent = label;
-        b.className = cls;
-        b.onclick = () => decidePermission(sid, p.tool_use_id, decision, scope, d);
-        actions.appendChild(b);
+      const buildActions = () => {
+        const actions = document.createElement("div");
+        actions.className = "msg-actions perm-actions";
+        const mk = (label, decision, scope, cls) => {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.textContent = label;
+          b.className = cls;
+          b.onclick = () => decidePermission(sid, p.tool_use_id, decision, scope, d);
+          actions.appendChild(b);
+        };
+        mk("Allow", "allow", "once", "allow");
+        mk("Allow for session", "allow", "session", "allow");
+        mk("Deny", "deny", "once", "deny");
+        d.appendChild(actions);
+        return actions;
       };
-      mk("Allow", "allow", "once", "allow");
-      mk("Allow for session", "allow", "session", "allow");
-      mk("Deny", "deny", "once", "deny");
-      d.appendChild(actions);
+      d.rebuildPermActions = buildActions;
+      buildActions();
       $("log").appendChild(d);
       _scrollToBottom();
       return d;
     }
     async function decidePermission(sid, toolUseId, decision, scope, card) {
       if (!sid || !toolUseId) return;
-      card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = true; });
+      if (card.classList.contains("resolved")) return;
+      // Take the buttons away on the first click: the decision is already sent,
+      // and a second click would race a stale tool_use_id.
+      card.classList.add("resolved");
+      clearPermissionActions(card);
       try {
         await api("/v1/sessions/" + sid + "/turns/approve", {
           method:"POST", body: JSON.stringify({ tool_use_id: toolUseId, decision, scope })
@@ -1601,7 +1615,7 @@
       } catch (e) {
         resolvePermissionCard(toolUseId, "Could not send decision: " + String(e));
         card.classList.remove("resolved");
-        card.querySelectorAll(".perm-actions button").forEach((b) => { b.disabled = false; });
+        if (card.rebuildPermActions) card.rebuildPermActions();
       }
     }
     function renderStopped(seq) {

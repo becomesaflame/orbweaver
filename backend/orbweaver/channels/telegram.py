@@ -146,6 +146,33 @@ def parse_approval_callback(data: str) -> tuple[str, str, str] | None:
     return decision, scope, tool_use_id
 
 
+def approval_result_label(decision: str, scope: str) -> str:
+    return {
+        ("allow", "once"): "Allowed",
+        ("allow", "session"): "Allowed for this session",
+        ("deny", "once"): "Denied",
+    }.get((decision, scope), decision)
+
+
+async def close_approval_message(query: Any, label: str) -> None:
+    """Retire an answered approval: append the outcome and take the buttons away.
+
+    ``edit_message_text`` without ``reply_markup`` drops the inline keyboard, so
+    the Allow / Deny buttons cannot be pressed a second time. If the edit fails
+    (message too old, identical text), still remove the keyboard on its own.
+    """
+    try:
+        original = str(getattr(query.message, "text", None) or "")
+        await query.edit_message_text(f"{original}\n\n→ {label}"[:4000])
+        return
+    except Exception:
+        log.debug("telegram approval message edit failed", exc_info=True)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        log.debug("telegram approval keyboard removal failed", exc_info=True)
+
+
 async def notify_telegram_approval(chat_id: int, payload: dict) -> None:
     token = settings.telegram_bot_token
     tool_use_id = str(payload.get("tool_use_id") or "")
@@ -979,19 +1006,11 @@ async def start_telegram() -> None:
         target_sid = _approval_session(candidates, tool_use_id)
         resolved = target_sid is not None and resolve_approval(target_sid, tool_use_id, decision, scope)
         if resolved:
-            label = {
-                ("allow", "once"): "Allowed",
-                ("allow", "session"): "Allowed for this session",
-                ("deny", "once"): "Denied",
-            }.get((decision, scope), decision)
+            label = approval_result_label(decision, scope)
         else:
             label = "No longer pending (timed out, cancelled, or already answered)"
         await query.answer(label)
-        try:
-            original = str(getattr(query.message, "text", None) or "")
-            await query.edit_message_text(f"{original}\n\n→ {label}"[:4000])
-        except Exception:
-            log.debug("telegram approval message edit failed", exc_info=True)
+        await close_approval_message(query, label)
 
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("version", on_version))
