@@ -23,7 +23,7 @@ from orbweaver.workspace import LocalWorkspace
 def test_ci_installs_bubblewrap():
     if not os.environ.get("GITHUB_ACTIONS"):
         return
-    assert sandbox_available(), "CI must apt-install bubblewrap so live sandbox tests can run where netns allows"
+    assert sandbox_available(), "CI must install bubblewrap so live sandbox tests can run where netns allows"
 
 
 def _loopback_blocked(text: object) -> bool:
