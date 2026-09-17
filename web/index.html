@@ -492,7 +492,19 @@
       wkind: "orbweaver.wkind", collapsed: "orbweaver.collapsedWs", expanded: "orbweaver.expandedWs"
     };
     let sessions = [];
-    let inFlight = null;
+    // One live turn per session. A turn in chat A must not block sending in chat B.
+    const flights = new Map();
+    function flightFor(sid) { return (sid && flights.get(sid)) || null; }
+    function currentFlight() { return flightFor(currentSid()); }
+    function dropEl(el) { if (el && el.parentNode) el.remove(); }
+    function finishWorking(sid, workingEl) {
+      const flight = flightFor(sid);
+      dropEl(workingEl);
+      if (flight) dropEl(flight.workingEl);
+    }
+    function clearFlight(sid, flight) {
+      if (sid && flights.get(sid) === flight) flights.delete(sid);
+    }
     let logSid = "";
     let historyGen = 0;
     let stoppedSids = new Set();
@@ -1519,7 +1531,7 @@
       return asks.some((id) => id && !answered.has(String(id)));
     }
     function syncComposer() {
-      const busy = !!(inFlight && inFlight.sid === currentSid());
+      const busy = !!currentFlight();
       const waiting = !busy && waitingAskSids.has(currentSid());
       const stopped = !busy && !waiting && stoppedSids.has(currentSid());
       const hasText = !!$("text").value.trim();
@@ -1753,7 +1765,7 @@
         // live turn is appending to it. Switching back from another chat must
         // still replace the transcript — otherwise the rail/title update and
         // the messages stay on the previous session.
-        if (inFlight && inFlight.sid === sid && logSid === sid) {
+        if (flightFor(sid) && logSid === sid) {
           syncComposer();
           return;
         }
@@ -1775,12 +1787,17 @@
             if (last && last.kind !== "assistant") stoppedSids.add(sid);
           }
         }
-        if (inFlight && inFlight.sid === sid) {
-          if (inFlight.workingEl && !inFlight.workingEl.isConnected) {
-            inFlight.workingEl = addWorking();
+        const flight = flightFor(sid);
+        if (flight) {
+          if (flight.userEl && !flight.userEl.isConnected && flight.text && !flight.userEl.dataset.seq) {
+            flight.userEl = add("user", flight.text, { extraClass: "pending" });
+            attachUserActions(flight.userEl, flight.text, null, true);
+          }
+          if (flight.workingEl && !flight.workingEl.isConnected) {
+            flight.workingEl = addWorking();
           }
         }
-        $("status").textContent = "";
+        $("status").textContent = flight ? "working…" : "";
         syncComposer();
         const cur = currentSession();
         if (cur) $("chat-title").textContent = cur.title || "New chat";
@@ -1945,7 +1962,7 @@
     });
 
     async function requestCancel(discard) {
-      const flight = inFlight;
+      const flight = currentFlight();
       if (!flight) return;
       try {
         await api("/v1/sessions/" + flight.sid + "/turns/cancel", {
@@ -1957,10 +1974,11 @@
     function cancelPrompt() { requestCancel(true); }
     async function editPrompt(text, seq, el) {
       restoreComposer(text);
-      const pending = !!(inFlight && el && el.classList.contains("pending"));
+      const flight = currentFlight();
+      const pending = !!(flight && el && el.classList.contains("pending"));
       const sid = currentSid();
-      if (inFlight) {
-        const wait = inFlight.done;
+      if (flight) {
+        const wait = flight.done;
         await requestCancel(true);
         if (wait) await wait;
       }
@@ -1984,8 +2002,9 @@
     }
     async function injectNow() {
       const text = $("text").value.trim();
-      if (!text || !inFlight) return;
-      const sid = inFlight.sid;
+      const flight = currentFlight();
+      if (!text || !flight) return;
+      const sid = flight.sid;
       $("text").value = "";
       syncComposer();
       try {
@@ -2057,7 +2076,7 @@
           settled = true;
           if (retryTimer) clearTimeout(retryTimer);
           try { if (ws) ws.close(); } catch (e) {}
-          if ($("status").textContent.startsWith("reconnecting")) $("status").textContent = "working…";
+          if (here() && $("status").textContent.startsWith("reconnecting")) $("status").textContent = "working…";
           fn(val);
         };
         const scheduleReconnect = () => {
@@ -2148,7 +2167,7 @@
       });
     }
     async function continueTurn() {
-      if (inFlight) return;
+      if (currentFlight()) return;
       const sid = currentSid();
       if (!sid) return;
       stoppedSids.delete(sid);
@@ -2159,30 +2178,33 @@
       const workingEl = addWorking();
       let resolveDone;
       const done = new Promise((r) => { resolveDone = r; });
-      inFlight = { sid, text: "", userEl: null, workingEl, done };
+      const flight = { sid, text: "", userEl: null, workingEl, done };
+      flights.set(sid, flight);
       syncComposer();
       $("status").textContent = "working…";
+      let turnStatus = null;
       try {
         const r = await streamTurn(sid, { resume: true }, (ev) => {
           if (currentSid() !== sid) return;
           renderEvent(ev);
         });
-        if (workingEl.parentNode) workingEl.remove();
+        finishWorking(sid, workingEl);
         if (currentSid() === sid) {
           if (r.status === "waiting_ask") waitingAskSids.add(sid);
           if (r.status === "stopped") stoppedSids.add(sid);
         }
         await refreshSessions();
-        await drainQueue(sid, r.status);
+        turnStatus = r.status;
       } catch (e) {
-        if (workingEl.parentNode) workingEl.remove();
+        finishWorking(sid, workingEl);
         if (currentSid() === sid) addError(e);
       } finally {
-        if (inFlight && inFlight.sid === sid) inFlight = null;
+        clearFlight(sid, flight);
         if (resolveDone) resolveDone();
         syncComposer();
-        if ($("status").textContent === "working…") $("status").textContent = "";
+        if (currentSid() === sid && $("status").textContent === "working…") $("status").textContent = "";
       }
+      if (turnStatus != null) await drainQueue(sid, turnStatus);
     }
     async function drainQueue(sid, status) {
       if (status !== "ok") return;
@@ -2196,7 +2218,7 @@
       await send();
     }
     async function send() {
-      if (inFlight) return;
+      if (currentFlight()) return;
       const text = $("text").value.trim();
       if (!text) return;
       if (!currentSid()) {
@@ -2215,37 +2237,41 @@
       const workingEl = addWorking();
       let resolveDone;
       const done = new Promise((r) => { resolveDone = r; });
-      inFlight = { sid, text, userEl, workingEl, done };
+      const flight = { sid, text, userEl, workingEl, done };
+      flights.set(sid, flight);
       syncComposer();
       $("status").textContent = "working…";
       const turnPayload = { text };
       if (pickedModel()) turnPayload.model = pickedModel();
+      let turnStatus = null;
       try {
         const r = await streamTurn(sid, turnPayload, (ev) => {
           if (currentSid() !== sid) return;
           if (ev.kind === "user" && !(ev.payload && ev.payload.injected)) {
-            if (userEl) {
-              userEl.classList.remove("pending");
+            const el = (flightFor(sid) && flightFor(sid).userEl) || userEl;
+            if (el) {
+              el.classList.remove("pending");
               if (ev.seq != null) {
-                userEl.dataset.seq = String(ev.seq);
+                el.dataset.seq = String(ev.seq);
                 renderedSeqs.add(Number(ev.seq));
               }
-              attachUserActions(userEl, text, ev.seq, false);
+              attachUserActions(el, text, ev.seq, false);
             }
             return;
           }
           renderEvent(ev);
         });
         const stillHere = currentSid() === sid;
-        if (workingEl.parentNode) workingEl.remove();
-        if (userEl) userEl.classList.remove("pending");
+        finishWorking(sid, workingEl);
+        const liveUser = (flightFor(sid) && flightFor(sid).userEl) || userEl;
+        if (liveUser) liveUser.classList.remove("pending");
         if (r.status === "discarded") {
           if (r.user_seq != null) dropFromSeq(r.user_seq);
-          if (userEl && userEl.parentNode) userEl.remove();
+          if (liveUser && liveUser.parentNode) liveUser.remove();
           if (stillHere) ensurePlaceholder();
         } else if (stillHere) {
-          if (userEl && r.user_seq != null) userEl.dataset.seq = String(r.user_seq);
-          if (userEl) attachUserActions(userEl, text, r.user_seq, false);
+          if (liveUser && r.user_seq != null) liveUser.dataset.seq = String(r.user_seq);
+          if (liveUser) attachUserActions(liveUser, text, r.user_seq, false);
           syncRestoreDefaults();
           if (r.status === "waiting_ask") waitingAskSids.add(sid);
           if (r.status === "stopped") stoppedSids.add(sid);
@@ -2255,28 +2281,29 @@
           const cur = currentSession();
           if (cur) $("chat-title").textContent = cur.title || "New chat";
         }
-        await drainQueue(sid, r.status);
+        turnStatus = r.status;
       } catch (e) {
-        if (workingEl.parentNode) workingEl.remove();
+        finishWorking(sid, workingEl);
         if (userEl) userEl.classList.remove("pending");
         if (currentSid() === sid) addError(e);
       } finally {
-        if (inFlight && inFlight.sid === sid) inFlight = null;
+        clearFlight(sid, flight);
         if (resolveDone) resolveDone();
         syncComposer();
-        if ($("status").textContent === "working…") $("status").textContent = "";
+        if (currentSid() === sid && $("status").textContent === "working…") $("status").textContent = "";
       }
+      if (turnStatus != null) await drainQueue(sid, turnStatus);
     }
-    $("send").onclick = () => { if (inFlight && inFlight.sid === currentSid()) stopTurn(); else send(); };
+    $("send").onclick = () => { if (currentFlight()) stopTurn(); else send(); };
     $("queue-btn").onclick = () => enqueue($("text").value.trim());
     $("inject").onclick = () => injectNow();
     $("continue").onclick = () => continueTurn();
     $("text").addEventListener("input", syncComposer);
     $("text").addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && inFlight) { e.preventDefault(); stopTurn(); return; }
+      if (e.key === "Escape" && currentFlight()) { e.preventDefault(); stopTurn(); return; }
       if (e.key !== "Enter" || e.repeat || e.isComposing) return;
       if (e.shiftKey) return;
-      const busy = !!(inFlight && inFlight.sid === currentSid());
+      const busy = !!currentFlight();
       if (busy && (e.ctrlKey || e.metaKey)) { e.preventDefault(); injectNow(); return; }
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       e.preventDefault();
@@ -2284,7 +2311,7 @@
       else send();
     });
     window.addEventListener("keydown", (e) => {
-      if (e.key !== "Escape" || !inFlight) return;
+      if (e.key !== "Escape" || !currentFlight()) return;
       if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
       e.preventDefault();
       stopTurn();

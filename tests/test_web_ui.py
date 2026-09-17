@@ -54,9 +54,13 @@ async def test_index_references_vendored_scripts():
             assert ">PREV<" not in r.text
             # Switching chats must rebuild the log even if a turn is in flight
             # on the target session (live permission wait / streaming).
-            assert "if (inFlight && inFlight.sid === sid && logSid === sid)" in r.text
+            assert "if (flightFor(sid) && logSid === sid)" in r.text
             assert 'addEventListener("hashchange"' in r.text
             assert "if (inFlight && inFlight.sid === sid) { syncComposer(); return; }" not in r.text
+            # A turn running in one chat must not block send() in another.
+            assert "if (currentFlight()) return;" in r.text
+            assert "const flights = new Map()" in r.text
+            assert "if (inFlight) return;" not in r.text
     assert (WEB_DIR / "vendor" / "README.md").is_file()
 
 

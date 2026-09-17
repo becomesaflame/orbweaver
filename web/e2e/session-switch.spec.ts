@@ -87,6 +87,37 @@ function chat(page: Page, title: string) {
   return page.locator("button.chat", { hasText: title });
 }
 
+async function installFakeWebSocket(page: Page) {
+  await page.evaluate(() => {
+    const w = window as unknown as {
+      __wsOpened: string[];
+      __wsPayloads: string[];
+      WebSocket: typeof WebSocket;
+    };
+    w.__wsOpened = [];
+    w.__wsPayloads = [];
+    class FakeWS {
+      readyState = 0;
+      onopen: ((ev?: object) => void) | null = null;
+      onmessage: ((ev: { data: string }) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: ((ev: { code: number }) => void) | null = null;
+      constructor(url: string) {
+        w.__wsOpened.push(String(url));
+        queueMicrotask(() => {
+          this.readyState = 1;
+          if (this.onopen) this.onopen({});
+        });
+      }
+      send(data: string) {
+        w.__wsPayloads.push(String(data));
+      }
+      close() {}
+    }
+    w.WebSocket = FakeWS as unknown as typeof WebSocket;
+  });
+}
+
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem("orbweaver.jwt", "test-jwt");
@@ -108,24 +139,7 @@ test("switching back mid-turn redraws the waiting chat", async ({ page }) => {
   await mockGateway(page);
   await page.goto("/");
   await expect(page.locator("#log")).toContainText("beta prompt");
-  await page.evaluate(() => {
-    class FakeWS {
-      readyState = 0;
-      onopen: ((ev?: object) => void) | null = null;
-      onmessage: ((ev: { data: string }) => void) | null = null;
-      onerror: (() => void) | null = null;
-      onclose: ((ev: { code: number }) => void) | null = null;
-      constructor() {
-        queueMicrotask(() => {
-          this.readyState = 1;
-          if (this.onopen) this.onopen({});
-        });
-      }
-      send() {}
-      close() {}
-    }
-    window.WebSocket = FakeWS as unknown as typeof WebSocket;
-  });
+  await installFakeWebSocket(page);
   await page.locator("#text").fill("keep going");
   await page.locator("#send").click();
   await expect(page.locator("#send")).toHaveText("Stop");
@@ -137,6 +151,34 @@ test("switching back mid-turn redraws the waiting chat", async ({ page }) => {
   await expect(page.locator("#log")).toContainText("beta prompt");
   await expect(page.locator("#log")).toContainText("Approval needed");
   await expect(page.locator("#log")).not.toContainText("alpha prompt");
+});
+
+test("a turn in one chat does not block sending in another", async ({ page }) => {
+  await mockGateway(page);
+  await page.goto("/");
+  await expect(page.locator("#log")).toContainText("beta prompt");
+  await installFakeWebSocket(page);
+  await page.locator("#text").fill("keep going");
+  await page.locator("#send").click();
+  await expect(page.locator("#send")).toHaveText("Stop");
+  await chat(page, "alpha chat").click();
+  await expect(page.locator("#chat-title")).toHaveText("alpha chat");
+  await expect(page.locator("#send")).toHaveText("Send");
+  await page.locator("#text").fill("hello from alpha");
+  await page.locator("#send").click();
+  await expect(page.locator("#text")).toHaveValue("");
+  await expect(page.locator("#log")).toContainText("hello from alpha");
+  await expect(page.locator("#send")).toHaveText("Stop");
+  const opened = await page.evaluate(
+    () => (window as unknown as { __wsOpened: string[] }).__wsOpened,
+  );
+  const payloads = await page.evaluate(
+    () => (window as unknown as { __wsPayloads: string[] }).__wsPayloads,
+  );
+  expect(opened.some((url) => url.includes(SID_B))).toBeTruthy();
+  expect(opened.some((url) => url.includes(SID_A))).toBeTruthy();
+  expect(payloads.some((raw) => raw.includes("keep going"))).toBeTruthy();
+  expect(payloads.some((raw) => raw.includes("hello from alpha"))).toBeTruthy();
 });
 
 test("a slower history fetch for the previous chat cannot overwrite the new one", async ({
