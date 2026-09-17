@@ -31,7 +31,9 @@ function card(page: Page) {
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
-  await expect(page.locator("#status")).toHaveText("disconnected");
+  // #status is empty while offline (it only carries live turn status); wait on
+  // the connection label the shell paints instead.
+  await expect(page.locator("#conn-label")).toHaveText("Offline");
 });
 
 test("clicking Allow removes the approval buttons", async ({ page }) => {
