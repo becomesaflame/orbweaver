@@ -94,6 +94,40 @@
     .chat.active .chat-time { color:var(--lcd-dim); }
     .chat-title { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .chat-time { font-size:0.68rem; color:var(--muted); flex:none; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    /* Rail activity: a chat with a live turn spins; one that finished while you
+       were elsewhere stays highlighted until you click it. */
+    .chat-state { width:0.75rem; height:0.75rem; flex:none; position:relative; }
+    .chat-state .spin, .chat-state .bell { display:none; }
+    .chat.running .chat-state .spin {
+      display:block; width:0.7rem; height:0.7rem; border-radius:50%;
+      border:2px solid rgba(120,255,160,0.22);
+      border-top-color:var(--lcd-ink);
+      animation:chat-spin 0.85s linear infinite;
+    }
+    .chat.done .chat-state .bell {
+      display:block; width:0.45rem; height:0.45rem; margin:0.15rem;
+      border-radius:50%; background:var(--amber);
+      box-shadow:0 0 6px rgba(255,176,40,0.65);
+      animation:chat-blip 1.8s ease-in-out infinite;
+    }
+    .chat.done { background:rgba(255,176,40,0.1); color:var(--amber); box-shadow:inset 2px 0 0 var(--amber); }
+    .chat.done .chat-title { font-weight:700; }
+    .chat.done .chat-time { color:var(--amber); }
+    @keyframes chat-spin { to { transform:rotate(360deg); } }
+    @keyframes chat-blip { 0%, 100% { opacity:1; } 50% { opacity:0.35; } }
+    /* Activity inside a collapsed group (or below the "More" cutoff) rolls up
+       onto the workspace header so it is never invisible. */
+    .ws-activity { flex:none; display:none; align-items:center; gap:0.3rem; font-size:0.68rem; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .ws-activity.on { display:flex; }
+    .ws-activity .run { color:var(--lcd-ink); }
+    .ws-activity .run::before { content:"◴ "; }
+    .ws-activity .fin { color:var(--amber); }
+    .ws-activity .fin::before { content:"● "; }
+    .ws-activity .run.off, .ws-activity .fin.off { display:none; }
+    @media (prefers-reduced-motion: reduce) {
+      .chat.running .chat-state .spin { animation:pulse 1.4s ease-in-out infinite; }
+      .chat.done .chat-state .bell { animation:none; }
+    }
     .more { color:var(--muted); font-size:0.8rem; padding:0.2rem 0.45rem 0.35rem 1.35rem; }
     .empty { color:var(--muted); padding:1rem 0.7rem; font-size:0.85rem; }
     .rail-foot { padding:0.45rem 0.55rem 0.6rem; }
@@ -501,7 +535,8 @@
     const $ = (id) => document.getElementById(id);
     const LS = {
       jwt: "orbweaver.jwt", sid: "orbweaver.sid", wuri: "orbweaver.wuri",
-      wkind: "orbweaver.wkind", collapsed: "orbweaver.collapsedWs", expanded: "orbweaver.expandedWs"
+      wkind: "orbweaver.wkind", collapsed: "orbweaver.collapsedWs", expanded: "orbweaver.expandedWs",
+      done: "orbweaver.doneSids", seen: "orbweaver.seenAt", pollMs: "orbweaver.pollMs"
     };
     let sessions = [];
     // One live turn per session. A turn in chat A must not block sending in chat B.
@@ -516,6 +551,7 @@
     }
     function clearFlight(sid, flight) {
       if (sid && flights.get(sid) === flight) flights.delete(sid);
+      noteFlightChange();
     }
     let logSid = "";
     let historyGen = 0;
@@ -524,6 +560,117 @@
     const followupQueues = new Map();
     let collapsed = new Set(JSON.parse(localStorage.getItem(LS.collapsed) || "[]"));
     let expandedExtra = new Set(JSON.parse(localStorage.getItem(LS.expanded) || "[]"));
+
+    // Rail activity. `runningSids` is what the rail animates: the union of this
+    // tab's flights and the gateway's view (`running` on /v1/sessions), so a
+    // turn started from Telegram or another tab spins here too. When a running
+    // chat you are not looking at goes idle it lands in `doneSids` and stays
+    // highlighted until you click it.
+    //
+    // A running→idle transition is not enough on its own: if the tab was hidden
+    // or closed for the whole turn, no poll ever saw it running. `seenAt` is the
+    // watermark (last_event_at at the moment you were last looking at the chat),
+    // so new events in a chat you are not on also light it up.
+    let gatewayRunning = new Set();
+    let runningSids = new Set();
+    let doneSids = new Set(JSON.parse(localStorage.getItem(LS.done) || "[]"));
+    let seenAt = new Map(JSON.parse(localStorage.getItem(LS.seen) || "[]"));
+    function persistDone() {
+      try { localStorage.setItem(LS.done, JSON.stringify([...doneSids])); } catch (e) {}
+    }
+    function persistSeen() {
+      try { localStorage.setItem(LS.seen, JSON.stringify([...seenAt])); } catch (e) {}
+    }
+    // Mark this chat read: drop its highlight and move the watermark forward.
+    function markSeen(sid) {
+      if (!sid) return false;
+      const row = sessions.find((s) => s.id === sid);
+      const stamp = row ? String(row.last_event_at || row.created_at || "") : "";
+      if (seenAt.get(sid) !== stamp) { seenAt.set(sid, stamp); persistSeen(); }
+      return clearDone(sid);
+    }
+    function clearDone(sid) {
+      if (!sid || !doneSids.has(sid)) return false;
+      doneSids.delete(sid);
+      persistDone();
+      return true;
+    }
+    // Recompute running/done from `gatewayRunning` plus this tab's flights.
+    // Returns true when anything moved, so callers can repaint the rail.
+    function trackActivity() {
+      const live = new Set(gatewayRunning);
+      for (const sid of flights.keys()) live.add(sid);
+      let changed = false;
+      for (const sid of runningSids) {
+        if (live.has(sid)) continue;
+        // A turn that finished in the chat you are watching needs no bell.
+        if (sid !== currentSid()) {
+          doneSids.add(sid);
+          persistDone();
+        }
+        changed = true;
+      }
+      for (const sid of live) {
+        if (!runningSids.has(sid)) changed = true;
+        if (doneSids.delete(sid)) { persistDone(); changed = true; }
+      }
+      runningSids = live;
+      return changed;
+    }
+    // New events in a chat you have opened before but are not on now.
+    // Sessions with no watermark are skipped so a fresh browser does not
+    // light up every chat in the rail.
+    function trackUnseen() {
+      let changed = false;
+      for (const s of sessions) {
+        const stamp = String(s.last_event_at || s.created_at || "");
+        if (s.id === currentSid()) {
+          if (seenAt.get(s.id) !== stamp) { seenAt.set(s.id, stamp); persistSeen(); }
+          continue;
+        }
+        const seen = seenAt.get(s.id);
+        if (seen === undefined || runningSids.has(s.id)) continue;
+        if (stamp && stamp > seen && !doneSids.has(s.id)) {
+          doneSids.add(s.id);
+          persistDone();
+          changed = true;
+        }
+      }
+      return changed;
+    }
+    // The gateway's snapshot of live turns, from the latest /v1/sessions.
+    function setGatewayRunning(ids) {
+      gatewayRunning = new Set(ids);
+      const moved = trackActivity();
+      return trackUnseen() || moved;
+    }
+    // Drop done marks and watermarks for sessions the gateway no longer lists,
+    // so a deleted chat cannot keep a highlight in localStorage forever.
+    function pruneDone(known) {
+      const live = new Set(known);
+      let changed = false;
+      for (const sid of [...doneSids]) {
+        if (live.has(sid)) continue;
+        doneSids.delete(sid);
+        changed = true;
+      }
+      if (changed) persistDone();
+      let seenChanged = false;
+      for (const sid of [...seenAt.keys()]) {
+        if (live.has(sid)) continue;
+        seenAt.delete(sid);
+        seenChanged = true;
+      }
+      if (seenChanged) persistSeen();
+    }
+    // A turn this tab starts or finishes: reflect it without waiting for a poll.
+    function noteFlightChange() {
+      if (trackActivity()) paintActivity();
+    }
+    function setFlight(sid, flight) {
+      flights.set(sid, flight);
+      noteFlightChange();
+    }
     $("base").value = location.origin;
     // Model picker (#137). "" = the channel default (ORBWEAVER_WEB_MODEL, else
     // ORBWEAVER_MODEL); anything else is stored on the session by the gateway.
@@ -1612,6 +1759,7 @@
     function setActive(session, opts={}) {
       $("sid").value = session.id;
       persistSid();
+      markSeen(session.id);
       $("wuri").value = session.workspace_uri || $("wuri").value;
       $("wkind").value = session.workspace_kind || $("wkind").value;
       persistWorkspace();
@@ -1663,9 +1811,12 @@
         headBtn.style.flex = "1";
         headBtn.innerHTML =
           '<span class="chev">' + (isCollapsed ? "▸" : "▾") + "</span>" +
-          '<span class="ws-name"></span><span class="ws-kind"></span>';
+          '<span class="ws-name"></span>' +
+          '<span class="ws-activity"><span class="run"></span><span class="fin"></span></span>' +
+          '<span class="ws-kind"></span>';
         headBtn.querySelector(".ws-name").textContent = wsLabel(first.workspace_uri);
         headBtn.querySelector(".ws-kind").textContent = first.workspace_kind || "";
+        headBtn.dataset.wsSids = items.map((s) => s.id).join(",");
         headBtn.onclick = () => {
           if (collapsed.has(key)) collapsed.delete(key);
           else collapsed.add(key);
@@ -1701,21 +1852,76 @@
         }
         root.appendChild(wrap);
       }
+      paintActivity();
+    }
+
+    // The running spinner / done highlight for one rail row. Split out of
+    // chatButton so paintActivity can restyle rows in place: a full
+    // paintSessions() on every turn boundary would drop the search box's
+    // scroll position and fight the rename dblclick.
+    function paintChatState(b, sid) {
+      const running = runningSids.has(sid);
+      const done = !running && doneSids.has(sid);
+      b.classList.toggle("running", running);
+      b.classList.toggle("done", done);
+      b.title = running
+        ? "Working…"
+        : done
+          ? "Finished — click to open"
+          : "Double-click to rename";
+      const time = b.querySelector(".chat-time");
+      if (!time) return;
+      if (running) time.textContent = "…";
+      else {
+        const row = sessions.find((s) => s.id === sid);
+        time.textContent = row ? timeAgo(row.last_event_at || row.created_at) : "";
+      }
+    }
+    function paintActivity() {
+      const root = $("session-list");
+      const shown = new Set();
+      root.querySelectorAll("button.chat[data-sid]").forEach((b) => {
+        shown.add(b.dataset.sid);
+        paintChatState(b, b.dataset.sid);
+      });
+      // Roll up whatever the group is hiding: collapsed, or past "More".
+      root.querySelectorAll("button.ws-head[data-ws-sids]").forEach((head) => {
+        const sids = (head.dataset.wsSids || "").split(",").filter(Boolean);
+        const hidden = sids.filter((sid) => !shown.has(sid));
+        const running = hidden.filter((sid) => runningSids.has(sid)).length;
+        const finished = hidden.filter((sid) => !runningSids.has(sid) && doneSids.has(sid)).length;
+        const box = head.querySelector(".ws-activity");
+        if (!box) return;
+        box.classList.toggle("on", running > 0 || finished > 0);
+        const run = box.querySelector(".run");
+        const fin = box.querySelector(".fin");
+        run.textContent = running ? String(running) : "";
+        run.classList.toggle("off", !running);
+        fin.textContent = finished ? String(finished) : "";
+        fin.classList.toggle("off", !finished);
+        const bits = [];
+        if (running) bits.push(running + " working");
+        if (finished) bits.push(finished + " finished");
+        box.title = bits.join(", ");
+      });
     }
 
     function chatButton(s) {
       const b = document.createElement("button");
       b.type = "button";
       b.className = "chat" + (s.id === currentSid() ? " active" : "");
-      b.title = "Double-click to rename";
+      b.dataset.sid = s.id;
+      const state = document.createElement("span");
+      state.className = "chat-state";
+      state.innerHTML = '<span class="spin"></span><span class="bell"></span>';
       const title = document.createElement("span");
       title.className = "chat-title";
       title.textContent = s.title || "New chat";
       const time = document.createElement("span");
       time.className = "chat-time";
-      time.textContent = timeAgo(s.last_event_at || s.created_at);
-      b.append(title, time);
-      b.onclick = () => setActive(s);
+      b.append(state, title, time);
+      paintChatState(b, s.id);
+      b.onclick = () => { markSeen(s.id); setActive(s); };
       b.ondblclick = async (e) => {
         e.preventDefault();
         const next = prompt("Rename chat", s.title || "");
@@ -1810,6 +2016,8 @@
       try {
         const r = await api("/v1/sessions");
         sessions = r.sessions || [];
+        setGatewayRunning(sessions.filter((s) => s.running).map((s) => s.id));
+        pruneDone(sessions.map((s) => s.id));
         paintConnection(true);
         const cur = currentSession();
         if (cur) setChatTitle(cur.title);
@@ -1821,6 +2029,30 @@
         paintSessions();
       }
     }
+
+    // Turns started outside this tab (Telegram, cron, a second browser) only
+    // show up on the next /v1/sessions read, so poll the rail while the page is
+    // visible. Faster while something is running, so the spinner stops and the
+    // done highlight appears promptly. `orbweaver.pollMs` in localStorage
+    // overrides the idle cadence (the e2e suite drives it fast).
+    const ACTIVITY_POLL_IDLE_MS = Number(localStorage.getItem(LS.pollMs)) || 8000;
+    const ACTIVITY_POLL_BUSY_MS = Math.min(3000, ACTIVITY_POLL_IDLE_MS);
+    let activityTimer = null;
+    function startActivityPoll() {
+      if (activityTimer) clearTimeout(activityTimer);
+      const tick = async () => {
+        activityTimer = null;
+        if (document.visibilityState !== "hidden" && $("token").value.trim()) {
+          try { await refreshSessions(); } catch (e) {}
+        }
+        const busy = runningSids.size > 0;
+        activityTimer = setTimeout(tick, busy ? ACTIVITY_POLL_BUSY_MS : ACTIVITY_POLL_IDLE_MS);
+      };
+      activityTimer = setTimeout(tick, ACTIVITY_POLL_BUSY_MS);
+    }
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") startActivityPoll();
+    });
 
     async function loadHistory() {
       const sid = currentSid();
@@ -2256,7 +2488,7 @@
       let resolveDone;
       const done = new Promise((r) => { resolveDone = r; });
       const flight = { sid, text: "", userEl: null, workingEl, done };
-      flights.set(sid, flight);
+      setFlight(sid, flight);
       syncComposer();
       $("status").textContent = "working…";
       let turnStatus = null;
@@ -2315,7 +2547,7 @@
       let resolveDone;
       const done = new Promise((r) => { resolveDone = r; });
       const flight = { sid, text, userEl, workingEl, done };
-      flights.set(sid, flight);
+      setFlight(sid, flight);
       syncComposer();
       $("status").textContent = "working…";
       const turnPayload = { text };
@@ -2424,8 +2656,11 @@
       if (!currentSid() && sessions.length) {
         setActive(sessions[0], { skipHistory: true });
       }
+      // The chat we open on is being looked at, so it is not "finished, unseen".
+      if (markSeen(currentSid())) paintActivity();
       await loadHistory();
       syncComposer();
+      startActivityPoll();
     })();
   </script>
 </body>

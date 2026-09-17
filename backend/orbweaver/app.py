@@ -770,6 +770,9 @@ async def list_sessions(_u: dict = Depends(_user)) -> dict[str, Any]:
                 "last_event_at": last_at,
                 "event_count": len(events),
                 "preview": preview[:80],
+                # The rail animates a spinner on chats with a live turn, including
+                # ones this browser did not start (Telegram, cron, another tab).
+                "running": turn_is_running(ent.id),
             }
         )
     out.sort(key=lambda s: s["last_event_at"] or s["created_at"] or "", reverse=True)
