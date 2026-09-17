@@ -415,12 +415,53 @@ def unpaired_tool_use_ids(messages: list[dict[str, Any]]) -> list[str]:
     return missing
 
 
+def _is_orphan_result(block: Any, uses: set[str]) -> bool:
+    return (
+        isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and str(block.get("tool_use_id")) not in uses
+    )
+
+
+def drop_orphan_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove tool_result blocks with no matching tool_use in the message before them.
+
+    Anthropic rejects those as hard as it rejects the reverse
+    (``unexpected tool_use_id found in tool_result blocks``). A result is orphaned
+    when its tool_use was already paired off by the time the result was recorded,
+    so stubbing another result cannot fix it; the block has to go. Messages left
+    with no blocks are dropped so the next message is judged against what the API
+    will actually see.
+    """
+    out: list[dict[str, Any]] = []
+    dropped: list[str] = []
+    for msg in messages:
+        content = msg.get("content")
+        if msg.get("role") != "user" or not isinstance(content, list):
+            out.append(msg)
+            continue
+        uses = {str(b["id"]) for b in _tool_use_blocks(out[-1] if out else None)}
+        orphans = [b for b in content if _is_orphan_result(b, uses)]
+        if not orphans:
+            out.append(msg)
+            continue
+        dropped.extend(str(b.get("tool_use_id")) for b in orphans)
+        kept = [b for b in content if not _is_orphan_result(b, uses)]
+        if kept:
+            out.append({**msg, "content": kept})
+    if dropped:
+        log.warning("dropping tool_result with no matching tool_use: %s", dropped)
+    return out
+
+
 def ensure_tool_use_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Guarantee each assistant tool_use is followed by matching tool_result blocks.
 
     Anthropic rejects a messages.create where a tool_use has no tool_result in the
     immediately following user message. Stub missing results rather than send that.
+    Orphaned results go first, so a use whose result was just dropped still gets a stub.
     """
+    messages = drop_orphan_tool_results(messages)
     out: list[dict[str, Any]] = []
     i = 0
     n = len(messages)
@@ -474,14 +515,34 @@ def _with_injection_warning(content: Any) -> Any:
     return content
 
 
+def _answers_pending_ask(pending_tool: list[dict[str, Any]], resolved: set[str]) -> bool:
+    """True when an open AskUser call already has its own tool_result later in the list."""
+    return any(
+        b.get("name") == "AskUser" and str(b.get("id")) in resolved for b in pending_tool
+    )
+
+
 def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     pending_tool: list[dict[str, Any]] = []
     flagged = flagged_tool_use_ids(events)
+    resolved = {
+        str((ev.payload or {}).get("tool_use_id"))
+        for ev in events
+        if ev.kind in {"tool_result", "MemoryRecall"} and (ev.payload or {}).get("tool_use_id")
+    }
     for ev in events:
         k = ev.kind
         p = ev.payload
         if k == "user":
+            if p.get("ask_answer") and _answers_pending_ask(pending_tool, resolved):
+                # An AskUser answer is stored twice: as this user event and as the
+                # tool_result that follows. Flushing here would pair the tool_use
+                # with an "interrupted" stub and orphan the real result, so let the
+                # result carry the answer. Images have no tool_result home.
+                if p.get("images"):
+                    _append_user_content(messages, user_image_blocks(p.get("images") or []))
+                continue
             _flush_pending_tools(messages, pending_tool, stub_results=True)
             _append_user_content(messages, _user_message_content(p))
         elif k == "assistant":

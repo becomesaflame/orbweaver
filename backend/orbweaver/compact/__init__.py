@@ -13,6 +13,7 @@ from orbweaver.compact.pipeline import maybe_compact
 from orbweaver.compact.project import (
     PROJECT_INSTRUCTIONS_KIND,
     choose_keep_from_recent_rounds,
+    drop_orphan_tool_results,
     ensure_tool_use_results,
     events_to_messages,
     live_events,
@@ -41,6 +42,7 @@ __all__ = [
     "ContextFullError",
     "ProbeStats",
     "choose_keep_from_recent_rounds",
+    "drop_orphan_tool_results",
     "ensure_tool_use_results",
     "estimate_prompt_tokens",
     "event_token_count",

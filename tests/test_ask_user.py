@@ -15,10 +15,53 @@ from orbweaver.agent import (
 )
 from orbweaver.app import app
 from orbweaver.channels.telegram import texts_for_reply
+from orbweaver.compact.project import (
+    INTERRUPTED_TOOL,
+    events_to_messages,
+    unpaired_tool_use_ids,
+)
 from orbweaver.config import settings
 from orbweaver.permissions.pipeline import TurnAborted
 from orbweaver.store import Event, reset_store_for_tests
 from orbweaver.workspace import LocalWorkspace
+
+
+def orphan_tool_results(messages: list[dict]) -> list[str]:
+    """tool_use_ids Anthropic would reject: a tool_result with no tool_use before it.
+
+    Mirrors ``unexpected tool_use_id found in tool_result blocks: ...``.
+    """
+    orphans: list[str] = []
+    for i, msg in enumerate(messages):
+        content = msg.get("content")
+        if msg.get("role") != "user" or not isinstance(content, list):
+            continue
+        prev = messages[i - 1] if i else None
+        uses: set[str] = set()
+        if prev and prev.get("role") == "assistant" and isinstance(prev.get("content"), list):
+            uses = {
+                str(b.get("id"))
+                for b in prev["content"]
+                if isinstance(b, dict) and b.get("type") == "tool_use"
+            }
+        orphans += [
+            str(b.get("tool_use_id"))
+            for b in content
+            if isinstance(b, dict)
+            and b.get("type") == "tool_result"
+            and str(b.get("tool_use_id")) not in uses
+        ]
+    return orphans
+
+
+def _tool_results(messages: list[dict]) -> list[dict]:
+    return [
+        b
+        for m in messages
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    ]
 
 
 class _ToolUse:
@@ -277,6 +320,257 @@ async def test_telegram_run_turn_marks_interactive(monkeypatch):
     assert seen.get("interactive") is True
     assert seen.get("headless") is True
     update.message.reply_text.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ask_user_answer_does_not_orphan_its_tool_result(tmp_path, monkeypatch):
+    """Production 400 on session b3985a44: the answer was sent twice.
+
+    The answer is stored as a ``user`` event *and* as the AskUser ``tool_result``.
+    Projecting both paired the tool_use with an "interrupted" stub and left the real
+    result with no tool_use in the message before it, which Anthropic rejects with
+    ``unexpected tool_use_id found in tool_result blocks``.
+    """
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    ask = SimpleNamespace(
+        content=[_ToolUse("AskUser", {"question": "Which branch?"}, uid="toolu_ask")]
+    )
+    client = _RecordingAnthropic([ask])
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", lambda *a, **k: client)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = _ws(tmp_path)
+
+    await agent_turn(store, sid, "need a name", ws)
+    client._responses.append(
+        SimpleNamespace(content=[SimpleNamespace(type="text", text="using feature/x")])
+    )
+    await agent_turn(store, sid, "feature/x", ws)
+
+    sent = client.calls[-1]["messages"]
+    assert orphan_tool_results(sent) == []
+    assert unpaired_tool_use_ids(sent) == []
+    # The answer still reaches the model, once, as the AskUser result.
+    answers = [b for b in _tool_results(sent) if b["tool_use_id"] == "toolu_ask"]
+    assert [b["content"] for b in answers] == ["feature/x"]
+    assert INTERRUPTED_TOOL not in str(sent)
+
+
+def test_ask_answer_events_project_without_orphan_result():
+    """Event shape recorded in production: tool_call, ask_user, user(ask_answer), tool_result."""
+    sid = uuid4()
+
+    def ev(seq: int, kind: str, payload: dict) -> Event:
+        return Event(id=uuid4(), session_id=sid, seq=seq, kind=kind, payload=payload)
+
+    events = [
+        ev(1, "user", {"text": "sort out gh auth"}),
+        ev(2, "assistant", {"text": "No stored credentials anywhere I can find."}),
+        ev(3, "tool_call", {"id": "toolu_ask", "name": "AskUser", "input": {"question": "Token?"}}),
+        ev(4, "permission_decision", {"name": "AskUser", "behavior": "allow", "tool_use_id": "toolu_ask"}),
+        ev(5, "ask_user", {"question": "Token?", "tool_use_id": "toolu_ask", "name": "AskUser"}),
+        ev(6, "user", {"text": "drop it, I'll fix gh myself", "ask_answer": True}),
+        ev(7, "tool_result", {"tool_use_id": "toolu_ask", "name": "AskUser", "content": "drop it, I'll fix gh myself"}),
+        ev(8, "user", {"text": "did the gh auth issue get resolved?"}),
+    ]
+    messages = events_to_messages(events)
+    assert orphan_tool_results(messages) == []
+    assert unpaired_tool_use_ids(messages) == []
+    answers = [b for b in _tool_results(messages) if b["tool_use_id"] == "toolu_ask"]
+    assert [b["content"] for b in answers] == ["drop it, I'll fix gh myself"]
+    assert INTERRUPTED_TOOL not in str(messages)
+    # The follow-up question after the answer is still there.
+    assert "did the gh auth issue get resolved?" in str(messages)
+
+
+def test_ask_answer_with_image_keeps_the_image_and_pairs_the_result():
+    sid = uuid4()
+
+    def ev(seq: int, kind: str, payload: dict) -> Event:
+        return Event(id=uuid4(), session_id=sid, seq=seq, kind=kind, payload=payload)
+
+    events = [
+        ev(1, "tool_call", {"id": "toolu_ask", "name": "AskUser", "input": {"question": "Which one?"}}),
+        ev(2, "ask_user", {"question": "Which one?", "tool_use_id": "toolu_ask", "name": "AskUser"}),
+        ev(
+            3,
+            "user",
+            {
+                "text": "this one",
+                "ask_answer": True,
+                "images": [{"media_type": "image/png", "path": "shot.png"}],
+            },
+        ),
+        ev(4, "tool_result", {"tool_use_id": "toolu_ask", "name": "AskUser", "content": "this one"}),
+    ]
+    messages = events_to_messages(events)
+    assert orphan_tool_results(messages) == []
+    assert unpaired_tool_use_ids(messages) == []
+    assert any(
+        isinstance(b, dict) and b.get("type") == "image"
+        for m in messages
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_askuser_requires_a_question(tmp_path):
+    store = reset_store_for_tests()
+    ctx = {"workspace": _ws(tmp_path), "store": store, "session_id": uuid4()}
+    for inp in ({}, {"question": ""}, {"question": "   "}):
+        assert await run_tools("AskUser", inp, ctx) == "error: question is required"
+
+
+def test_pending_ask_user_returns_the_latest_unanswered():
+    sid = uuid4()
+
+    def ev(seq: int, kind: str, payload: dict) -> Event:
+        return Event(id=uuid4(), session_id=sid, seq=seq, kind=kind, payload=payload)
+
+    first = ev(1, "tool_call", {"id": "toolu_1", "name": "AskUser", "input": {"question": "A?"}})
+    answer = ev(2, "tool_result", {"tool_use_id": "toolu_1", "name": "AskUser", "content": "a"})
+    second = ev(3, "tool_call", {"id": "toolu_2", "name": "AskUser", "input": {"question": "B?"}})
+    assert pending_ask_user([first, answer, second]) is second
+    other = ev(4, "tool_call", {"id": "toolu_3", "name": "Read", "input": {"path": "a.py"}})
+    assert pending_ask_user([first, answer, second, other]) is second
+
+
+@pytest.mark.asyncio
+async def test_resume_with_pending_ask_and_no_text_records_nothing(tmp_path, monkeypatch):
+    """A reconnect must not re-run the turn or append a second user event."""
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    ask = SimpleNamespace(content=[_ToolUse("AskUser", {"question": "Which branch?"})])
+    client = _RecordingAnthropic([ask])
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", lambda *a, **k: client)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = _ws(tmp_path)
+
+    await agent_turn(store, sid, "need a name", ws)
+    before = await store.list_events(sid)
+    calls = len(client.calls)
+
+    assert await agent_turn(store, sid, "", ws, resume=True) == []
+    assert [e.id for e in await store.list_events(sid)] == [e.id for e in before]
+    assert len(client.calls) == calls
+
+
+@pytest.mark.asyncio
+async def test_askuser_beside_another_tool_pauses_and_both_results_pair(tmp_path, monkeypatch):
+    """AskUser is never concurrency-safe, so it gets its own batch and still pauses.
+
+    The Read in the same round runs first, so answering has to pair two results
+    against one assistant message.
+    """
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    (tmp_path / "a.py").write_text("print(1)\n", encoding="utf-8")
+    round_one = SimpleNamespace(
+        content=[
+            _ToolUse("Read", {"path": "a.py"}, uid="toolu_read"),
+            _ToolUse("AskUser", {"question": "Rename it?"}, uid="toolu_ask"),
+        ]
+    )
+    client = _RecordingAnthropic([round_one])
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", lambda *a, **k: client)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = _ws(tmp_path)
+
+    paused = await agent_turn(store, sid, "look at a.py", ws)
+    results = [e for e in paused if e.kind == "tool_result"]
+    assert [e.payload["tool_use_id"] for e in results] == ["toolu_read"]
+    assert any(e.kind == "ask_user" for e in paused)
+
+    client._responses.append(
+        SimpleNamespace(content=[SimpleNamespace(type="text", text="left as is")])
+    )
+    await agent_turn(store, sid, "no, leave it", ws)
+    sent = client.calls[-1]["messages"]
+    assert orphan_tool_results(sent) == []
+    assert unpaired_tool_use_ids(sent) == []
+    paired = {b["tool_use_id"] for b in _tool_results(sent)}
+    assert {"toolu_read", "toolu_ask"} <= paired
+    assert INTERRUPTED_TOOL not in str(sent)
+
+
+@pytest.mark.asyncio
+async def test_two_asks_in_a_row_stay_paired(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    client = _RecordingAnthropic(
+        [SimpleNamespace(content=[_ToolUse("AskUser", {"question": "First?"}, uid="toolu_a1")])]
+    )
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", lambda *a, **k: client)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    ws = _ws(tmp_path)
+
+    await agent_turn(store, sid, "start", ws)
+    client._responses.append(
+        SimpleNamespace(content=[_ToolUse("AskUser", {"question": "Second?"}, uid="toolu_a2")])
+    )
+    await agent_turn(store, sid, "answer one", ws)
+    assert pending_ask_user(await store.list_events(sid)) is not None
+
+    client._responses.append(
+        SimpleNamespace(content=[SimpleNamespace(type="text", text="all set")])
+    )
+    await agent_turn(store, sid, "answer two", ws)
+
+    sent = client.calls[-1]["messages"]
+    assert orphan_tool_results(sent) == []
+    assert unpaired_tool_use_ids(sent) == []
+    answers = {b["tool_use_id"]: b["content"] for b in _tool_results(sent)}
+    assert answers["toolu_a1"] == "answer one"
+    assert answers["toolu_a2"] == "answer two"
+    assert pending_ask_user(await store.list_events(sid)) is None
+
+
+def test_unanswered_ask_is_stubbed_when_the_next_message_is_not_an_answer():
+    """Gateway restart between the user event and the tool_result loses the result.
+
+    The tool_use still has to be paired, so it gets the interrupted stub.
+    """
+    sid = uuid4()
+
+    def ev(seq: int, kind: str, payload: dict) -> Event:
+        return Event(id=uuid4(), session_id=sid, seq=seq, kind=kind, payload=payload)
+
+    events = [
+        ev(1, "tool_call", {"id": "toolu_ask", "name": "AskUser", "input": {"question": "Token?"}}),
+        ev(2, "ask_user", {"question": "Token?", "tool_use_id": "toolu_ask", "name": "AskUser"}),
+        ev(3, "user", {"text": "never mind, different topic"}),
+    ]
+    messages = events_to_messages(events)
+    assert orphan_tool_results(messages) == []
+    assert unpaired_tool_use_ids(messages) == []
+    stub = [b for b in _tool_results(messages) if b["tool_use_id"] == "toolu_ask"]
+    assert stub and stub[0]["content"] == INTERRUPTED_TOOL
+    assert stub[0].get("is_error") is True
+
+
+def test_ask_group_split_by_a_compact_boundary_still_projects_valid():
+    """A boundary that keeps the answer but drops the tool_call must not send an orphan."""
+    from orbweaver.compact.project import prompt_events
+
+    sid = uuid4()
+
+    def ev(seq: int, kind: str, payload: dict) -> Event:
+        return Event(id=uuid4(), session_id=sid, seq=seq, kind=kind, payload=payload)
+
+    events = [
+        ev(1, "user", {"text": "start"}),
+        ev(2, "tool_call", {"id": "toolu_ask", "name": "AskUser", "input": {"question": "Token?"}}),
+        ev(3, "ask_user", {"question": "Token?", "tool_use_id": "toolu_ask", "name": "AskUser"}),
+        ev(4, "user", {"text": "here it is", "ask_answer": True}),
+        # keep_from_seq lands after the tool_call, so only the result survives.
+        ev(5, "compact_boundary", {"text": "earlier turns", "keep_from_seq": 6}),
+        ev(6, "tool_result", {"tool_use_id": "toolu_ask", "name": "AskUser", "content": "here it is"}),
+        ev(7, "user", {"text": "carry on"}),
+    ]
+    messages = events_to_messages(prompt_events(events))
+    assert orphan_tool_results(messages) == []
+    assert unpaired_tool_use_ids(messages) == []
 
 
 def test_ask_user_abort_message_is_specific():
