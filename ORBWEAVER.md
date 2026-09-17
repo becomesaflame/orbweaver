@@ -28,11 +28,15 @@ Work on a **feature branch**. Do not commit on `main`.
    the PR while it is draft.
 5. When the feature is ready: mark the PR ready and **enable auto-merge
    (squash)** (`gh pr merge --squash --auto`). GitHub merges when `test`
-   is green. Do not click Merge yourself. Never force-push. Never rewrite
-   history. Never push `main`.
+   is green. Do not click Merge yourself. Never push, force-push, or rewrite
+   `main`.
 
 Do not `git push origin HEAD:main` from a feature branch. The auto-merged
 squash is what updates production.
+
+Your own feature branch is yours: rebase it and `git push --force-with-lease`
+freely. Prefer that over merging `main` back in, especially for the version
+bump — see Versioning. Leave branches you do not own alone.
 
 ## CI pipeline
 
@@ -85,6 +89,16 @@ Do not ship two merges with the same version. Do not bump on the live clone.
 The agent prompt version is not this working copy until production has
 deployed.
 
+Another PR landing first takes the number you bumped to and puts yours behind
+`main`. Rebase and re-bump rather than merging `main` into the branch, so the
+branch keeps one version-bump commit instead of accumulating merge commits
+that resolve the same line twice:
+
+```bash
+git fetch origin && git rebase origin/main   # resolve __init__.py to a number above main
+git push --force-with-lease
+```
+
 Do **not** put the version in the PR title (or the squash-merge commit title
 template). Parallel PRs each bump against the same `origin/main` base, so the
 number in the title goes stale as soon as another PR merges first. The
@@ -94,9 +108,10 @@ only if needed after rebasing onto current `main`.
 ## Trust and permissions
 
 Pushing the feature branch, opening a PR into `main`, and enabling squash
-auto-merge is allowed when the user asked to land or ship the work. Pushing
-`main`, force-push, history rewrite, editing systemd, and restarting the
-gateway are not.
+auto-merge is allowed when the user asked to land or ship the work. Rebasing
+and force-pushing **your own** feature branch is allowed too. Pushing,
+force-pushing, or rewriting `main`, force-pushing a branch you do not own,
+editing systemd, and restarting the gateway are not.
 
 Sandboxed Bash may read host files (including `/var/log`). The system journal
 socket and this uid's user journal socket are granted by default, so
