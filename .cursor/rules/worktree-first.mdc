@@ -26,6 +26,23 @@ the shell's own cwd still starts at the original checkout.
 Read-only work — answering questions, reading code, inspecting logs — needs no
 worktree.
 
+## Tear it down once the PR merges
+
+A worktree is scratch space for one task, not a place to keep work. As soon as
+auto-merge lands your PR, remove the worktree and both copies of the branch
+from outside the worktree:
+
+```bash
+cd <original checkout>
+git worktree remove ../orbweaver-worktrees/<slug>
+git branch -D <topic>                  # -d refuses: squash-merge leaves no merge ancestry
+git push origin --delete <topic>       # this repo does not delete branches on merge
+```
+
+Confirm the PR is `MERGED` first (`gh pr view <n> --json state`); an abandoned
+or still-open PR's worktree stays until you or the user decides. Report it
+instead of deleting unmerged work.
+
 ## Do not
 
 - Clone the repo, or switch the agent's workspace root, to get isolation.
