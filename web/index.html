@@ -435,6 +435,8 @@
     };
     let sessions = [];
     let inFlight = null;
+    let logSid = "";
+    let historyGen = 0;
     let stoppedSids = new Set();
     let waitingAskSids = new Set();
     const followupQueues = new Map();
@@ -528,7 +530,10 @@
     const savedWkind = localStorage.getItem(LS.wkind);
     if (savedWkind && savedWkind !== "docker") $("wkind").value = savedWkind;
     else $("wkind").value = "local";
-    const hashSid = (location.hash.match(/^#\/s\/([0-9a-f-]{36})$/i) || [])[1];
+    function sidFromHash() {
+      return (location.hash.match(/^#\/s\/([0-9a-f-]{36})$/i) || [])[1] || "";
+    }
+    const hashSid = sidFromHash();
     if (hashSid) $("sid").value = hashSid;
     if (!$("token").value.trim()) $("settings").classList.remove("hidden");
 
@@ -646,6 +651,7 @@
       subagentCards.clear();
       askBlocks.clear();
       _renderTarget = null;
+      logSid = "";
       setTodos([]);
     }
     function copyText(text, btn) {
@@ -1683,6 +1689,7 @@
 
     async function loadHistory() {
       const sid = currentSid();
+      const gen = ++historyGen;
       if (!sid) {
         $("status").textContent = "disconnected";
         resetLog();
@@ -1696,8 +1703,17 @@
       }
       try {
         const r = await api("/v1/sessions/" + sid + "/events");
-        if (inFlight && inFlight.sid === sid) { syncComposer(); return; }
+        if (gen !== historyGen || currentSid() !== sid) return;
+        // Skip a rebuild only when this session's log is already on screen and a
+        // live turn is appending to it. Switching back from another chat must
+        // still replace the transcript — otherwise the rail/title update and
+        // the messages stay on the previous session.
+        if (inFlight && inFlight.sid === sid && logSid === sid) {
+          syncComposer();
+          return;
+        }
         resetLog();
+        logSid = sid;
         _resetAutoscroll();
         const evs = r.events || [];
         stoppedSids.delete(sid);
@@ -1714,12 +1730,30 @@
             if (last && last.kind !== "assistant") stoppedSids.add(sid);
           }
         }
+        if (inFlight && inFlight.sid === sid) {
+          if (inFlight.workingEl && !inFlight.workingEl.isConnected) {
+            inFlight.workingEl = addWorking();
+          }
+        }
         $("status").textContent = "";
         syncComposer();
         const cur = currentSession();
         if (cur) $("chat-title").textContent = cur.title || "New chat";
-      } catch (e) { $("status").textContent = String(e); }
+      } catch (e) {
+        if (gen !== historyGen || currentSid() !== sid) return;
+        $("status").textContent = String(e);
+      }
     }
+    window.addEventListener("hashchange", () => {
+      const next = sidFromHash();
+      if (!next || next === currentSid()) return;
+      const s = sessions.find((x) => x.id === next);
+      if (s) { setActive(s); return; }
+      $("sid").value = next;
+      persistSid();
+      $("chat-title").textContent = "Chat";
+      loadHistory();
+    });
 
     async function createSession(uri, kind) {
       if (!$("token").value.trim()) {
@@ -1750,6 +1784,7 @@
       };
       sessions = [session, ...sessions.filter((s) => s.id !== session.id)];
       resetLog();
+      logSid = session.id;
       $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
       _resetAutoscroll();
       setActive(session, { skipHistory: true });

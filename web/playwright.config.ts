@@ -1,6 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const baseURL = process.env.ORBWEAVER_BASE_URL || "http://127.0.0.1:8080";
+// Keep off :8080 so a local run cannot reuse the production gateway on this host.
+const port = Number(process.env.ORBWEAVER_E2E_PORT || 18080);
+const baseURL = process.env.ORBWEAVER_BASE_URL || `http://127.0.0.1:${port}`;
 
 export default defineConfig({
   testDir: "./e2e",
@@ -18,7 +20,7 @@ export default defineConfig({
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: {
-    command: "python -m uvicorn orbweaver.app:app --host 127.0.0.1 --port 8080",
+    command: `python -m uvicorn orbweaver.app:app --host 127.0.0.1 --port ${port}`,
     url: `${baseURL}/health`,
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,
