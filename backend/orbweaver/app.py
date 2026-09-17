@@ -800,7 +800,15 @@ async def patch_session(session_id: UUID, body: SessionPatch, _u: dict = Depends
 
 @app.get("/v1/sessions/{session_id}/events")
 async def list_events(session_id: UUID, _u: dict = Depends(_user)) -> dict[str, Any]:
+    from orbweaver.turnstate import session_turn_status
+
     events = await get_store().list_events(session_id)
+    # The client must not infer "stopped" from the last event's kind: trailing
+    # bookkeeping (subagent_result, todo_state) follows a finished turn and used
+    # to surface a stray Continue button. Classify it server-side instead.
+    # Named last_turn_state, not turn_status: the websocket already sends a
+    # "turn_status" frame carrying a boolean `running`, and these are different
+    # shapes.
     return {
         "events": [
             {
@@ -810,7 +818,10 @@ async def list_events(session_id: UUID, _u: dict = Depends(_user)) -> dict[str, 
                 "payload": e.payload,
             }
             for e in events
-        ]
+        ],
+        "last_turn_state": (
+            "running" if turn_is_running(session_id) else session_turn_status(events)
+        ),
     }
 
 
