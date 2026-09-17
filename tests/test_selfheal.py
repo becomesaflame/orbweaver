@@ -249,6 +249,67 @@ async def test_log_exception_enqueues():
 
 
 @pytest.mark.asyncio
+async def test_web_turn_api_status_error_enqueues(auth_header, monkeypatch):
+    """Web UI 502 from Anthropic 400 used to skip intake (WARNING in the LLM
+    client, then HTTPException without log.exception)."""
+    import anthropic
+    import httpx
+    from httpx import ASGITransport, AsyncClient
+
+    from orbweaver.app import app
+    from orbweaver.selfheal import attach_log_handler, bind_loop
+
+    store = reset_store_for_tests()
+    bind_loop(asyncio.get_running_loop())
+    attach_log_handler()
+
+    async def boom(*_a, **_k):
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(400, request=request)
+        raise anthropic.APIStatusError(
+            "This model does not support assistant message prefill.",
+            response=response,
+            body={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "This model does not support assistant message prefill.",
+                },
+            },
+        )
+
+    monkeypatch.setattr("orbweaver.app.agent_turn", boom)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        sess = await client.post(
+            "/v1/sessions",
+            json={"workspace_uri": "workspace:default", "workspace_kind": "local"},
+            headers=auth_header,
+        )
+        assert sess.status_code == 200, sess.text
+        sid = sess.json()["id"]
+        turned = await client.post(
+            f"/v1/sessions/{sid}/turns",
+            json={"text": "hello"},
+            headers=auth_header,
+        )
+        assert turned.status_code == 502, turned.text
+        assert "prefill" in turned.json()["detail"]
+
+    deadline = asyncio.get_running_loop().time() + 2
+    jobs: list = []
+    while asyncio.get_running_loop().time() < deadline:
+        jobs = await store.due_jobs(datetime.now(UTC) + timedelta(days=1))
+        if jobs:
+            break
+        await asyncio.sleep(0)
+    assert jobs
+    assert jobs[0].payload.get("selfheal") is True
+    assert "APIStatusError" in jobs[0].payload["fingerprint"]
+    assert "prefill" in jobs[0].payload["message"]
+
+
+@pytest.mark.asyncio
 async def test_cron_finish_updates_ledger(monkeypatch):
     from orbweaver.channels.cron import _run_job_turn
 
