@@ -129,6 +129,27 @@
       .chat.done .chat-state .bell { animation:none; }
     }
     .more { color:var(--muted); font-size:0.8rem; padding:0.2rem 0.45rem 0.35rem 1.35rem; }
+    /* Right-click menu for a chat row. Fixed-positioned at the pointer and
+       clamped to the viewport by positionContextMenu(). */
+    .ctx-menu {
+      position:fixed; z-index:60; min-width:9rem; padding:0.2rem;
+      background:var(--panel, #1a1a1f); border:1px solid var(--line);
+      border-radius:3px; box-shadow:0 6px 20px rgba(0,0,0,0.55);
+      display:flex; flex-direction:column; gap:0.05rem;
+    }
+    .ctx-menu.hidden { display:none; }
+    .ctx-menu button {
+      width:100%; text-align:left; padding:0.35rem 0.6rem; border-radius:2px;
+      color:#c8c8d0; font-size:0.85rem; background:none; border:none; cursor:pointer;
+    }
+    .ctx-menu button:hover, .ctx-menu button:focus { background:var(--active); color:var(--lcd-ink); outline:none; }
+    .ctx-menu button.danger { color:#f0a0a0; }
+    .ctx-menu button.danger:hover, .ctx-menu button.danger:focus { background:#4a1c1c; color:#ffd0d0; }
+    .ctx-menu .ctx-label {
+      padding:0.3rem 0.6rem 0.2rem; font-size:0.7rem; color:var(--muted);
+      overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:14rem;
+    }
+    .ctx-menu hr { border:none; border-top:1px solid var(--line); margin:0.15rem 0; }
     .empty { color:var(--muted); padding:1rem 0.7rem; font-size:0.85rem; }
     .rail-foot { padding:0.45rem 0.55rem 0.6rem; }
     .conn-toggle {
@@ -573,6 +594,12 @@
       </div>
       <div id="composer-hint" class="hidden"></div>
     </div>
+  </div>
+  <div id="chat-menu" class="ctx-menu hidden" role="menu" aria-hidden="true">
+    <div class="ctx-label" id="chat-menu-label"></div>
+    <button type="button" id="chat-menu-rename" role="menuitem">Rename</button>
+    <hr>
+    <button type="button" id="chat-menu-delete" class="danger" role="menuitem">Delete</button>
   </div>
   <!-- Vendored, pinned; see web/vendor/README.md. Served by the /ui static mount. -->
   <script src="/ui/vendor/marked.min.js"></script>
@@ -1985,16 +2012,92 @@
       b.onclick = () => { markSeen(s.id); setActive(s); };
       b.ondblclick = async (e) => {
         e.preventDefault();
-        const next = prompt("Rename chat", s.title || "");
-        if (next == null) return;
-        const title = next.trim();
-        if (!title) return;
-        try {
-          await renameSession(s.id, title);
-        } catch (err) { $("status").textContent = String(err); }
+        await promptRename(s.id);
+      };
+      b.oncontextmenu = (e) => {
+        e.preventDefault();
+        openChatMenu(s.id, e.clientX, e.clientY);
       };
       return b;
     }
+
+    // Right-click menu over a rail row. One menu element is reused for every
+    // row; openChatMenu() rebinds it to the session under the pointer.
+    let chatMenuSid = "";
+    function chatMenuOpen() { return !$("chat-menu").classList.contains("hidden"); }
+    function openChatMenu(sid, x, y) {
+      const row = sessions.find((s) => s.id === sid);
+      if (!row) return;
+      chatMenuSid = sid;
+      const menu = $("chat-menu");
+      $("chat-menu-label").textContent = row.title || "New chat";
+      menu.classList.remove("hidden");
+      menu.setAttribute("aria-hidden", "false");
+      positionChatMenu(x, y);
+      $("chat-menu-rename").focus();
+    }
+    function positionChatMenu(x, y) {
+      // Place at the pointer, then pull back inside the viewport so a row near
+      // the bottom or right edge does not open a menu that is half off-screen.
+      const menu = $("chat-menu");
+      menu.style.left = "0px";
+      menu.style.top = "0px";
+      const r = menu.getBoundingClientRect();
+      const left = Math.max(4, Math.min(x, window.innerWidth - r.width - 4));
+      const top = Math.max(4, Math.min(y, window.innerHeight - r.height - 4));
+      menu.style.left = left + "px";
+      menu.style.top = top + "px";
+    }
+    function closeChatMenu() {
+      if (!chatMenuOpen()) return;
+      chatMenuSid = "";
+      const menu = $("chat-menu");
+      menu.classList.add("hidden");
+      menu.setAttribute("aria-hidden", "true");
+    }
+    async function promptRename(sid) {
+      const row = sessions.find((s) => s.id === sid);
+      const next = prompt("Rename chat", (row && row.title) || "");
+      if (next == null) return;
+      const title = next.trim();
+      if (!title) return;
+      try {
+        await renameSession(sid, title);
+      } catch (err) { $("status").textContent = String(err); }
+    }
+    // Deleting is a soft delete on the gateway, but the confirm still matters:
+    // the chat leaves the rail and the UI offers no way back.
+    async function confirmDelete(sid) {
+      const row = sessions.find((s) => s.id === sid);
+      const name = (row && row.title) || "this chat";
+      if (!confirm("Delete \u201C" + name + "\u201D?\n\nIt disappears from the sidebar.")) return;
+      try {
+        await deleteSession(sid);
+      } catch (err) { $("status").textContent = String(err); }
+    }
+    $("chat-menu-rename").onclick = () => {
+      const sid = chatMenuSid;
+      closeChatMenu();
+      promptRename(sid);
+    };
+    $("chat-menu-delete").onclick = () => {
+      const sid = chatMenuSid;
+      closeChatMenu();
+      confirmDelete(sid);
+    };
+    // Any click outside, scroll, resize, or Escape dismisses the menu.
+    document.addEventListener("click", (e) => {
+      if (chatMenuOpen() && !$("chat-menu").contains(e.target)) closeChatMenu();
+    });
+    document.addEventListener("contextmenu", (e) => {
+      if (chatMenuOpen() && !e.target.closest(".chat")) closeChatMenu();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && chatMenuOpen()) { e.stopPropagation(); closeChatMenu(); }
+    });
+    window.addEventListener("resize", closeChatMenu);
+    window.addEventListener("blur", closeChatMenu);
+    $("session-list").addEventListener("scroll", closeChatMenu, { passive: true });
 
     // Rename: PATCH the session, then keep the rail row and the title bar in
     // sync without waiting for the next /v1/sessions poll.
@@ -2009,6 +2112,36 @@
       if (sid === currentSid()) setChatTitle(next);
       paintSessions();
       return next;
+    }
+
+    // Delete: soft-delete on the gateway, then drop the row locally so the rail
+    // updates before the next /v1/sessions poll. If the deleted chat was open,
+    // move to the next most recent one (or a blank slate when none is left).
+    async function deleteSession(sid) {
+      await api("/v1/sessions/" + sid, { method: "DELETE" });
+      const wasCurrent = sid === currentSid();
+      sessions = sessions.filter((s) => s.id !== sid);
+      stoppedSids.delete(sid);
+      waitingAskSids.delete(sid);
+      followupQueues.delete(sid);
+      try { sessionStorage.removeItem("orbweaver.queue." + sid); } catch (e) {}
+      if (!wasCurrent) {
+        paintSessions();
+        return;
+      }
+      const next = sessions[0];
+      if (next) {
+        setActive(next);
+      } else {
+        $("sid").value = "";
+        persistSid();
+        resetLog();
+        $("log").innerHTML = '<div class="placeholder">No chats. Start one with New chat.</div>';
+        setChatTitle("");
+        history.replaceState(null, "", "#/");
+        paintSessions();
+      }
+      $("status").textContent = "Chat deleted.";
     }
 
     // Title bar rename: clicking #chat-title swaps in #chat-title-edit.

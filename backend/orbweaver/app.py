@@ -66,11 +66,13 @@ from orbweaver.model_routing import (
 from orbweaver.ratelimit import FileRateLimiter, get_rate_limiter
 from orbweaver.session_status import context_snapshot
 from orbweaver.store import (
+    SESSION_STATUS_DELETED,
     SESSION_TYPE,
     Entity,
     Job,
     PinBudgetError,
     get_store,
+    is_deleted_session,
     new_uuid,
     session_at_id,
 )
@@ -753,7 +755,7 @@ async def list_sessions(_u: dict = Depends(_user)) -> dict[str, Any]:
     store = get_store()
     out: list[dict[str, Any]] = []
     for ent in await store.list_entities(SESSION_TYPE):
-        if is_subagent_session(ent):
+        if is_subagent_session(ent) or is_deleted_session(ent):
             continue
         events = await store.list_events(ent.id)
         preview = _preview_text(events)
@@ -797,6 +799,28 @@ async def patch_session(session_id: UUID, body: SessionPatch, _u: dict = Depends
         "title": _display_title(sess.jsonld),
         "model": str(sess.jsonld.get("model") or ""),
     }
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def delete_session(session_id: UUID, _u: dict = Depends(_user)) -> dict[str, Any]:
+    """Soft-delete: mark the session deleted and hide it. Events are kept.
+
+    A running turn keeps its own reference to the entity, so deleting mid-turn
+    would leave the turn writing events to a hidden session. Refuse instead and
+    let the caller stop the turn first.
+    """
+    store = get_store()
+    sess = await store.get_entity(session_id)
+    if not sess or sess.at_type != SESSION_TYPE:
+        raise HTTPException(404, "session not found")
+    if is_deleted_session(sess):
+        return {"id": str(sess.id), "status": SESSION_STATUS_DELETED}
+    if turn_is_running(session_id):
+        raise HTTPException(409, "a turn is running; stop it before deleting")
+    sess.jsonld["status"] = SESSION_STATUS_DELETED
+    sess.jsonld["deleted_at"] = datetime.now(UTC).isoformat()
+    await store.put_entity(sess)
+    return {"id": str(sess.id), "status": SESSION_STATUS_DELETED}
 
 
 @app.get("/v1/sessions/{session_id}/events")
@@ -928,6 +952,8 @@ async def turn(session_id: UUID, body: TurnBody, _u: dict = Depends(_user)) -> d
     sess = await store.get_entity(session_id)
     if not sess:
         raise HTTPException(404, "session not found")
+    if is_deleted_session(sess):
+        raise HTTPException(404, "session was deleted")
     model = _validated_model(body.model)
     await store_session_model(store, sess, model)
     return await _run_turn(store, sess, session_id, body.text, model=model)

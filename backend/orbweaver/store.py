@@ -16,6 +16,10 @@ from orbweaver.uris import WorkspaceURIError, validate_workspace_uri
 SESSION_TYPE = "Session"
 AGENT_TYPE = "Agent"
 
+# Soft-delete marker. A deleted session keeps its row and its events so the
+# delete stays recoverable; every session enumeration filters it out instead.
+SESSION_STATUS_DELETED = "deleted"
+
 
 def new_uuid() -> uuid.UUID:
     return uuid.uuid4()
@@ -36,6 +40,13 @@ class Entity:
     at_type: str
     jsonld: dict[str, Any]
     pinned: bool = False
+
+
+def is_deleted_session(entity: Entity | None) -> bool:
+    """True for a soft-deleted session: hide it from listings, refuse new turns."""
+    if entity is None:
+        return False
+    return str((entity.jsonld or {}).get("status") or "") == SESSION_STATUS_DELETED
 
 
 def jsonld_triples(entity: Entity) -> list[tuple[str, str, str]]:
