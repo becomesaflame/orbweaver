@@ -159,6 +159,8 @@ class Settings(BaseSettings):
     brave_search_api_key: str = ""
     orbweaver_host: str = "0.0.0.0"
     orbweaver_port: int = 8080
+    # Root logger level for `orbweaver serve` (journald via systemd stderr).
+    orbweaver_log_level: str = "info"
     # How long `orbweaver drain` (and therefore deploy) waits for in-flight
     # turns before restarting anyway. Approval-held turns count as running.
     orbweaver_drain_timeout_s: float = 900.0
