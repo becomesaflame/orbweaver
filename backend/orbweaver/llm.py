@@ -10,6 +10,7 @@ from uuid import uuid4
 from orbweaver.config import settings
 from orbweaver.open_models import (
     DEFAULT_OPENROUTER_BASE,
+    OPEN_MODELS,
     is_claude_model,
     is_open_model,
     max_tokens_for,
@@ -90,8 +91,26 @@ def openrouter_configured() -> bool:
     return bool(settings.openrouter_key)
 
 
+def unknown_model(model: str | None) -> bool:
+    """A non-empty id that is not a Claude name, a catalog name, or the Ollama model.
+
+    Empty is "unspecified", not unknown, so the provider defaults still apply.
+    """
+    m = (model or "").strip()
+    if not m or is_open_model(m) or is_claude_model(m):
+        return False
+    ollama = settings.ollama_model.strip()
+    return not (ollama and m == ollama)
+
+
 def select_provider(model: str | None = None) -> str:
-    """Claude names → Anthropic; catalog names → Earth Runtime; else Anthropic / Ollama."""
+    """Claude names → Anthropic; catalog names → Earth Runtime; the Ollama model → Ollama.
+
+    An id we do not recognise routes nowhere. It used to fall through to Anthropic,
+    which answered ``404 not_found_error`` on every turn — that is what
+    ``ORBWEAVER_TELEGRAM_MODEL=glm-5.3-flash`` looked like in production while that
+    (real) Earth Runtime model was missing from ``OPEN_MODELS``.
+    """
     model = (model or settings.orbweaver_model).strip()
     if is_open_model(model):
         return "openrouter" if openrouter_configured() else "none"
@@ -100,6 +119,10 @@ def select_provider(model: str | None = None) -> str:
             return "anthropic"
         if _ollama_configured():
             return "ollama"
+        return "none"
+    if _ollama_configured() and model == settings.ollama_model.strip():
+        return "ollama"
+    if unknown_model(model):
         return "none"
     if settings.anthropic_api_key.strip():
         return "anthropic"
@@ -115,6 +138,8 @@ def hosted_provider(model: str | None = None) -> str:
     model = (model or "").strip()
     if is_open_model(model):
         return "openrouter" if openrouter_configured() else "none"
+    if unknown_model(model):
+        return "none"
     if settings.anthropic_api_key.strip():
         return "anthropic"
     return "none"
@@ -128,6 +153,13 @@ def no_llm_echo(user_text: str, model: str | None = None) -> str:
             f"OPENROUTER_API_KEY is not set (needed for {model}). Echo: {echo}\n"
             "Get a key from earthruntime.com and set OPENROUTER_API_KEY "
             "(optional OPENROUTER_BASE_URL, default https://api.earthruntime.com/v1)."
+        )
+    if unknown_model(model):
+        return (
+            f"{model} is not a model Orbweaver can route, so no provider was picked. "
+            f"Echo: {echo}\nUse a claude-* id, the configured OLLAMA_MODEL, or one of: "
+            + ", ".join(sorted(OPEN_MODELS))
+            + "."
         )
     return (
         "No LLM provider is configured. Echo: "

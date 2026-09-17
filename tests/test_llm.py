@@ -20,8 +20,10 @@ from orbweaver.llm import (
     no_llm_echo,
     normalize_openai_tool_parameters,
     select_provider,
+    unknown_model,
 )
-from orbweaver.open_models import context_window_for
+from orbweaver.model_routing import unsupported_configured_models
+from orbweaver.open_models import OPEN_MODELS, context_window_for
 from orbweaver.store import reset_store_for_tests
 from orbweaver.workspace import LocalWorkspace
 
@@ -154,6 +156,57 @@ def test_open_model_without_key_echoes(monkeypatch):
     assert select_provider() == "none"
     assert "OPENROUTER_API_KEY" in no_llm_echo("hello")
     assert "qwen3.6-35b" in no_llm_echo("hello")
+
+
+def test_unknown_model_does_not_fall_through_to_anthropic(monkeypatch):
+    """Production 404: ORBWEAVER_TELEGRAM_MODEL was a real Earth Runtime id we did not list.
+
+    ``anthropic.NotFoundError: model: glm-5.3-flash`` on every Telegram turn, because an
+    unrecognised id fell through to the Anthropic client.
+    """
+    _clear_providers(monkeypatch, anthropic="sk-ant-test", openrouter="pk-prov-test")
+    monkeypatch.setattr(settings, "orbweaver_model", "glm-5.3-flash-typo")
+    assert unknown_model("glm-5.3-flash-typo")
+    assert select_provider() == "none"
+    assert hosted_provider("glm-5.3-flash-typo") == "none"
+    assert make_agent_client() is None
+    echo = no_llm_echo("hello")
+    assert "glm-5.3-flash-typo" in echo
+    assert "gpt-oss-120b" in echo  # names the ids that do work
+
+
+def test_every_catalog_model_routes_to_earthruntime(monkeypatch):
+    _clear_providers(monkeypatch, anthropic="sk-ant-test", openrouter="pk-prov-test")
+    for mid in OPEN_MODELS:
+        assert not unknown_model(mid), mid
+        assert select_provider(mid) == "openrouter", mid
+        assert hosted_provider(mid) == "openrouter", mid
+
+
+def test_glm_flash_is_routable_now(monkeypatch):
+    """The exact id configured in production for Telegram and VS Code."""
+    _clear_providers(monkeypatch, anthropic="sk-ant-test", openrouter="pk-prov-test")
+    monkeypatch.setattr(settings, "orbweaver_telegram_model", "glm-5.3-flash")
+    monkeypatch.setattr(settings, "orbweaver_vscode_model", "glm-5.3-flash")
+    assert select_provider("glm-5.3-flash") == "openrouter"
+    assert unsupported_configured_models() == []
+    assert isinstance(make_agent_client(model="glm-5.3-flash"), OpenAICompatClient)
+
+
+def test_unsupported_configured_models_names_the_env_var(monkeypatch):
+    _clear_providers(monkeypatch, anthropic="sk-ant-test", openrouter="pk-prov-test")
+    monkeypatch.setattr(settings, "orbweaver_model", "claude-sonnet-4-6")
+    monkeypatch.setattr(settings, "orbweaver_telegram_model", "glm-5.3-flush")
+    monkeypatch.setattr(settings, "orbweaver_vscode_model", "")
+    assert unsupported_configured_models() == [("ORBWEAVER_TELEGRAM_MODEL", "glm-5.3-flush")]
+
+
+def test_configured_ollama_model_beats_an_anthropic_key(monkeypatch):
+    """A bare Ollama id used to route to Anthropic whenever a key happened to be set."""
+    _clear_providers(monkeypatch, anthropic="sk-ant-test", ollama=True)
+    monkeypatch.setattr(settings, "orbweaver_model", "llama3.2")
+    assert not unknown_model("llama3.2")
+    assert select_provider() == "ollama"
 
 
 def test_catalog_name_does_not_fall_through_to_anthropic(monkeypatch):

@@ -101,6 +101,28 @@ def is_supported_model(model: str | None) -> bool:
     return bool(ollama) and m == ollama
 
 
+# Every model id an operator can set. Checked at startup so a typo is visible
+# before a turn fails on it.
+CONFIGURED_MODEL_ENV: tuple[tuple[str, str], ...] = (
+    ("ORBWEAVER_MODEL", "orbweaver_model"),
+    ("ORBWEAVER_WEB_MODEL", "orbweaver_web_model"),
+    ("ORBWEAVER_VSCODE_MODEL", "orbweaver_vscode_model"),
+    ("ORBWEAVER_TELEGRAM_MODEL", "orbweaver_telegram_model"),
+    ("ORBWEAVER_CLASSIFIER_MODEL", "orbweaver_classifier_model"),
+    ("ORBWEAVER_INJECTION_PROBE_MODEL", "orbweaver_injection_probe_model"),
+    ("ORBWEAVER_COMPACT_MODEL", "orbweaver_compact_model"),
+)
+
+
+def unsupported_configured_models() -> list[tuple[str, str]]:
+    """``(env name, id)`` for configured models that route nowhere."""
+    return [
+        (env_name, mid)
+        for env_name, attr in CONFIGURED_MODEL_ENV
+        if (mid := str(getattr(settings, attr, "") or "").strip()) and not is_supported_model(mid)
+    ]
+
+
 def model_label(model: str) -> str:
     """Short picker name; falls back to the id."""
     mid = (model or "").strip()
