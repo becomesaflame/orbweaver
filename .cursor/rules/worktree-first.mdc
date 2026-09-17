@@ -1,0 +1,34 @@
+---
+description: Edit this repo from your own git worktree so parallel agents never share a checkout
+alwaysApply: true
+---
+
+# One worktree per agent
+
+Concurrent agents work in this repo. Do not edit, commit, or run `git checkout`
+in the checkout you were opened in — another agent may be mid-turn there. Before
+the first edit, add your own worktree of **this** repo and work from it.
+
+```bash
+git fetch origin
+git worktree add -b <topic> ../orbweaver-worktrees/<slug> origin/main
+cd ../orbweaver-worktrees/<slug>
+```
+
+The path is a sibling of the repo root (`/home/spark/orbweaver-worktrees/<slug>`),
+so no agent's `Grep`/`Glob` walks another agent's tree. Branch off `origin/main`,
+per the feature-branch flow in `ORBWEAVER.md`; that flow — version bump, tests,
+draft PR, squash auto-merge — then runs from inside the worktree.
+
+Pass the worktree as `working_directory` (or `git -C`) on every command, because
+the shell's own cwd still starts at the original checkout.
+
+Read-only work — answering questions, reading code, inspecting logs — needs no
+worktree.
+
+## Do not
+
+- Clone the repo, or switch the agent's workspace root, to get isolation.
+  `git worktree add` in the current repo is the whole mechanism.
+- Touch, reset, or `git worktree remove` a worktree you did not create.
+- Reuse someone else's topic branch. One worktree, one branch, one task.
