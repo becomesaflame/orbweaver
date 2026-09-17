@@ -125,10 +125,21 @@
     }
     header.chat-bar h2 {
       font: 0.95rem/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      margin:0; font-weight:650; color:var(--lcd-ink);
+      margin:0 -0.15rem; font-weight:650; color:var(--lcd-ink);
       text-shadow:0 0 8px rgba(120,255,160,0.3);
       overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
       flex:1; min-width:0;
+      /* Click the title to rename; #chat-title-edit swaps in place. */
+      cursor:text; border-radius:2px; padding:0 0.15rem;
+    }
+    header.chat-bar h2:hover, header.chat-bar h2:focus-visible {
+      background:rgba(120,255,160,0.08); outline:none;
+    }
+    header.chat-bar h2.hidden, #chat-title-edit.hidden { display:none; }
+    #chat-title-edit {
+      flex:1; min-width:0; padding:0.1rem 0.25rem;
+      font: 0.95rem/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-weight:650;
     }
     #status {
       color:var(--amber); font: 0.75rem/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -454,7 +465,8 @@
   <div id="stage">
     <header class="chat-bar">
       <div class="lcd">
-        <h2 id="chat-title">New chat</h2>
+        <h2 id="chat-title" tabindex="0" role="button" title="Click to rename this chat">New chat</h2>
+        <input id="chat-title-edit" class="hidden" aria-label="Chat title" maxlength="80" autocomplete="off">
         <span id="status"></span>
       </div>
     </header>
@@ -1159,7 +1171,7 @@
       if (s) { setActive(s); return; }
       $("sid").value = childId;
       persistSid();
-      $("chat-title").textContent = "Subagent " + childId.slice(0, 8);
+      setChatTitle("Subagent " + childId.slice(0, 8));
       history.replaceState(null, "", "#/s/" + childId);
       loadHistory();
     }
@@ -1603,7 +1615,7 @@
       $("wuri").value = session.workspace_uri || $("wuri").value;
       $("wkind").value = session.workspace_kind || $("wkind").value;
       persistWorkspace();
-      $("chat-title").textContent = session.title || "New chat";
+      setChatTitle(session.title);
       history.replaceState(null, "", "#/s/" + session.id);
       paintSessions();
       paintModelPicker();
@@ -1711,12 +1723,77 @@
         const title = next.trim();
         if (!title) return;
         try {
-          await api("/v1/sessions/" + s.id, { method:"PATCH", body: JSON.stringify({ title }) });
-          await refreshSessions();
+          await renameSession(s.id, title);
         } catch (err) { $("status").textContent = String(err); }
       };
       return b;
     }
+
+    // Rename: PATCH the session, then keep the rail row and the title bar in
+    // sync without waiting for the next /v1/sessions poll.
+    async function renameSession(sid, title) {
+      const r = await api("/v1/sessions/" + sid, {
+        method: "PATCH",
+        body: JSON.stringify({ title }),
+      });
+      const next = (r && r.title) || title;
+      const row = sessions.find((s) => s.id === sid);
+      if (row) row.title = next;
+      if (sid === currentSid()) setChatTitle(next);
+      paintSessions();
+      return next;
+    }
+
+    // Title bar rename: clicking #chat-title swaps in #chat-title-edit.
+    let titleEditing = false;
+    function setChatTitle(text) {
+      $("chat-title").textContent = text || "New chat";
+    }
+    function startTitleEdit() {
+      if (titleEditing) return;
+      const sid = currentSid();
+      if (!sid) return;
+      const row = sessions.find((s) => s.id === sid);
+      titleEditing = true;
+      const input = $("chat-title-edit");
+      input.value = (row && row.title) || $("chat-title").textContent || "";
+      $("chat-title").classList.add("hidden");
+      input.classList.remove("hidden");
+      input.focus();
+      input.select();
+    }
+    function cancelTitleEdit() {
+      if (!titleEditing) return;
+      titleEditing = false;
+      $("chat-title-edit").classList.add("hidden");
+      $("chat-title").classList.remove("hidden");
+    }
+    async function commitTitleEdit() {
+      if (!titleEditing) return;
+      const sid = currentSid();
+      const next = $("chat-title-edit").value.trim();
+      const row = sessions.find((s) => s.id === sid);
+      cancelTitleEdit();
+      if (!sid || !next || next === ((row && row.title) || "")) return;
+      setChatTitle(next);
+      try {
+        await renameSession(sid, next);
+      } catch (e) {
+        $("status").textContent = String(e);
+        if (row) setChatTitle(row.title);
+      }
+    }
+    $("chat-title").addEventListener("click", startTitleEdit);
+    $("chat-title").addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      startTitleEdit();
+    });
+    $("chat-title-edit").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commitTitleEdit(); return; }
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelTitleEdit(); }
+    });
+    $("chat-title-edit").addEventListener("blur", () => { commitTitleEdit(); });
 
     function paintConnection(ok) {
       $("conn-dot").classList.toggle("ok", !!ok);
@@ -1735,7 +1812,7 @@
         sessions = r.sessions || [];
         paintConnection(true);
         const cur = currentSession();
-        if (cur) $("chat-title").textContent = cur.title || "New chat";
+        if (cur) setChatTitle(cur.title);
         paintSessions();
         if (!modelsLoaded) await loadModels(); else paintModelPicker();
       } catch (e) {
@@ -1800,7 +1877,7 @@
         $("status").textContent = flight ? "working…" : "";
         syncComposer();
         const cur = currentSession();
-        if (cur) $("chat-title").textContent = cur.title || "New chat";
+        if (cur) setChatTitle(cur.title);
       } catch (e) {
         if (gen !== historyGen || currentSid() !== sid) return;
         $("status").textContent = String(e);
@@ -1813,7 +1890,7 @@
       if (s) { setActive(s); return; }
       $("sid").value = next;
       persistSid();
-      $("chat-title").textContent = "Chat";
+      setChatTitle("Chat");
       loadHistory();
     });
 
@@ -2279,7 +2356,7 @@
         await refreshSessions();
         if (stillHere) {
           const cur = currentSession();
-          if (cur) $("chat-title").textContent = cur.title || "New chat";
+          if (cur) setChatTitle(cur.title);
         }
         turnStatus = r.status;
       } catch (e) {
