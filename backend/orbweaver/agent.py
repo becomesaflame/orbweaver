@@ -2005,6 +2005,10 @@ async def agent_turn(
         payload.setdefault("text", exc.message)
         fire(await store.append_event(session_id, "turn_aborted", payload))
         fire(await store.append_event(session_id, "assistant", {"text": exc.message}))
+        if settings.orbweaver_selfheal:
+            from orbweaver.selfheal import note_abort
+
+            asyncio.create_task(note_abort(session_id, payload), name="selfheal-abort")
 
     probe_task: asyncio.Task[int] | None = None
 

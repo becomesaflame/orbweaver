@@ -123,8 +123,18 @@ async def _lifespan(_app: FastAPI):
         from orbweaver.channels.telegram import start_telegram
 
         asyncio.create_task(start_telegram())
+    if settings.orbweaver_selfheal and not testing:
+        from orbweaver.selfheal import attach_log_handler, bind_loop
+
+        bind_loop(asyncio.get_running_loop())
+        attach_log_handler()
     yield
     begin_drain()
+    from orbweaver.selfheal import bind_loop as unbind_selfheal
+    from orbweaver.selfheal import detach_log_handler
+
+    detach_log_handler()
+    unbind_selfheal(None)
     from orbweaver.sandbox.shell import close_all_session_shells
 
     await asyncio.to_thread(close_all_session_shells)

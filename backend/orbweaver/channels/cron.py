@@ -145,6 +145,10 @@ async def _run_job_turn(store, sess, session_id: UUID, job: Job, message: str) -
             # Stop from the web UI now reaches cron turns through the shared registry.
             marker = await store.append_event(session_id, "turn_interrupted", {"reason": "stop"})
             events = [*e.produced, marker]
+        if job.payload.get("selfheal"):
+            from orbweaver.selfheal import finish_attempt
+
+            await finish_attempt(job, events, store)
         await _notify_originating_channel(store, sess, session_id, job, events)
 
 

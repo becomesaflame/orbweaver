@@ -125,3 +125,14 @@ socket and this uid's user journal socket are granted by default, so
 `journalctl -u` works without `permissions: ["all"]`. Extra sockets (local
 Postgres) still go in `allowUnixSockets`. Do not use `permissions: ["all"]`
 for log inspection. Do not restart the gateway or edit systemd units.
+
+## Self-heal
+
+When `ORBWEAVER_SELFHEAL=1`, the gateway fingerprints `orbweaver.*` ERROR
+tracebacks (and some `turn_aborted` reasons) and enqueues a headless turn on
+`workspace:orbweaver-selfheal`. Clone that sibling of `workspace:orbweaver`
+before enabling. Optional: `ORBWEAVER_SELFHEAL_TELEGRAM_CHAT_ID`. Caps:
+`ORBWEAVER_SELFHEAL_DAILY_CAP` (default 3) and `ORBWEAVER_SELFHEAL_COOLDOWN_S`
+(default 7 days). Duplicate fingerprints do not start a second turn. This does
+not refuse `gh pr merge`; silent auto-merge is a skill choice, not a sandbox
+rule. Pushing `main` is still forbidden.

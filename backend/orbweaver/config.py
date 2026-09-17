@@ -161,6 +161,13 @@ class Settings(BaseSettings):
     orbweaver_port: int = 8080
     # Root logger level for `orbweaver serve` (journald via systemd stderr).
     orbweaver_log_level: str = "info"
+    # Self-heal intake (#69): on ERROR+exc_info (and some turn_aborted reasons)
+    # enqueue a headless job against workspace:orbweaver-selfheal. Opt-in.
+    orbweaver_selfheal: bool = False
+    orbweaver_selfheal_workspace: str = "workspace:orbweaver-selfheal"
+    orbweaver_selfheal_cooldown_s: float = 604800.0  # 7 days
+    orbweaver_selfheal_daily_cap: int = 3
+    orbweaver_selfheal_telegram_chat_id: int = 0
     # How long `orbweaver drain` (and therefore deploy) waits for in-flight
     # turns before restarting anyway. Approval-held turns count as running.
     orbweaver_drain_timeout_s: float = 900.0
