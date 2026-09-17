@@ -191,6 +191,7 @@ _GATEWAY_ENV = {
     "TELEGRAM_BOT_TOKEN": "123:abc",
     "DATABASE_URL": "postgresql://u:p@localhost/db",
     "HINDSIGHT_API_KEY": "hs-FAKE",
+    "GH_TOKEN": "gho_FAKE",
     "MY_PASSWORD": "hunter2",
     "PGHOST": "localhost",
 }
@@ -213,12 +214,14 @@ def test_bwrap_clears_env_and_sets_allowlist(tmp_path: Path):
         "TELEGRAM_BOT_TOKEN",
         "DATABASE_URL",
         "HINDSIGHT_API_KEY",
+        "GH_TOKEN",
         "MY_PASSWORD",
         "PGHOST",
     ):
         assert secret not in env
     joined = " ".join(argv)
     assert "sk-ant-FAKE" not in joined
+    assert "gho_FAKE" not in joined
     assert "hunter2" not in joined
 
 
