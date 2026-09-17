@@ -896,11 +896,10 @@ async def _run_turn(
         from orbweaver.llm import OpenAICompatError
 
         failure = str(getattr(e, "message", None) or e) or type(e).__name__
-        if isinstance(e, ContextFullError):
-            raise HTTPException(status_code=502, detail=e.message) from e
-        if isinstance(e, anthropic.APIStatusError):
-            raise HTTPException(status_code=502, detail=e.message) from e
-        if isinstance(e, OpenAICompatError):
+        # Map to 502 for the UI. log.exception so self-heal intake (ERROR+exc_info)
+        # sees it; _ws_turn swallows HTTPException without logging.
+        if isinstance(e, (ContextFullError, anthropic.APIStatusError, OpenAICompatError)):
+            log.exception("turn failed for %s", session_id)
             raise HTTPException(status_code=502, detail=e.message) from e
         raise
     finally:
