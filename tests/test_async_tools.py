@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import anthropic
 import pytest
+from live_bwrap import require_live_bwrap
 
 from orbweaver.agent import (
     INTERRUPTED_BY_USER,
@@ -186,9 +187,9 @@ async def test_sandboxed_bash_async_runs_and_cancels(tmp_path: Path, monkeypatch
     try:
         out = await run_sandboxed_async("echo sandbox-async-ok", tmp_path, timeout=15)
     except Exception as e:  # bwrap may be blocked on this host (AppArmor, nested userns)
-        pytest.skip(f"bwrap cannot run here: {e}")
+        require_live_bwrap(f"bwrap cannot run here: {e}")
     if "sandbox-async-ok" not in out:
-        pytest.skip(f"bwrap cannot run here: {out[-300:]}")
+        require_live_bwrap(f"bwrap cannot run here: {out[-300:]}")
     ws = LocalWorkspace("workspace:default", str(tmp_path))
     cancel = asyncio.Event()
 

@@ -34,6 +34,39 @@ jobs:
           curl -fsSL -o /tmp/ripgrep.deb \
             http://archive.ubuntu.com/ubuntu/pool/universe/r/rust-ripgrep/ripgrep_14.1.0-1_amd64.deb
           sudo dpkg -i /tmp/bubblewrap.deb /tmp/ripgrep.deb
+      # Ubuntu 24.04 withholds CAP_NET_ADMIN in unprivileged userns, so
+      # bwrap --unshare-net dies with RTM_NEWADDR. Same profile as README.
+      - name: Allow bwrap netns
+        run: |
+          set -euo pipefail
+          sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap>
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap || \
+            echo "apparmor_parser failed (will try sysctl if the probe still fails)"
+          probe() {
+            bwrap --unshare-user --unshare-pid --unshare-net --die-with-parent \
+              --ro-bind / / --proc /proc --dev /dev -- /bin/true 2>&1 || true
+          }
+          out=$(probe)
+          if grep -qiE 'rtm_newaddr|loopback:' <<<"$out"; then
+            echo "AppArmor profile did not unlock bwrap netns; disabling apparmor_restrict_unprivileged_userns"
+            echo "$out"
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            out=$(probe)
+          fi
+          if grep -qiE 'rtm_newaddr|loopback:' <<<"$out"; then
+            echo "bwrap netns still blocked:"
+            echo "$out"
+            exit 1
+          fi
+          echo "bwrap netns probe ok"
       - run: uv pip install -e ".[dev]"
         working-directory: backend
       - run: python -m ruff check backend tests --config backend/pyproject.toml

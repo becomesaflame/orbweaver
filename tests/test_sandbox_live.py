@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
+from live_bwrap import require_live_bwrap
 
 from orbweaver.config import settings
 from orbweaver.sandbox.bwrap import (
@@ -20,10 +21,17 @@ from orbweaver.sandbox.bwrap import (
 from orbweaver.workspace import LocalWorkspace
 
 
-def test_ci_installs_bubblewrap():
+def test_ci_installs_bubblewrap(tmp_path: Path):
     if not os.environ.get("GITHUB_ACTIONS"):
         return
-    assert sandbox_available(), "CI must install bubblewrap so live sandbox tests can run where netns allows"
+    assert sandbox_available(), "CI must install bubblewrap so live sandbox tests can run"
+    try:
+        out = run_sandboxed("echo ci-bwrap-ok", tmp_path, timeout=15)
+    except SandboxUnavailable as e:
+        pytest.fail(f"CI bwrap netns must start: {e}")
+    assert "ci-bwrap-ok" in out, out[-400:]
+    assert not _loopback_blocked(out), out[-400:]
+    assert "sandbox_unavailable" not in out
 
 
 def _loopback_blocked(text: object) -> bool:
@@ -51,19 +59,19 @@ def live_root(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox", True)
     monkeypatch.setattr(settings, "orbweaver_sandbox_fail_if_unavailable", True)
     if not sandbox_available() or is_containerized():
-        pytest.skip("bubblewrap not available")
+        require_live_bwrap("bubblewrap not available")
     try:
         out = run_sandboxed("true", tmp_path, timeout=10)
     except SandboxUnavailable as e:
-        if _loopback_blocked(e):
-            pytest.skip(f"bwrap netns loopback not permitted: {e}")
         if _nested_in_seccomp_sandbox() and "not permitted" in str(e).lower():
             pytest.skip(f"nested bwrap blocked by the outer seccomp filter: {e}")
+        if _loopback_blocked(e):
+            require_live_bwrap(f"bwrap netns loopback not permitted: {e}")
         raise
     if _loopback_blocked(out):
-        pytest.skip(out[-200:])
+        require_live_bwrap(out[-200:])
     if "sandbox_unavailable" in out:
-        pytest.skip(out[-200:])
+        require_live_bwrap(out[-200:])
     return tmp_path
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from live_bwrap import require_live_bwrap
 
 from orbweaver.config import settings
 from orbweaver.git_ritual import RITUAL_MARK, repo_for_command
@@ -148,15 +149,15 @@ def live_root(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_sandbox_fail_if_unavailable", True)
     monkeypatch.setattr(settings, "orbweaver_persistent_shell", True)
     if not sandbox_available() or is_containerized():
-        pytest.skip("bubblewrap not available")
+        require_live_bwrap("bubblewrap not available")
     try:
         out = run_sandboxed("true", tmp_path, timeout=10)
     except SandboxUnavailable as e:
         if _loopback_blocked(e):
-            pytest.skip(f"bwrap netns loopback not permitted: {e}")
+            require_live_bwrap(f"bwrap netns loopback not permitted: {e}")
         raise
     if _loopback_blocked(out) or "sandbox_unavailable" in out:
-        pytest.skip(out[-200:])
+        require_live_bwrap(out[-200:])
     return tmp_path
 
 

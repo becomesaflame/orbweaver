@@ -16,7 +16,7 @@ import stat
 import struct
 from pathlib import Path
 
-import pytest
+from live_bwrap import require_live_bwrap
 
 from orbweaver.agent import static_system
 from orbweaver.sandbox.bwrap import (
@@ -183,7 +183,7 @@ def test_sandboxed_gh_auth_status_uses_host_token(monkeypatch, tmp_path):
     from orbweaver.config import settings
 
     if not sandbox_available() or is_containerized():
-        pytest.skip("bubblewrap not available")
+        require_live_bwrap("bubblewrap not available")
     monkeypatch.setattr(settings, "orbweaver_sandbox", True)
     monkeypatch.setattr(settings, "orbweaver_sandbox_fail_if_unavailable", True)
     fake = _fake_gh(tmp_path / "bin")
@@ -197,9 +197,9 @@ def test_sandboxed_gh_auth_status_uses_host_token(monkeypatch, tmp_path):
         try:
             probe = run_sandboxed("true", root, timeout=10)
         except SandboxUnavailable as e:
-            pytest.skip(str(e))
+            require_live_bwrap(str(e))
         if "sandbox_unavailable" in probe:
-            pytest.skip(probe[-200:])
+            require_live_bwrap(probe[-200:])
         out = run_sandboxed(
             "gh auth status; echo TOKEN=${GH_TOKEN-unset}",
             root,
