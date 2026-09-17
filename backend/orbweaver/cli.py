@@ -54,6 +54,16 @@ def main() -> None:
         # writes this to stderr; uvicorn would otherwise own logging setup.
         logging.getLogger("orbweaver").error("refusing to start: %s", e)
         raise SystemExit(1) from e
+    from orbweaver.model_routing import unsupported_configured_models
+
+    # A typo here only breaks the channels that use it, so warn instead of
+    # refusing to start; turns on that model answer with no_llm_echo.
+    for env_name, model_id in unsupported_configured_models():
+        logging.getLogger("orbweaver").warning(
+            "%s=%s is not a model Orbweaver can route; turns using it will not reach a provider",
+            env_name,
+            model_id,
+        )
     uvicorn.run(
         "orbweaver.app:app",
         host=settings.orbweaver_host,

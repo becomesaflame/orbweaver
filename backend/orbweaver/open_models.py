@@ -6,6 +6,10 @@ from dataclasses import dataclass
 
 DEFAULT_OPENROUTER_BASE = "https://api.earthruntime.com/v1"
 
+# Stand-in for models whose real context length we have not confirmed; matches
+# the smallest window in the catalog so compaction math errs on the safe side.
+PROVISIONAL_CONTEXT_WINDOW = 131_072
+
 
 @dataclass(frozen=True)
 class OpenModel:
@@ -44,6 +48,54 @@ OPEN_MODELS: dict[str, OpenModel] = {
         reasoning=True,
         max_tokens=16_384,
         description="Reasoning-capable, good for complex problems (262K context)",
+    ),
+    # Live on Earth Runtime but the provider's /models gives no context length,
+    # so these carry the conservative 128K default until issue #155 confirms them.
+    # An id missing from this table routes nowhere (see llm.select_provider), which
+    # is how ORBWEAVER_TELEGRAM_MODEL=glm-5.3-flash 404'd against Anthropic.
+    "glm-5.3": OpenModel(
+        id="glm-5.3",
+        label="GLM 5.3",
+        context_window=PROVISIONAL_CONTEXT_WINDOW,
+        description="GLM 5.3 (context window unconfirmed)",
+    ),
+    "glm-5.3-flash": OpenModel(
+        id="glm-5.3-flash",
+        label="GLM 5.3 Flash",
+        context_window=PROVISIONAL_CONTEXT_WINDOW,
+        description="Faster GLM 5.3 (context window unconfirmed)",
+    ),
+    "deepseek-v4.1-flash": OpenModel(
+        id="deepseek-v4.1-flash",
+        label="DeepSeek V4.1 Flash",
+        context_window=PROVISIONAL_CONTEXT_WINDOW,
+        reasoning=True,
+        max_tokens=16_384,
+        description="Newer DeepSeek V4 Flash (context window unconfirmed)",
+    ),
+    "kimi-k3": OpenModel(
+        id="kimi-k3",
+        label="Kimi K3",
+        context_window=PROVISIONAL_CONTEXT_WINDOW,
+        description="Kimi K3 (context window unconfirmed)",
+    ),
+    "minimax-m3": OpenModel(
+        id="minimax-m3",
+        label="MiniMax M3",
+        context_window=PROVISIONAL_CONTEXT_WINDOW,
+        description="MiniMax M3 (context window unconfirmed)",
+    ),
+    "nemotron-3-ultra": OpenModel(
+        id="nemotron-3-ultra",
+        label="Nemotron 3 Ultra",
+        context_window=PROVISIONAL_CONTEXT_WINDOW,
+        description="Nemotron 3 Ultra (context window unconfirmed)",
+    ),
+    "hy4": OpenModel(
+        id="hy4",
+        label="HY4",
+        context_window=PROVISIONAL_CONTEXT_WINDOW,
+        description="HY4 (context window unconfirmed)",
     ),
 }
 
