@@ -2089,11 +2089,14 @@
         } else {
           for (const ev of evs) renderEvent(ev);
           syncRestoreDefaults();
-          if (pendingAskFromEvents(evs)) waitingAskSids.add(sid);
-          else {
-            const turns = evs.filter((e) => e.kind !== "checkpoint_restore");
-            const last = turns[turns.length - 1];
-            if (last && last.kind !== "assistant") stoppedSids.add(sid);
+          // The gateway classifies the last turn. Do not re-derive it from the
+          // final event's kind: bookkeeping events (subagent_result, todo_state)
+          // trail a finished turn and used to show a stray Continue button.
+          const status = r.last_turn_state;
+          if (status === "waiting_ask") waitingAskSids.add(sid);
+          else if (status === "stopped") stoppedSids.add(sid);
+          else if (status === undefined && pendingAskFromEvents(evs)) {
+            waitingAskSids.add(sid);  // older gateway: fall back to the ask scan
           }
         }
         const flight = flightFor(sid);
