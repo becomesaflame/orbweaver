@@ -117,6 +117,129 @@ async def test_list_sessions_autotitle_and_rename(tmp_path, monkeypatch, auth_he
         assert listed.json()["sessions"][0]["title"] == "Sidebar"
 
 
+@pytest.mark.asyncio
+async def test_delete_session_hides_it_but_keeps_events(tmp_path: Path, monkeypatch, auth_header):
+    """Soft delete: gone from the listing, entity and events still in the store."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    from orbweaver.config import settings
+
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = auth_header
+        keep = await client.post(
+            "/v1/sessions",
+            json={"workspace_uri": "workspace:default", "workspace_kind": "local"},
+            headers=headers,
+        )
+        drop = await client.post(
+            "/v1/sessions",
+            json={"workspace_uri": "workspace:default", "workspace_kind": "local"},
+            headers=headers,
+        )
+        keep_id, drop_id = keep.json()["id"], drop.json()["id"]
+        turned = await client.post(
+            f"/v1/sessions/{drop_id}/turns", json={"text": "some history"}, headers=headers
+        )
+        assert turned.status_code == 200, turned.text
+
+        listed = await client.get("/v1/sessions", headers=headers)
+        assert {s["id"] for s in listed.json()["sessions"]} == {keep_id, drop_id}
+
+        deleted = await client.delete(f"/v1/sessions/{drop_id}", headers=headers)
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["status"] == "deleted"
+
+        listed = await client.get("/v1/sessions", headers=headers)
+        assert [s["id"] for s in listed.json()["sessions"]] == [keep_id]
+
+        # Soft delete, so the transcript survives and the delete is recoverable.
+        from uuid import UUID
+
+        from orbweaver.store import get_store, is_deleted_session
+
+        store = get_store()
+        ent = await store.get_entity(UUID(drop_id))
+        assert ent is not None and is_deleted_session(ent)
+        assert ent.jsonld.get("deleted_at")
+        assert await store.list_events(UUID(drop_id)), "events must be kept"
+
+
+@pytest.mark.asyncio
+async def test_delete_session_is_idempotent_and_404s_unknown(auth_header):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        made = await client.post(
+            "/v1/sessions", json={"workspace_uri": "workspace:default"}, headers=auth_header
+        )
+        sid = made.json()["id"]
+        first = await client.delete(f"/v1/sessions/{sid}", headers=auth_header)
+        second = await client.delete(f"/v1/sessions/{sid}", headers=auth_header)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert second.json()["status"] == "deleted"
+
+        missing = await client.delete(
+            "/v1/sessions/00000000-0000-4000-8000-000000000000", headers=auth_header
+        )
+        assert missing.status_code == 404
+
+        denied = await client.delete(f"/v1/sessions/{sid}")
+        assert denied.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_delete_session_refuses_while_a_turn_runs(auth_header):
+    """Deleting mid-turn would hide a session the running turn still writes to."""
+    from uuid import UUID
+
+    from orbweaver.turns import acquire as acquire_turn
+    from orbweaver.turns import release as release_turn
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        made = await client.post(
+            "/v1/sessions", json={"workspace_uri": "workspace:default"}, headers=auth_header
+        )
+        sid = made.json()["id"]
+        state = acquire_turn(UUID(sid), "web")
+        assert state is not None
+        try:
+            busy = await client.delete(f"/v1/sessions/{sid}", headers=auth_header)
+            assert busy.status_code == 409, busy.text
+        finally:
+            release_turn(UUID(sid), state)
+        # Once the turn is done the same delete succeeds.
+        ok = await client.delete(f"/v1/sessions/{sid}", headers=auth_header)
+        assert ok.status_code == 200, ok.text
+
+
+@pytest.mark.asyncio
+async def test_turn_on_deleted_session_is_refused(tmp_path: Path, monkeypatch, auth_header):
+    """A deleted chat must not be revivable by posting a turn to its id."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    from orbweaver.config import settings
+
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        made = await client.post(
+            "/v1/sessions",
+            json={"workspace_uri": "workspace:default", "workspace_kind": "local"},
+            headers=auth_header,
+        )
+        sid = made.json()["id"]
+        assert (await client.delete(f"/v1/sessions/{sid}", headers=auth_header)).status_code == 200
+        turned = await client.post(
+            f"/v1/sessions/{sid}/turns", json={"text": "are you there"}, headers=auth_header
+        )
+        assert turned.status_code == 404, turned.text
+        listed = await client.get("/v1/sessions", headers=auth_header)
+        assert sid not in {s["id"] for s in listed.json()["sessions"]}
+
+
 
 @pytest.mark.asyncio
 async def test_browse_workspaces(tmp_path: Path, monkeypatch, auth_header):

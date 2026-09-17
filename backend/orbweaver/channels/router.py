@@ -29,7 +29,14 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from orbweaver.store import SESSION_TYPE, Entity, Event, Store, session_at_id
+from orbweaver.store import (
+    SESSION_TYPE,
+    Entity,
+    Event,
+    Store,
+    is_deleted_session,
+    session_at_id,
+)
 from orbweaver.turns import get as get_running_turn
 
 log = logging.getLogger(__name__)
@@ -244,11 +251,13 @@ def display_title(jsonld: dict[str, Any], events: list[Event]) -> str:
 
 
 async def candidate_sessions(store: Store, *, exclude: Iterable[UUID] = ()) -> list[Entity]:
-    """Sessions a channel may attach to: no subagents, no operators, none in ``exclude``."""
+    """Sessions a channel may attach to: no subagents, operators, deleted, or ``exclude``."""
     skip = set(exclude)
     out: list[Entity] = []
     for ent in await store.list_entities(SESSION_TYPE):
         if ent.id in skip or _is_subagent(ent) or is_operator_session(ent):
+            continue
+        if is_deleted_session(ent):
             continue
         out.append(ent)
     return out

@@ -190,6 +190,26 @@ async def test_find_session_by_uuid_prefix_and_title():
 
 
 @pytest.mark.asyncio
+async def test_deleted_sessions_are_not_attach_candidates():
+    """A chat deleted in the web UI must not be reachable from another channel."""
+    store = reset_store_for_tests()
+    op = await tg.session_for_telegram_user(store, 42, chat_id=42)
+    live = _session(UUID("aaaaaaaa-0000-4000-8000-000000000011"), title="Airbed controller")
+    gone = _session(
+        UUID("bbbbbbbb-0000-4000-8000-000000000012"),
+        title="Airbed deleted",
+        status="deleted",
+    )
+    for s in (live, gone):
+        await store.put_entity(s)
+    ex = {op.id}
+    assert [e.id for e in await router.candidate_sessions(store, exclude=ex)] == [live.id]
+    # Neither by id nor by title, and "airbed" is no longer ambiguous.
+    assert await router.find_session(store, str(gone.id), exclude=ex) is None
+    assert (await router.find_session(store, "airbed", exclude=ex)).id == live.id
+
+
+@pytest.mark.asyncio
 async def test_list_and_digest_report_running_and_pending():
     store = reset_store_for_tests()
     op = await tg.session_for_telegram_user(store, 42, chat_id=42)

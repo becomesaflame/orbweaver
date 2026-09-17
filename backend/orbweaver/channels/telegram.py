@@ -50,6 +50,7 @@ from orbweaver.store import (
     Entity,
     Store,
     get_store,
+    is_deleted_session,
     new_uuid,
     session_at_id,
 )
@@ -436,6 +437,10 @@ async def session_for_telegram_user(
 ) -> Entity:
     for ent in await store.list_entities(SESSION_TYPE):
         if ent.jsonld.get("telegram_user_id") == user_id:
+            # A deleted operator session must not come back: fall through and
+            # create a fresh one rather than reusing the hidden row.
+            if is_deleted_session(ent):
+                continue
             if _normalize_operator(ent.jsonld, chat_id):
                 await store.put_entity(ent)
             return ent
