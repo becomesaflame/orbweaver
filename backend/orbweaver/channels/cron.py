@@ -149,7 +149,8 @@ async def _run_job_turn(store, sess, session_id: UUID, job: Job, message: str) -
             from orbweaver.selfheal import finish_attempt
 
             await finish_attempt(job, events, store)
-        await _notify_originating_channel(store, sess, session_id, job, events)
+        else:
+            await _notify_originating_channel(store, sess, session_id, job, events)
 
 
 async def _finish_job(store, job: Job) -> None:

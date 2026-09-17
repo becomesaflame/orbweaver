@@ -57,6 +57,50 @@ _loop: asyncio.AbstractEventLoop | None = None
 _gate = asyncio.Lock()
 
 
+def _telegram_chat_id() -> int:
+    return int(settings.orbweaver_selfheal_telegram_chat_id or 0)
+
+
+async def notify_selfheal(text: str) -> None:
+    """Ping the operator chat. No-op without chat id or bot token."""
+    chat = _telegram_chat_id()
+    body = (text or "").strip()
+    if not chat or not body:
+        return
+    from orbweaver.channels.telegram import notify_telegram_chat
+
+    try:
+        await notify_telegram_chat(chat, body)
+    except Exception:
+        log.exception("selfheal telegram notify failed")
+
+
+def trigger_notice(
+    fingerprint: str,
+    *,
+    count: int = 1,
+    logger_name: str = "",
+    traceback_text: str = "",
+    abort_payload: dict[str, Any] | None = None,
+) -> str:
+    lines = [f"Self-heal triggered: {fingerprint}", f"count={count}"]
+    if logger_name:
+        lines.append(f"logger={logger_name}")
+    abort_payload = abort_payload or {}
+    if abort_payload.get("reason"):
+        lines.append(f"abort={abort_payload.get('reason')}")
+        extra = str(abort_payload.get("text") or "").strip()
+        if extra:
+            lines.append(extra[:800])
+    elif traceback_text.strip():
+        lines.append(traceback_text.strip()[-800:])
+    return "\n".join(lines)
+
+
+def pr_notice(fingerprint: str, pr_url: str) -> str:
+    return f"Self-heal opened a PR\n{fingerprint}\n{pr_url}"
+
+
 def bind_loop(loop: asyncio.AbstractEventLoop | None) -> None:
     global _loop
     _loop = loop
@@ -336,7 +380,16 @@ async def maybe_enqueue(
             ent.jsonld.update(body)
         await db.put_entity(ent)
         log.info("selfheal enqueue %s job=%s session=%s", fp, job.id, sess.id)
-        return job
+    await notify_selfheal(
+        trigger_notice(
+            fp,
+            count=count,
+            logger_name=logger_name,
+            traceback_text=traceback_text,
+            abort_payload=abort_payload,
+        )
+    )
+    return job
 
 
 async def note_exception(
@@ -407,6 +460,8 @@ async def finish_attempt(job: Job, events: list[Event], store: Store | None = No
         ent.jsonld["state"] = "cooling-down"
     ent.jsonld["last_seen"] = datetime.now(UTC).isoformat()
     await db.put_entity(ent)
+    if pr:
+        await notify_selfheal(pr_notice(fp, pr))
 
 
 class SelfHealLogHandler(logging.Handler):

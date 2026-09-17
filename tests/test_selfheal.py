@@ -271,11 +271,73 @@ async def test_cron_finish_updates_ledger(monkeypatch):
         ]
 
     monkeypatch.setattr("orbweaver.channels.cron.agent_turn", fake_turn)
+    cron_pings: list = []
 
-    async def _silent(*_a, **_k):
-        return None
+    async def _cron_notify(*_a, **_k):
+        cron_pings.append(1)
 
-    monkeypatch.setattr("orbweaver.channels.cron._notify_originating_channel", _silent)
+    monkeypatch.setattr("orbweaver.channels.cron._notify_originating_channel", _cron_notify)
+    pings: list[str] = []
+
+    async def _ping(text: str) -> None:
+        pings.append(text)
+
+    monkeypatch.setattr("orbweaver.selfheal.notify_selfheal", _ping)
     await _run_job_turn(store, sess, job.session_id, job, job.payload["message"])
     ent = await store.get_entity_by_at_id(attempt_at_id(fp))
     assert ent.jsonld["pr_url"].endswith("/pull/7")
+    assert cron_pings == []
+    assert any("pull/7" in t and "Self-heal opened a PR" in t for t in pings)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_notifies_telegram(monkeypatch):
+    from orbweaver.config import settings
+
+    monkeypatch.setattr(settings, "orbweaver_selfheal_telegram_chat_id", 99)
+    pings: list[str] = []
+
+    async def _ping(text: str) -> None:
+        pings.append(text)
+
+    monkeypatch.setattr("orbweaver.selfheal.notify_selfheal", _ping)
+    store = reset_store_for_tests()
+    job = await maybe_enqueue(
+        "KeyError:agent.py:run_tools",
+        traceback_text="Traceback: KeyError: x",
+        logger_name="orbweaver.app",
+        store=store,
+    )
+    assert job is not None
+    assert len(pings) == 1
+    assert "Self-heal triggered: KeyError:agent.py:run_tools" in pings[0]
+    assert "logger=orbweaver.app" in pings[0]
+    assert "KeyError: x" in pings[0]
+    assert await maybe_enqueue("KeyError:agent.py:run_tools", store=store) is None
+    assert len(pings) == 1
+
+
+@pytest.mark.asyncio
+async def test_finish_noop_does_not_notify_pr(monkeypatch):
+    pings: list[str] = []
+
+    async def _ping(text: str) -> None:
+        pings.append(text)
+
+    monkeypatch.setattr("orbweaver.selfheal.notify_selfheal", _ping)
+    store = reset_store_for_tests()
+    fp = "KeyError:agent.py:run_tools"
+    job = await maybe_enqueue(fp, store=store)
+    assert job is not None
+    pings.clear()
+    events = [
+        Event(
+            id=uuid4(),
+            session_id=job.session_id,
+            seq=1,
+            kind="assistant",
+            payload={"text": NOOP_MARK},
+        )
+    ]
+    await finish_attempt(job, events, store)
+    assert pings == []
