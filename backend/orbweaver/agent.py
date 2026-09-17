@@ -44,8 +44,11 @@ from orbweaver.instructions import instruction_blocks_for_call, seen_instruction
 from orbweaver.lints import read_lints
 from orbweaver.llm import (
     StreamAssembler,
+    client_can_stream,
+    is_streaming_required_error,
     message_stream,
     prompt_cache_supported,
+    streaming_required_for_max_tokens,
     with_message_cache_breakpoint,
     with_tool_cache_breakpoint,
 )
@@ -1786,7 +1789,19 @@ async def _complete_llm(
     fire: Callable[[Event], None] | None,
     **kwargs: Any,
 ) -> Any:
-    stream_cm = message_stream(client, **kwargs)
+    long_request = streaming_required_for_max_tokens(kwargs.get("max_tokens") or 0)
+    can_stream = client_can_stream(client)
+    stream_cm: Any | None = None
+    try:
+        stream_cm = message_stream(client, **kwargs)
+    except Exception:
+        if long_request and can_stream:
+            log.warning(
+                "messages.stream() failed to open; not falling back to create (long request)",
+                exc_info=True,
+            )
+            raise
+        log.warning("messages.stream() failed to open", exc_info=True)
     if stream_cm is not None:
         try:
             return await _read_message_stream(
@@ -1802,13 +1817,24 @@ async def _complete_llm(
         except (TurnCancelled, TurnInjected):
             raise
         except Exception:
+            if long_request:
+                log.warning(
+                    "LLM stream failed; not falling back to create (long request)",
+                    exc_info=True,
+                )
+                raise
             log.warning("LLM stream failed; falling back to create", exc_info=True)
-    return await _await_or_cancel(
-        client.messages.create(**kwargs),
-        cancel,
-        produced,
-        inject=inject,
-    )
+    try:
+        return await _await_or_cancel(
+            client.messages.create(**kwargs),
+            cancel,
+            produced,
+            inject=inject,
+        )
+    except Exception as e:
+        if is_streaming_required_error(e):
+            log.warning("non-streaming create rejected for a long request", exc_info=True)
+        raise
 
 
 async def _create_agent_message(
