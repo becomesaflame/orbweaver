@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from orbweaver.auth import mint_token
@@ -47,6 +49,26 @@ def _isolated_turn_registry():
     yield
     reset_turns_for_tests()
     reset_router_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _restore_root_logging():
+    """`orbweaver serve` attaches a named stderr handler; do not leak it across tests."""
+    root = logging.getLogger()
+    handlers = list(root.handlers)
+    level = root.level
+    ow = logging.getLogger("orbweaver")
+    ow_level = ow.level
+    yield
+    for handler in list(root.handlers):
+        if handler not in handlers:
+            root.removeHandler(handler)
+            handler.close()
+    for handler in handlers:
+        if handler not in root.handlers:
+            root.addHandler(handler)
+    root.setLevel(level)
+    ow.setLevel(ow_level)
 
 
 @pytest.fixture(autouse=True)
