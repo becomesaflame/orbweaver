@@ -15,6 +15,8 @@ test("web chat shell loads health version and composer", async ({ page }) => {
   await expect(model).toBeVisible();
   await expect(model).toHaveValue("");
   await expect(model.locator("option").first()).toHaveText(/^Default/i);
+  await expect(page.locator("#ctx-meter")).toBeHidden();
+  await expect(page.locator("#chat-where")).toHaveText("");
   await expect(page.locator("#settings")).toBeVisible();
   await expect(page.locator("#token")).toBeVisible();
 });

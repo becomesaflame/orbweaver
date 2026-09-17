@@ -64,6 +64,7 @@ from orbweaver.model_routing import (
     supported_models,
 )
 from orbweaver.ratelimit import FileRateLimiter, get_rate_limiter
+from orbweaver.session_status import context_snapshot
 from orbweaver.store import (
     SESSION_TYPE,
     Entity,
@@ -809,7 +810,7 @@ async def list_events(session_id: UUID, _u: dict = Depends(_user)) -> dict[str, 
     # Named last_turn_state, not turn_status: the websocket already sends a
     # "turn_status" frame carrying a boolean `running`, and these are different
     # shapes.
-    return {
+    body: dict[str, Any] = {
         "events": [
             {
                 "id": str(e.id),
@@ -823,6 +824,10 @@ async def list_events(session_id: UUID, _u: dict = Depends(_user)) -> dict[str, 
             "running" if turn_is_running(session_id) else session_turn_status(events)
         ),
     }
+    sess = await get_store().get_entity(session_id)
+    if sess:
+        body["context"] = context_snapshot(session_id, events, session=sess.jsonld)
+    return body
 
 
 async def _run_turn(

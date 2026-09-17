@@ -78,6 +78,7 @@ from orbweaver.permissions.session_rules import (
 )
 from orbweaver.procs import BashInterrupted
 from orbweaver.readstate import ReadState, read_state_for
+from orbweaver.session_status import context_frame
 from orbweaver.skills import workspace_skills_prompt
 from orbweaver.store import Event, Job, Store, new_uuid
 from orbweaver.stuck import NUDGE_KIND, StuckDetector
@@ -1994,6 +1995,18 @@ async def agent_turn(
         if emit:
             emit({"kind": ev.kind, "payload": ev.payload, "id": str(ev.id), "seq": ev.seq})
 
+    def emit_context(events: list[Event]) -> None:
+        if emit:
+            emit(
+                context_frame(
+                    session_id,
+                    events,
+                    workspace=workspace,
+                    model=turn_model,
+                    channel=channel,
+                )
+            )
+
     def check() -> None:
         _raise_if_cancelled(cancel, produced)
 
@@ -2412,6 +2425,7 @@ async def agent_turn(
             ctx["events"] = events
             last_seq = events[-1].seq if events else 0
             record_response_usage(session_id, getattr(resp, "usage", None), last_seq)
+            emit_context(events)
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
             if texts:
                 ev = await store.append_event(session_id, "assistant", {"text": "\n".join(texts)})
@@ -2658,6 +2672,7 @@ async def agent_turn(
             events = await store.list_events(session_id)
             last_seq = events[-1].seq if events else 0
             record_response_usage(session_id, getattr(resp, "usage", None), last_seq)
+            emit_context(events)
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
             if texts:
                 fire(

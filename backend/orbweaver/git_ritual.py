@@ -117,6 +117,24 @@ def git_toplevel(cwd: Path) -> Path | None:
     return Path(top) if top else None
 
 
+def current_branch(cwd: Path | None) -> str:
+    """Short branch name for the LCD; empty when ``cwd`` is not a git checkout."""
+    if cwd is None or not cwd.is_dir():
+        return ""
+    repo = git_toplevel(cwd) or cwd
+    named = _run_git(repo, "symbolic-ref", "--short", "HEAD")
+    if named.returncode == 0:
+        return (named.stdout or "").strip()
+    proc = _run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    name = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        return ""
+    if name == "HEAD":
+        sha = (_run_git(repo, "rev-parse", "--short", "HEAD").stdout or "").strip()
+        return f"detached {sha}" if sha else "HEAD"
+    return name
+
+
 def _working_set_roots(root: Path) -> tuple[Path, ...]:
     """Working-set roots for the ritual: never follow `cd` outside them (#94).
 
