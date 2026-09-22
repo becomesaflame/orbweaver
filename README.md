@@ -141,6 +141,29 @@ Each Telegram user gets one **operator** session (`workspace:default`) and can p
 
 The operator's own turns get four extra allowlisted tools — `ListSessions`, `SessionDigest`, `AttachSession`, `DetachSession` — so "what was I doing on the airbed controller?" is answered by reading the other session's log and, on request, attaching to it. Attach pointers persist on the operator session (`attached_session`) and are rebound after a restart.
 
+### File uploads
+
+Drag a file onto the chat, use the paperclip, or paste one; on Telegram, send
+any document. Files land in the session workspace under `attachments/` and the
+agent gets their text.
+
+| Kind | Handling |
+| --- | --- |
+| Text, code, Markdown, JSON, CSV, YAML, logs | Decoded UTF-8, falling back to latin-1 |
+| PDF | Text per page via `pypdf` |
+| DOCX | Unzipped with the stdlib; tables flatten, headers/footnotes are dropped |
+| Images | Routed to the existing vision path, never text-extracted |
+| Anything else | Reported as unsupported binary, still stored |
+
+Detection reads content before trusting the extension, so a mislabelled file
+still parses. Malformed input never raises — a corrupt PDF or bogus zip comes
+back as a note.
+
+Two caps apply: extraction holds at most 200k characters, and at most 4k of
+those are inlined into the turn, with the stored path named so the agent can
+`Read` the rest. Uploads are capped at 25 MB (`413` past that); Telegram is
+capped at its own 20 MB bot download limit.
+
 ### Cron
 
 The host polls due jobs every 30s. A finished turn notifies the originating Telegram chat (success and abort) and appends a `cron_result` session event for web chat. Recurrence is `minute`, `hour`, or `day` (also `every hour`), or a 5-field cron expression (`minute hour day-of-month month day-of-week`, e.g. `0 9 * * mon`). Day-of-week `0` is Monday; names like `mon` work. Omit recurrence for a one-shot — those are deleted after they run.

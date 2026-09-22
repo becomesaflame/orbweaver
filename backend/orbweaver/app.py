@@ -56,6 +56,7 @@ from orbweaver.checkpoints import (
 )
 from orbweaver.config import settings
 from orbweaver.drain import drain_state, is_local_admin
+from orbweaver.extract import human_size
 from orbweaver.memory import expand_chunk_graph, remember, rewrite_search_query
 from orbweaver.model_routing import (
     is_supported_model,
@@ -83,6 +84,12 @@ from orbweaver.turns import acquire as acquire_turn
 from orbweaver.turns import get as get_running_turn
 from orbweaver.turns import is_running as turn_is_running
 from orbweaver.turns import release as release_turn
+from orbweaver.uploads import (
+    MAX_UPLOAD_BYTES,
+    UploadNameError,
+    UploadTooLarge,
+    store_upload,
+)
 from orbweaver.uris import (
     WorkspaceURIError,
     list_workspace_dirs,
@@ -1340,6 +1347,57 @@ async def _ws_resubscribe(store, session_id: UUID, sub: _WsSubscriber, after_seq
     }
     frames.append(status)
     sub.replay(frames, top)
+
+
+async def _read_capped(file: UploadFile, limit: int) -> bytes:
+    """Read at most ``limit`` bytes, then confirm the stream really ended.
+
+    ``await file.read()`` would pull an arbitrarily large upload into memory
+    before any size check could reject it. Reading ``limit + 1`` bytes is enough
+    to know the file is over the cap without holding the whole thing.
+    """
+    chunk = await file.read(limit + 1)
+    if len(chunk) > limit:
+        raise UploadTooLarge(
+            f"file exceeds the {human_size(limit)} upload limit"
+        )
+    return chunk
+
+
+@app.post("/v1/sessions/{session_id}/uploads")
+async def upload_to_session(
+    session_id: UUID, file: UploadFile = File(...), _u: dict = Depends(_user)
+) -> dict[str, Any]:
+    """Store one file under ``attachments/`` in the session workspace.
+
+    The response carries the stored path and either an extracted-text preview
+    or an image marker, so the composer can show a chip and the next turn can
+    tell the agent what to read.
+    """
+    store = get_store()
+    sess = await store.get_entity(session_id)
+    if not sess or sess.at_type != SESSION_TYPE:
+        raise HTTPException(404, "session not found")
+    if is_deleted_session(sess):
+        raise HTTPException(404, "session was deleted")
+    try:
+        data = await _read_capped(file, MAX_UPLOAD_BYTES)
+    except UploadTooLarge as e:
+        raise HTTPException(413, str(e)) from e
+    ws, _kind, changed = bind_workspace(
+        sess.jsonld, settings.workspace_root, session_key=str(session_id)
+    )
+    if changed:
+        await store.put_entity(sess)
+    try:
+        stored = await asyncio.to_thread(store_upload, ws, data, file.filename or "upload")
+    except UploadTooLarge as e:
+        raise HTTPException(413, str(e)) from e
+    except UploadNameError as e:
+        raise HTTPException(400, str(e)) from e
+    except (OSError, PermissionError) as e:
+        raise HTTPException(500, f"could not store upload: {e}") from e
+    return stored.payload()
 
 
 @app.post("/v1/stt")

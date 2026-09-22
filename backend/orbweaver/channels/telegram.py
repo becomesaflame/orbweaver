@@ -38,6 +38,7 @@ from orbweaver.channels.router import (
     RouterError,
 )
 from orbweaver.config import settings
+from orbweaver.extract import human_size
 from orbweaver.image import (
     PHOTO_MEDIA_TYPES,
     generate_image_bytes,
@@ -58,12 +59,21 @@ from orbweaver.turns import GatewayDraining, RunningTurn
 from orbweaver.turns import acquire as acquire_turn
 from orbweaver.turns import get as get_running_turn
 from orbweaver.turns import release as release_turn
+from orbweaver.uploads import (
+    TELEGRAM_MAX_BYTES,
+    StoredUpload,
+    UploadError,
+    describe_for_turn,
+    store_upload,
+)
 from orbweaver.workspace import WORKSPACE_KIND_LOCAL, apply_local_workspace_kind, bind_workspace
 
 log = logging.getLogger(__name__)
 
 TELEGRAM_IMAGE_HINT = (
     "The user may send photos; those arrive as images you can see. "
+    "Other attachments (PDF, text, code) are stored under attachments/ with their "
+    "text extracted into the message; Read the stored path for anything truncated. "
     "To send a photo on Telegram, write an image file in the workspace and call SendPhoto. "
     "GenerateImage creates a file and, on Telegram sessions, sends it to the chat."
 )
@@ -414,8 +424,96 @@ async def generate_and_maybe_send(ctx: dict, inp: dict) -> str:
     return json.dumps(payload)
 
 
-# ------------------------------------------------------------ operator session
+# ---------------------------------------------------------- inbound documents
 
+
+def document_too_large_text(name: str, size: int) -> str:
+    """Telegram refuses to serve bot downloads above ~20 MB; say so plainly."""
+    return (
+        f"{name} is {human_size(size)}, over Telegram's {human_size(TELEGRAM_MAX_BYTES)} "
+        "bot download limit. Put the file in the workspace another way "
+        "(scp, git, or the web UI) and tell me the path."
+    )
+
+
+async def receive_document(workspace: Any, data: bytes, filename: str) -> StoredUpload:
+    """Store a Telegram document off the event loop (it writes to disk)."""
+    return await asyncio.to_thread(store_upload, workspace, data, filename)
+
+
+async def handle_photo(update, context) -> None:
+    """A compressed photo: Telegram re-encoded it, so only the vision path applies.
+
+    Module level rather than nested in ``start_telegram`` so tests can drive it
+    with a fake update.
+    """
+    if not update.effective_user or not update.message or not update.message.photo:
+        return
+    if not user_allowed(update.effective_user.id):
+        return
+    largest = update.message.photo[-1]
+    try:
+        file = await largest.get_file()
+        data = bytes(await file.download_as_bytearray())
+    except Exception as e:
+        await update.message.reply_text(f"photo download failed: {e}")
+        return
+    bound = await _session_workspace(update, context)
+    try:
+        img = save_inbound_image(bound.ws, data, f"photo_{update.message.message_id}")
+    except Exception as e:
+        await update.message.reply_text(f"photo processing failed: {e}")
+        return
+    caption = (update.message.caption or "").strip() or "[Photo]"
+    start_turn(update, context, caption, images=[img])
+
+
+async def handle_document(update, context) -> None:
+    """Any uncompressed attachment.
+
+    Images keep the vision path they always had; everything else (PDF, text,
+    code, docx) is stored under ``attachments/`` and its extracted text goes
+    into the turn message alongside the workspace path.
+    """
+    if not update.effective_user or not update.message or not update.message.document:
+        return
+    if not user_allowed(update.effective_user.id):
+        return
+    doc = update.message.document
+    name = doc.file_name or f"document_{update.message.message_id}"
+    size = int(doc.file_size or 0)
+    # Check the declared size before get_file(): Telegram answers that call with
+    # a bare "file is too big" error, which is a worse thing to show the user.
+    if size > TELEGRAM_MAX_BYTES:
+        await update.message.reply_text(document_too_large_text(name, size))
+        return
+    try:
+        file = await doc.get_file()
+        data = bytes(await file.download_as_bytearray())
+    except Exception as e:
+        await update.message.reply_text(f"download failed: {e}")
+        return
+    if len(data) > TELEGRAM_MAX_BYTES:
+        await update.message.reply_text(document_too_large_text(name, len(data)))
+        return
+    bound = await _session_workspace(update, context)
+    try:
+        stored = await receive_document(bound.ws, data, name)
+    except UploadError as e:
+        await update.message.reply_text(f"cannot accept {name}: {e}")
+        return
+    except Exception as e:
+        log.exception("telegram document handling failed")
+        await update.message.reply_text(f"could not store {name}: {e}")
+        return
+    caption = (update.message.caption or "").strip()
+    note = describe_for_turn(stored)
+    text = f"{caption}\n\n{note}" if caption else note
+    images = [stored.image] if stored.image is not None else None
+    start_turn(update, context, text, images=images)
+
+
+# ------------------------------------------------------------ operator session
 
 def _normalize_operator(jsonld: dict[str, Any], chat_id: int | None) -> bool:
     """Bring an operator session's JSON-LD up to date. Returns True when it changed."""
@@ -934,49 +1032,6 @@ async def start_telegram() -> None:
             return
         start_turn(update, context, update.message.text)
 
-    async def on_photo(update: Update, context) -> None:
-        if not update.effective_user or not update.message or not update.message.photo:
-            return
-        if not user_allowed(update.effective_user.id):
-            return
-        largest = update.message.photo[-1]
-        try:
-            file = await largest.get_file()
-            data = bytes(await file.download_as_bytearray())
-        except Exception as e:
-            await update.message.reply_text(f"photo download failed: {e}")
-            return
-        bound = await _session_workspace(update, context)
-        try:
-            img = save_inbound_image(bound.ws, data, f"photo_{update.message.message_id}")
-        except Exception as e:
-            await update.message.reply_text(f"photo processing failed: {e}")
-            return
-        caption = (update.message.caption or "").strip() or "[Photo]"
-        start_turn(update, context, caption, images=[img])
-
-    async def on_image_document(update: Update, context) -> None:
-        if not update.effective_user or not update.message or not update.message.document:
-            return
-        if not user_allowed(update.effective_user.id):
-            return
-        doc = update.message.document
-        try:
-            file = await doc.get_file()
-            data = bytes(await file.download_as_bytearray())
-        except Exception as e:
-            await update.message.reply_text(f"image download failed: {e}")
-            return
-        bound = await _session_workspace(update, context)
-        stem = (doc.file_name or f"image_{update.message.message_id}").rsplit(".", 1)[0]
-        try:
-            img = save_inbound_image(bound.ws, data, stem)
-        except Exception as e:
-            await update.message.reply_text(f"image processing failed: {e}")
-            return
-        caption = (update.message.caption or "").strip() or f"[Image: {img['path']}]"
-        start_turn(update, context, caption, images=[img])
-
     async def on_voice(update: Update, context) -> None:
         if not update.message or not update.message.voice:
             return
@@ -1034,8 +1089,10 @@ async def start_telegram() -> None:
         CallbackQueryHandler(on_approval, pattern=rf"^{APPROVAL_CALLBACK_PREFIX}:")
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, on_image_document))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # Every document, not just images: PDFs, text, code. filters.PHOTO above
+    # still claims compressed photos, so this cannot shadow them.
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
     async def on_error(update, context) -> None:

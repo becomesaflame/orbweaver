@@ -16,6 +16,10 @@ dependencies = [
   "python-telegram-bot>=21.0",
   "apscheduler>=3.10.0",
   "pillow>=10.0.0",
+  # Pure-Python PDF text extraction for uploads. Guarded at the import site
+  # (orbweaver.extract) so a deploy without it degrades to "PDF support
+  # unavailable" instead of failing the upload.
+  "pypdf>=5.0.0",
 ]
 
 [project.optional-dependencies]
