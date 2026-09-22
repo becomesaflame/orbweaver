@@ -302,3 +302,26 @@ def test_consecutive_user_events_merge_for_the_model():
     assert messages[0]["role"] == "user"
     assert "one" in messages[0]["content"]
     assert "two" in messages[0]["content"]
+
+
+def test_duplicate_cron_user_prompt_is_projected_once():
+    sid = uuid4()
+    prompt = "You are Orbweaver's self-heal session. Fix ONE production failure."
+    events = [
+        Event(id=uuid4(), session_id=sid, seq=1, kind="user", payload={"text": prompt}),
+        Event(
+            id=uuid4(),
+            session_id=sid,
+            seq=2,
+            kind="compact_boundary",
+            payload={"text": "earlier turns", "keep_from_seq": 3},
+        ),
+        Event(id=uuid4(), session_id=sid, seq=3, kind="user", payload={"text": prompt}),
+        Event(id=uuid4(), session_id=sid, seq=4, kind="cron", payload={"job_id": "x"}),
+        Event(id=uuid4(), session_id=sid, seq=5, kind="user", payload={"text": prompt}),
+    ]
+    messages = _events_to_messages(events)
+    blob = "\n".join(
+        m["content"] if isinstance(m["content"], str) else str(m["content"]) for m in messages
+    )
+    assert blob.count(prompt) == 1

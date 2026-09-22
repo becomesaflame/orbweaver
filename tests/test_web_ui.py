@@ -88,6 +88,8 @@ async def test_index_references_vendored_scripts():
             assert "function refreshSessionsOnce()" in r.text
             assert ".chat.running .chat-state .spin" in r.text
             assert "@keyframes chat-spin" in r.text
+            assert "function markDuplicateUser()" in r.text
+            assert 'kind === "cron" || kind === "compact_boundary" || kind === "compact_summary"' in r.text
             assert ".chat.done {" in r.text
             # An answered approval drops its Allow / Deny buttons rather than
             # leaving them on screen (disabled) for a second click.

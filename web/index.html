@@ -269,6 +269,7 @@
     .msg { margin:0.45rem 0; padding:0.55rem 0.65rem; border-radius:2px; background:#0c120c; }
     .msg-body { white-space:pre-wrap; }
     .msg.user { border-left:3px solid var(--accent); }
+    .msg-dup-count { color:var(--lcd-dim); font-size:0.75rem; margin-left:0.4rem; }
     .msg.assistant { border-left:3px solid var(--amber); }
     .msg.tool { border-left:3px solid #888; color:#bbb; font-size:0.85rem; }
     .placeholder { color:var(--lcd-dim); padding:3rem 1rem; text-align:center; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
@@ -928,6 +929,8 @@
     const toolCards = new Map();      // tool_use_id -> card
     const subagentCards = new Map();  // child_session_id -> card
     const askBlocks = new Map();      // tool_use_id -> ask_user prompt element
+    let lastUserText = "";
+    let userTurnConcluded = false;
     let currentTodos = [];
     let _renderTarget = null;         // when set, new nodes go here (nested subagent events)
     const OUTPUT_CAP = 20000;
@@ -975,6 +978,8 @@
       askBlocks.clear();
       _renderTarget = null;
       logSid = "";
+      lastUserText = "";
+      userTurnConcluded = false;
       setTodos([]);
     }
     function copyText(text, btn) {
@@ -1567,16 +1572,41 @@
       const kind = ev.kind;
       if (kind === "assistant_delta" || kind === "tool_use_progress" || kind === "context") return;
       if (kind === "subscribed" || kind === "pong" || kind === "idle" || kind === "cancelling") return;
+      if (kind === "cron" || kind === "compact_boundary" || kind === "compact_summary") return;
       if (p.child_session_id && kind !== "subagent_started" && kind !== "subagent_finished") {
         if (renderNested(p.child_session_id, () => renderEventInner(ev, p))) return;
       }
       renderEventInner(ev, p);
+    }
+    function markDuplicateUser() {
+      const nodes = $("log").querySelectorAll(":scope > .msg.user");
+      const last = nodes[nodes.length - 1];
+      if (!last) return;
+      const n = Number(last.dataset.dupCount || "1") + 1;
+      last.dataset.dupCount = String(n);
+      let badge = last.querySelector(".msg-dup-count");
+      if (!badge) {
+        badge = el("span", "msg-dup-count");
+        last.appendChild(badge);
+      }
+      badge.textContent = "\u00d7" + n;
     }
     function renderEventInner(ev, p) {
       const kind = ev.kind;
       if (kind === "checkpoint_restore") {
         add("tool", restoreSummaryText(p), { seq: ev.seq, extraClass: "checkpoint", markdown: false });
       } else if (kind === "user" || kind === "assistant") {
+        if (kind === "user") {
+          const text = p.text || "";
+          if (text && text === lastUserText && !userTurnConcluded) {
+            markDuplicateUser();
+            return;
+          }
+          lastUserText = text;
+          userTurnConcluded = false;
+        } else {
+          userTurnConcluded = true;
+        }
         const extra = (p.injected || p.stuck_nudge) ? "injected" : "";
         const node = add(kind, p.text || "", { seq: ev.seq, extraClass: extra });
         if (kind === "user") attachUserActions(node, p.text || "", ev.seq, false);
@@ -1622,9 +1652,11 @@
       } else if (kind === "schedule_request") {
         renderNote(ev, "Scheduled task requested: " + summarizeInputClient("ScheduleTask", p.input || {}), "schedule");
       } else if (kind === "turn_aborted") {
+        userTurnConcluded = true;
         add("assistant", p.text || "Turn aborted", { seq: ev.seq, extraClass: "stopped", markdown: false });
         if (logSid) { waitingPermSids.delete(logSid); paintActivity(); }
       } else if (kind === "cron_result") {
+        userTurnConcluded = true;
         const extra = p.status === "aborted" ? "stopped" : "";
         add("assistant", p.text || "Scheduled task finished.", { seq: ev.seq, extraClass: extra });
         if (logSid) { waitingPermSids.delete(logSid); paintActivity(); }

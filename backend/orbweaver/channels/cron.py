@@ -121,6 +121,45 @@ def _slots() -> asyncio.Semaphore:
     return _job_slots
 
 
+def _one_shot_already_started(prior, job: Job, message: str) -> bool:
+    """True when this one-shot already wrote a cron/user event for this fire.
+
+    Recurring rows reuse the same job id; each occurrence still needs a new
+    prompt once the previous turn concluded.
+    """
+    if job.recurrence:
+        return False
+    want = message or "scheduled task"
+    jid = str(job.id)
+    for ev in prior:
+        payload = ev.payload or {}
+        if ev.kind == "cron" and str(payload.get("job_id") or "") == jid:
+            return True
+        if ev.kind == "user" and str(payload.get("text") or "") == want:
+            return True
+    return False
+
+
+def _should_resume(job: Job, prior, message: str) -> bool:
+    return (
+        bool(job.payload.get("resume"))
+        or session_turn_status(prior) == STATUS_STOPPED
+        or _one_shot_already_started(prior, job, message)
+    )
+
+
+async def _retry_later(store, job: Job, *, resume: bool = False) -> None:
+    """Keep a failed/busy job queued, but do not leave due_at in the past.
+
+    A due-now one-shot that raises is otherwise picked up every 30s sweeper
+    tick, and each retry used to append another copy of the prompt.
+    """
+    if resume:
+        job.payload["resume"] = True
+    job.due_at = datetime.now(UTC) + SKIP_RETRY
+    await store.reschedule_job(job)
+
+
 async def _run_job_turn(store, sess, session_id: UUID, job: Job, message: str) -> bool:
     """One cron turn under the per-session lock. Raises TurnBusy if the session is mid-turn.
 
@@ -134,7 +173,7 @@ async def _run_job_turn(store, sess, session_id: UUID, job: Job, message: str) -
         if changed:
             await store.put_entity(sess)
         prior = await store.list_events(session_id)
-        resume = bool(job.payload.get("resume")) or session_turn_status(prior) == STATUS_STOPPED
+        resume = _should_resume(job, prior, message)
         if not resume:
             await store.append_event(session_id, "cron", {"job_id": str(job.id)})
         prompt = "" if resume else (message or "scheduled task")
@@ -194,25 +233,28 @@ async def _run_job(store, job: Job) -> None:
                         session_id,
                         busy.channel or "unknown channel",
                     )
-                    job.due_at = datetime.now(UTC) + SKIP_RETRY
-                    await store.reschedule_job(job)
+                    await _retry_later(store, job)
                     return
                 except GatewayDraining:
                     log.info(
                         "cron: job %s skipped, gateway is draining; retry in 1 min",
                         job.id,
                     )
-                    job.due_at = datetime.now(UTC) + SKIP_RETRY
-                    await store.reschedule_job(job)
+                    await _retry_later(store, job)
                     return
                 if keep:
                     job.due_at = datetime.now(UTC)
+                    job.payload["resume"] = True
                     await store.reschedule_job(job)
                     log.info("cron: job %s paused for drain; will resume after restart", job.id)
                     return
             await _finish_job(store, job)
     except Exception:
         log.exception("cron: job %s failed", job.id)
+        try:
+            await _retry_later(store, job, resume=True)
+        except Exception:
+            log.exception("cron: job %s could not be rescheduled after failure", job.id)
     finally:
         _in_flight.discard(job.id)
 

@@ -531,10 +531,18 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
         for ev in events
         if ev.kind in {"tool_result", "MemoryRecall"} and (ev.payload or {}).get("tool_use_id")
     }
+    last_user_event_text = ""
+    concluded_since_user = False
     for ev in events:
         k = ev.kind
         p = ev.payload
         if k == "user":
+            text = str(p.get("text") or p.get("content") or "")
+            if text and text == last_user_event_text and not concluded_since_user:
+                # Same prompt written again (cron retried a one-shot) — keep one copy.
+                continue
+            last_user_event_text = text
+            concluded_since_user = False
             if p.get("ask_answer") and _answers_pending_ask(pending_tool, resolved):
                 # An AskUser answer is stored twice: as this user event and as the
                 # tool_result that follows. Flushing here would pair the tool_use
@@ -546,6 +554,7 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
             _flush_pending_tools(messages, pending_tool, stub_results=True)
             _append_user_content(messages, _user_message_content(p))
         elif k == "assistant":
+            concluded_since_user = True
             _flush_pending_tools(messages, pending_tool, stub_results=True)
             messages.append({"role": "assistant", "content": p.get("text") or ""})
         elif k == "tool_call":
@@ -589,6 +598,8 @@ def events_to_messages(events: list[Event]) -> list[dict[str, Any]]:
             else:
                 messages.append({"role": "user", "content": [block]})
         elif k in STOP_KINDS:
+            if k == "turn_aborted":
+                concluded_since_user = True
             _flush_pending_tools(messages, pending_tool, stub_results=True)
         elif k == PROJECT_INSTRUCTIONS_KIND:
             _flush_pending_tools(messages, pending_tool, stub_results=True)
