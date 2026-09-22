@@ -7,7 +7,7 @@ import json
 import logging
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -1582,6 +1582,27 @@ class TurnInjected(Exception):
     """Current LLM call aborted so a mid-turn follow-up can join this query."""
 
 
+@dataclass
+class _TurnLLM:
+    """Concrete model + client for this turn; mutated when Auto / 503 falls back."""
+
+    model: str
+    client: Any
+    tried: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        if self.model:
+            self.tried.add(self.model)
+
+    def switch(self, nxt: str, client: Any) -> None:
+        from orbweaver.model_routing import set_current_model
+
+        self.model = nxt
+        self.client = client
+        self.tried.add(nxt)
+        set_current_model(nxt)
+
+
 async def _create_with_overflow_retry(
     client: Any,
     *,
@@ -1598,11 +1619,23 @@ async def _create_with_overflow_retry(
     fire: Callable[[Event], None],
     emit: Callable[[dict[str, Any]], None] | None = None,
     nudge: str | None = None,
+    live: _TurnLLM | None = None,
 ) -> Any:
-    """Call the LLM (stream when available); on context overflow, compact and retry."""
+    """Call the LLM (stream when available); on context overflow, compact and retry.
+
+    HTTP 503 / Anthropic overloaded switches ``live`` to a different model
+    (preferably another provider) instead of retrying the same id.
+    """
+    from orbweaver.llm import is_upstream_unavailable, make_agent_client
+    from orbweaver.model_routing import MAX_UNAVAILABLE_FALLBACKS, fallback_model
+
     last_error: BaseException | None = None
     retries = max(0, int(settings.compact_overflow_retries))
+    unavailable_left = MAX_UNAVAILABLE_FALLBACKS
     for attempt in range(retries + 1):
+        if live is not None:
+            client = live.client
+            model = live.model
         events = await store.list_events(session_id)
         messages = _prompt_messages(events, workspace, user_text)
         if nudge:
@@ -1641,6 +1674,28 @@ async def _create_with_overflow_retry(
             raise
         except Exception as e:
             last_error = e
+            if (
+                live is not None
+                and unavailable_left > 0
+                and is_upstream_unavailable(e)
+            ):
+                nxt = fallback_model(model, tried=live.tried)
+                nxt_client = make_agent_client(model=nxt) if nxt else None
+                if nxt and nxt_client is not None:
+                    log.warning(
+                        "model %s unavailable (%s); falling back to %s",
+                        model,
+                        getattr(e, "status_code", type(e).__name__),
+                        nxt,
+                    )
+                    _emit_progress(
+                        emit,
+                        "model_fallback",
+                        {"from": model, "to": nxt, "reason": "unavailable"},
+                    )
+                    live.switch(nxt, nxt_client)
+                    unavailable_left -= 1
+                    continue
             if not should_overflow_retry(e, near_limit=near_limit):
                 raise
             if attempt >= retries:
@@ -1989,6 +2044,7 @@ async def agent_turn(
                 }
             )
     produced: list[Event] = []
+    llm = _TurnLLM(model="", client=None)
 
     def fire(ev: Event) -> None:
         produced.append(ev)
@@ -2002,7 +2058,7 @@ async def agent_turn(
                     session_id,
                     events,
                     workspace=workspace,
-                    model=turn_model,
+                    model=llm.model,
                     channel=channel,
                 )
             )
@@ -2119,6 +2175,7 @@ async def agent_turn(
     check()
     from orbweaver.llm import make_agent_client, no_llm_echo
     from orbweaver.model_routing import (
+        realize_turn_model,
         reset_current_model,
         resolve_turn_model,
         set_current_model,
@@ -2126,17 +2183,21 @@ async def agent_turn(
 
     sess = await store.get_entity(session_id)
     resolved_channel = resolve_channel(sess.jsonld if sess else None, channel=channel)
-    turn_model = resolve_turn_model(
+    requested_model = resolve_turn_model(
         override=model, session=sess.jsonld if sess else None, channel=resolved_channel
     )
+    turn_model = realize_turn_model(requested_model)
     # Published for the turn so event_budget / compact follow this model.
     model_token = set_current_model(turn_model)
-    client = make_agent_client(model=turn_model)
+    client = make_agent_client(model=turn_model) if turn_model else None
+    llm.model = turn_model
+    llm.client = client
+    llm.tried = {turn_model} if turn_model else set()
     if client is None:
         ev = await store.append_event(
             session_id,
             "assistant",
-            {"text": no_llm_echo(user_text or "", turn_model)},
+            {"text": no_llm_echo(user_text or "", requested_model or turn_model)},
         )
         fire(ev)
         reset_current_model(model_token)
@@ -2369,11 +2430,11 @@ async def agent_turn(
         await maybe_compact(
             store,
             session_id,
-            client=client,
+            client=llm.client,
             workspace=workspace,
             system=system,
             tools=active_tools,
-            model=turn_model,
+            model=llm.model,
         )
         if turn_state is not None:
             for ev in reversed(await store.list_events(session_id)):
@@ -2404,13 +2465,13 @@ async def agent_turn(
             await settle_probes()
             try:
                 resp = await _create_with_overflow_retry(
-                    client,
+                    llm.client,
                     store=store,
                     session_id=session_id,
                     workspace=workspace,
                     system=system,
                     user_text=user_text,
-                    model=turn_model,
+                    model=llm.model,
                     tools=active_tools,
                     cancel=cancel,
                     produced=produced,
@@ -2418,6 +2479,7 @@ async def agent_turn(
                     fire=fire,
                     emit=emit,
                     nudge=nudge,
+                    live=llm,
                 )
             except TurnInjected:
                 continue
@@ -2637,24 +2699,24 @@ async def agent_turn(
             await maybe_compact(
                 store,
                 session_id,
-                client=client,
+                client=llm.client,
                 workspace=workspace,
                 system=system,
                 tools=active_tools,
-                model=turn_model,
+                model=llm.model,
             )
         else:
             await settle_probes()
             await deliver_child_results()
             try:
                 resp = await _create_with_overflow_retry(
-                    client,
+                    llm.client,
                     store=store,
                     session_id=session_id,
                     workspace=workspace,
                     system=system,
                     user_text=user_text,
-                    model=turn_model,
+                    model=llm.model,
                     tools=[],
                     cancel=cancel,
                     produced=produced,
@@ -2666,6 +2728,7 @@ async def agent_turn(
                         if ctx.get("git_not_done")
                         else CONCLUDE_NUDGE
                     ),
+                    live=llm,
                 )
             except TurnInjected:
                 return produced

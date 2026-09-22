@@ -552,11 +552,25 @@ async def test_post_retries_429_then_succeeds(_fast_retries):
 
 @pytest.mark.asyncio
 async def test_post_retries_transient_5xx(_fast_retries):
-    http = _ScriptedHTTP([(503, {"error": {"message": "upstream busy"}}, None), (200, _OK, None)])
+    http = _ScriptedHTTP([(500, {"error": {"message": "upstream busy"}}, None), (200, _OK, None)])
     client = OpenAICompatClient("http://x/v1", "k", http=http)
     resp = await client.create(messages=[{"role": "user", "content": "hi"}])
     assert http.calls == 2
     assert resp.content[0].text == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_post_does_not_retry_503_so_router_can_switch_models(_fast_retries):
+    """503 is model-unavailable; same-id retry would delay the provider switch."""
+    from orbweaver.llm import is_upstream_unavailable
+
+    http = _ScriptedHTTP([(503, {"error": {"message": "The model is temporarily rate limited"}}, None)])
+    client = OpenAICompatClient("http://x/v1", "k", http=http)
+    with pytest.raises(OpenAICompatError) as ei:
+        await client.create(messages=[{"role": "user", "content": "hi"}])
+    assert http.calls == 1
+    assert ei.value.status_code == 503
+    assert is_upstream_unavailable(ei.value)
 
 
 @pytest.mark.asyncio
@@ -667,6 +681,7 @@ def test_retry_delay_policy():
 
     assert retry_delay_for(OpenAICompatError("x", status_code=401), attempt=1) is None
     assert retry_delay_for(OpenAICompatError("x", status_code=502), attempt=1) is None
+    assert retry_delay_for(OpenAICompatError("x", status_code=503), attempt=1) is None
     assert retry_delay_for(OpenAICompatError("x", status_code=429), attempt=1) is not None
     # Backoff grows with the attempt number but never exceeds the ceiling.
     err = OpenAICompatError("x", status_code=429)

@@ -1,13 +1,17 @@
-"""Per-channel agent model defaults and per-turn overrides (#137).
+"""Per-channel agent model defaults, Auto routing, and per-turn overrides (#137).
 
 Resolution order for one turn: explicit override → model stored on the
 session → channel default (``ORBWEAVER_WEB_MODEL`` / ``ORBWEAVER_VSCODE_MODEL``
-/ ``ORBWEAVER_TELEGRAM_MODEL``) → ``ORBWEAVER_MODEL``. Provider routing is
-unchanged: Claude ids go to Anthropic, catalog names to Earth Runtime.
+/ ``ORBWEAVER_TELEGRAM_MODEL``) → ``ORBWEAVER_MODEL``. Web and Telegram default
+to the virtual id ``auto``, which the router replaces with a concrete model
+that currently has a provider. Provider routing is otherwise unchanged: Claude
+ids go to Anthropic, catalog names to Earth Runtime.
 
-The resolved model is published through a ``ContextVar`` for the duration of
-the turn so context-window maths (``settings.event_budget``) follow the model
-actually in use instead of the process-wide default.
+The resolved *concrete* model is published through a ``ContextVar`` for the
+duration of the turn so context-window maths (``settings.event_budget``) follow
+the model actually in use instead of the process-wide default. HTTP 503
+(upstream model unavailable) switches to a different model, preferring a
+different provider, rather than retrying the same id.
 """
 
 from __future__ import annotations
@@ -41,6 +45,32 @@ CLAUDE_MODEL_LABELS: dict[str, str] = {
 # Telegram ``/model default`` (and friends) clear the session override.
 CLEAR_MODEL_ALIASES = frozenset({"default", "clear", "reset", "none", "-"})
 
+AUTO_MODEL_ID = "auto"
+AUTO_MODEL_LABEL = "Auto"
+# Extra concrete models to try after an upstream-unavailable failure (503/529).
+MAX_UNAVAILABLE_FALLBACKS = 3
+
+# Preferred Auto / 503-fallback order after ``ORBWEAVER_MODEL``. Mix providers so
+# a down Anthropic model does not land on another Anthropic id first.
+AUTO_RANKING: tuple[str, ...] = (
+    "claude-sonnet-4-6",
+    "glm-5.3-flash",
+    "claude-sonnet-5",
+    "qwen3.6-35b",
+    "gpt-oss-120b",
+    "claude-haiku-4-5",
+    "deepseek-v4-flash-0731",
+    "glm-5.3",
+    "claude-opus-5",
+    "qwen3.8-27b",
+    "kimi-k3",
+    "deepseek-v4.1-flash",
+    "claude-fable-5-1",
+    "minimax-m3",
+    "nemotron-3-ultra",
+    "hy4",
+)
+
 WEB_CHANNEL = "web"
 VSCODE_CHANNEL = "vscode"
 TELEGRAM_CHANNEL = "telegram"
@@ -68,16 +98,24 @@ def _norm_channel(value: str | None) -> str:
     return raw
 
 
+def is_auto_model(model: str | None) -> bool:
+    return (model or "").strip().lower() == AUTO_MODEL_ID
+
+
 def channel_default_model(channel: str | None) -> str:
-    """Env default for a channel; ``ORBWEAVER_MODEL`` for cron, subagents and unknown."""
+    """Env default for a channel.
+
+    Web and Telegram fall back to Auto when their env is empty. VS Code, cron,
+    subagents and unknown channels use ``ORBWEAVER_MODEL``.
+    """
     fallback = settings.orbweaver_model.strip()
     ch = _norm_channel(channel)
     if ch == WEB_CHANNEL:
-        return settings.orbweaver_web_model.strip() or fallback
+        return settings.orbweaver_web_model.strip() or AUTO_MODEL_ID
     if ch == VSCODE_CHANNEL:
         return settings.orbweaver_vscode_model.strip() or fallback
     if ch == TELEGRAM_CHANNEL:
-        return settings.orbweaver_telegram_model.strip() or fallback
+        return settings.orbweaver_telegram_model.strip() or AUTO_MODEL_ID
     return fallback
 
 
@@ -91,11 +129,11 @@ def model_defaults() -> dict[str, str]:
 
 
 def is_supported_model(model: str | None) -> bool:
-    """Claude ids, Earth Runtime catalog names, or the configured Ollama model."""
+    """Auto, Claude ids, Earth Runtime catalog names, or the configured Ollama model."""
     m = (model or "").strip()
     if not m or len(m) > MODEL_ID_MAX_LEN or any(c.isspace() for c in m):
         return False
-    if is_open_model(m) or is_claude_model(m):
+    if is_auto_model(m) or is_open_model(m) or is_claude_model(m):
         return True
     ollama = settings.ollama_model.strip()
     return bool(ollama) and m == ollama
@@ -126,6 +164,8 @@ def unsupported_configured_models() -> list[tuple[str, str]]:
 def model_label(model: str) -> str:
     """Short picker name; falls back to the id."""
     mid = (model or "").strip()
+    if is_auto_model(mid):
+        return AUTO_MODEL_LABEL
     if mid in CLAUDE_MODEL_LABELS:
         return CLAUDE_MODEL_LABELS[mid]
     spec = OPEN_MODELS.get(mid)
@@ -139,6 +179,8 @@ def format_model_id(model: str) -> str:
     mid = (model or "").strip()
     if not mid:
         return ""
+    if is_auto_model(mid):
+        return AUTO_MODEL_LABEL
     lab = model_label(mid)
     return f"{lab} ({mid})" if lab != mid else mid
 
@@ -205,15 +247,74 @@ def resolve_turn_model(
     session: dict[str, Any] | None = None,
     channel: str | None = None,
 ) -> str:
-    """override → session ``model`` → channel default → ``ORBWEAVER_MODEL``."""
+    """override → session ``model`` → channel default → ``ORBWEAVER_MODEL``.
+
+    May return the virtual id ``auto``; call ``realize_turn_model`` before
+    talking to a provider.
+    """
     for candidate in (override, (session or {}).get("model")):
         if candidate and str(candidate).strip():
             return str(candidate).strip()
     return channel_default_model(channel)
 
 
+def routed_models(*, skip: set[str] | None = None) -> list[str]:
+    """Concrete models that currently have a provider, ranked for Auto / 503 fallback."""
+    from orbweaver.llm import select_provider
+
+    ignore = {m.strip() for m in (skip or set()) if m and not is_auto_model(m)}
+    ordered: list[str] = []
+
+    def add(mid: str) -> None:
+        mid = (mid or "").strip()
+        if not mid or is_auto_model(mid) or mid in ordered or mid in ignore:
+            return
+        provider = select_provider(mid)
+        if provider in {"none", "auto"}:
+            return
+        ordered.append(mid)
+
+    add(settings.orbweaver_model)
+    for mid in AUTO_RANKING:
+        add(mid)
+    for mid in KNOWN_CLAUDE_MODELS:
+        add(mid)
+    for mid in OPEN_MODELS:
+        add(mid)
+    add(settings.ollama_model)
+    return ordered
+
+
+def pick_auto_model(*, skip: set[str] | None = None) -> str:
+    """First Auto candidate with a live provider, or empty when none are configured."""
+    ranked = routed_models(skip=skip)
+    return ranked[0] if ranked else ""
+
+
+def realize_turn_model(model: str | None, *, skip: set[str] | None = None) -> str:
+    """Replace ``auto`` with a concrete id; pass other ids through."""
+    mid = (model or "").strip()
+    if is_auto_model(mid):
+        return pick_auto_model(skip=skip)
+    return mid
+
+
+def fallback_model(failed: str, *, tried: set[str] | None = None) -> str:
+    """Next model after an unavailable failure, preferring a different provider."""
+    from orbweaver.llm import select_provider
+
+    skip = set(tried or ())
+    skip.add((failed or "").strip())
+    failed_provider = select_provider(failed)
+    candidates = routed_models(skip=skip)
+    other = [m for m in candidates if select_provider(m) != failed_provider]
+    same = [m for m in candidates if select_provider(m) == failed_provider]
+    ordered = other + same
+    return ordered[0] if ordered else ""
+
+
 def supported_models() -> list[dict[str, Any]]:
-    """Picker catalog: configured defaults, known Claude ids, Earth Runtime, Ollama."""
+    """Picker catalog: Auto, configured defaults, known Claude ids, Earth Runtime, Ollama."""
     from orbweaver.llm import select_provider
 
     ordered: list[str] = []
@@ -223,6 +324,7 @@ def supported_models() -> list[dict[str, Any]]:
         if mid and mid not in ordered:
             ordered.append(mid)
 
+    add(AUTO_MODEL_ID)
     add(settings.orbweaver_model)
     for ch in (WEB_CHANNEL, VSCODE_CHANNEL, TELEGRAM_CHANNEL):
         add(channel_default_model(ch))
@@ -232,16 +334,20 @@ def supported_models() -> list[dict[str, Any]]:
         add(mid)
     add(settings.ollama_model)
 
+    auto_pick = pick_auto_model()
     out: list[dict[str, Any]] = []
     for mid in ordered:
         provider = select_provider(mid)
+        window = context_window_for(mid, settings.context_window)
+        if is_auto_model(mid) and auto_pick:
+            window = context_window_for(auto_pick, settings.context_window)
         out.append(
             {
                 "id": mid,
                 "label": model_label(mid),
                 "provider": provider,
                 "available": provider != "none",
-                "context_window": context_window_for(mid, settings.context_window),
+                "context_window": window,
             }
         )
     return out

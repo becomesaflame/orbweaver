@@ -71,6 +71,8 @@ async def test_index_references_vendored_scripts():
             assert "function paintChatState(b, sid)" in r.text
             assert "function paintActivity()" in r.text
             assert "function setGatewayRunning(ids)" in r.text
+            assert "default is Auto" in r.text
+            assert 'id === "auto"' in r.text
             assert 'classList.toggle("running", running)' in r.text
             assert 'classList.toggle("done", done)' in r.text
             assert "b.onclick = () => { markSeen(s.id); setActive(s); };" in r.text

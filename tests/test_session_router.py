@@ -529,9 +529,13 @@ async def test_model_command_lists_sets_attached_and_clears(tmp_path, monkeypatc
 
     listed = await tg.model_text(bound, "")
     assert "Available:" in listed and "qwen3.6-35b" in listed
+    assert "auto — Auto" in listed
     assert "/model <id>" in listed
     status = await tg.status_text(bound)
     assert "model: default" in status and "qwen3.6-35b" in status
+    auto_msg = await tg.model_text(bound, "auto")
+    assert auto_msg.startswith("This chat now uses Auto")
+    assert (await store.get_entity(bound.operator.id)).jsonld["model"] == "auto"
 
     set_msg = await tg.model_text(bound, "opus")
     assert "claude-opus-5" in set_msg

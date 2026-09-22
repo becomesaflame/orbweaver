@@ -14,10 +14,12 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://api.earthruntime.com/v1"
     earthruntime_api_key: str = ""
-    # Shared open-model pools shed load as 429 (and transient 5xx). Retry those
-    # in-process instead of surfacing a hard failure: the permission classifier
-    # fails closed onto a human approval prompt when its LLM call dies, so one
-    # rate-limited instant should not interrupt a turn. 0 disables retrying.
+    # Shared open-model pools shed load as 429 (and transient 5xx). Retry 429,
+    # 500, and 504 in-process instead of surfacing a hard failure: the
+    # permission classifier fails closed onto a human approval prompt when its
+    # LLM call dies, so one rate-limited instant should not interrupt a turn.
+    # HTTP 503 is *not* retried on the same model — the router falls back to a
+    # different id (preferably another provider). 0 disables same-model retry.
     orbweaver_llm_retries: int = 3
     orbweaver_llm_retry_base_s: float = 0.5
     orbweaver_llm_retry_max_s: float = 8.0
@@ -30,11 +32,12 @@ class Settings(BaseSettings):
     # served from the gateway itself and needs nothing here.
     orbweaver_cors_origins: str = ""
     orbweaver_model: str = "claude-sonnet-4-6"
-    # Per-channel agent defaults (#137); empty falls back to ORBWEAVER_MODEL.
-    # Cron, subagents and unknown channels always use ORBWEAVER_MODEL.
-    orbweaver_web_model: str = ""
+    # Per-channel agent defaults (#137). Web and Telegram default to Auto (the
+    # router picks a live model). Empty vscode / cron / subagents use
+    # ORBWEAVER_MODEL. Set a concrete id to pin that channel.
+    orbweaver_web_model: str = "auto"
     orbweaver_vscode_model: str = ""
-    orbweaver_telegram_model: str = ""
+    orbweaver_telegram_model: str = "auto"
     orbweaver_classifier_model: str = "claude-sonnet-4-6"
     orbweaver_injection_probe_model: str = "claude-haiku-4-5"
     # off | scoped | all. scoped skips in-project Read/Grep/Glob/WorkspaceSearch and
