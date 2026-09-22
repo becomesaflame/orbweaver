@@ -131,6 +131,10 @@ async def _lifespan(_app: FastAPI):
 
         bind_loop(asyncio.get_running_loop())
         attach_log_handler()
+    if not testing:
+        from orbweaver.resume import kickoff_drain_resumes
+
+        asyncio.create_task(kickoff_drain_resumes(), name="drain-resume")
     yield
     begin_drain()
     from orbweaver.selfheal import bind_loop as unbind_selfheal
@@ -461,7 +465,9 @@ async def _finish_cancelled_turn(
             await store.truncate_events(sess.id, state.user_seq)
             await _revert_autotitle_if_needed(store, sess, user_text)
         return {"events": [], "status": "discarded", "user_seq": state.user_seq}
-    marker = await store.append_event(sess.id, "turn_interrupted", {"reason": "stop"})
+    marker = await store.append_event(
+        sess.id, "turn_interrupted", {"reason": state.interrupt_reason or "stop"}
+    )
     produced = list(produced) + [marker]
     _broadcast(sess.id, _event_dict(marker))
     return {

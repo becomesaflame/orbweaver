@@ -7,9 +7,9 @@ must go through :func:`acquire` (or :func:`running_turn`) before calling
 ``agent_turn``; the registry holds the cancel flag and inject queue that the
 web UI's Stop and inject endpoints use.
 
-:func:`begin_drain` stops new user-facing turns so a deploy can wait until
-:func:`active` is empty, then restart. In-flight turns (and subagents they
-spawn) keep running.
+:func:`begin_drain` stops new user-facing turns and cancels in-flight ones so
+a deploy can wait until :func:`active` is empty, then restart. The event log
+is the saved state; after boot, cron/web resume those sessions.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from uuid import UUID
 
+DRAIN_INTERRUPT = "drain"
+
 
 @dataclass
 class RunningTurn:
@@ -29,6 +31,7 @@ class RunningTurn:
     user_seq: int = 0
     channel: str = ""
     session_id: UUID | None = None
+    interrupt_reason: str = ""
 
 
 class TurnBusy(Exception):
@@ -56,9 +59,21 @@ _draining = False
 
 
 def begin_drain() -> None:
-    """Refuse new user-facing turns. Idempotent."""
+    """Refuse new turns and preempt in-flight ones. Idempotent."""
     global _draining
     _draining = True
+    cancel_running(reason=DRAIN_INTERRUPT)
+
+
+def cancel_running(*, reason: str = DRAIN_INTERRUPT) -> list[UUID]:
+    """Set cancel on every registered turn. Returns the session ids signalled."""
+    ids: list[UUID] = []
+    for sid, state in _running.items():
+        if not state.interrupt_reason:
+            state.interrupt_reason = reason
+        state.cancel.set()
+        ids.append(sid)
+    return ids
 
 
 def is_draining() -> bool:
@@ -104,7 +119,11 @@ def active() -> dict[UUID, RunningTurn]:
 def snapshot() -> list[dict[str, str]]:
     """JSON-safe view of :func:`active` for the deploy drain endpoint."""
     return [
-        {"session_id": str(sid), "channel": state.channel or "unknown"}
+        {
+            "session_id": str(sid),
+            "channel": state.channel or "unknown",
+            "cancelling": "1" if state.cancel.is_set() else "0",
+        }
         for sid, state in _running.items()
     ]
 
