@@ -24,6 +24,7 @@ from orbweaver.turnstate import (
     STATUS_OK,
     STATUS_STOPPED,
     STATUS_WAITING_ASK,
+    STATUS_WAITING_PERM,
     session_turn_status,
 )
 
@@ -145,6 +146,50 @@ def test_answered_ask_user_then_answer_is_finished():
 
 def test_empty_session_has_nothing_to_continue():
     assert session_turn_status([]) == STATUS_OK
+
+
+def test_unresolved_permission_request_is_waiting_perm():
+    """A permission_request with no response marks the turn as waiting_perm."""
+    events = [
+        _ev(1, "user", {"text": "do dangerous thing"}),
+        _ev(2, "tool_call", {"id": "tu-1", "name": "Bash"}),
+        _ev(3, "permission_request", {"tool_use_id": "tu-1", "name": "Bash"}),
+    ]
+    assert session_turn_status(events) == STATUS_WAITING_PERM
+
+
+def test_resolved_permission_request_via_response_is_not_waiting():
+    """A permission_request followed by a permission_response is resolved."""
+    events = [
+        _ev(1, "user", {"text": "do it"}),
+        _ev(2, "tool_call", {"id": "tu-1", "name": "Bash"}),
+        _ev(3, "permission_request", {"tool_use_id": "tu-1", "name": "Bash"}),
+        _ev(4, "permission_response", {"tool_use_id": "tu-1", "decision": "allow"}),
+        _ev(5, "tool_result", {"tool_use_id": "tu-1", "content": "ok"}),
+        _ev(6, "assistant", {"text": "done"}),
+    ]
+    assert session_turn_status(events) == STATUS_OK
+
+
+def test_resolved_permission_request_via_tool_result_is_not_waiting():
+    """A tool_result for the same tool_use_id also resolves the permission."""
+    events = [
+        _ev(1, "user", {"text": "do it"}),
+        _ev(2, "tool_call", {"id": "tu-1", "name": "Bash"}),
+        _ev(3, "permission_request", {"tool_use_id": "tu-1", "name": "Bash"}),
+        _ev(4, "tool_result", {"tool_use_id": "tu-1", "content": "output"}),
+        _ev(5, "assistant", {"text": "done"}),
+    ]
+    assert session_turn_status(events) == STATUS_OK
+
+
+def test_waiting_perm_takes_precedence_over_stopped():
+    """waiting_perm is detected before stopped; the turn is held, not dead."""
+    events = [
+        _ev(1, "user", {"text": "go"}),
+        _ev(2, "permission_request", {"tool_use_id": "tu-1", "name": "Bash"}),
+    ]
+    assert session_turn_status(events) == STATUS_WAITING_PERM
 
 
 @pytest.mark.asyncio
