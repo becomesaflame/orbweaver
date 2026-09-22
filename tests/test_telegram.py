@@ -236,3 +236,145 @@ async def test_run_turn_replies_before_cancelled_error_propagates(tmp_path, monk
         await _run_turn(SimpleNamespace(message=_Msg()), None, "still going")
     assert replies
     assert "interrupted" in replies[0].lower()
+
+
+# --------------------------------------------------- inbound documents (uploads)
+#
+# Telegram used to accept only photos and image-documents; anything else was
+# silently dropped. handle_document now stores any attachment and feeds its
+# extracted text into the turn, while images keep the vision path unchanged.
+
+
+class _DocMsg:
+    """Minimal stand-in for telegram.Message carrying a document."""
+
+    def __init__(self, document, caption: str = "") -> None:
+        self.document = document
+        self.caption = caption
+        self.message_id = 7
+        self.replies: list[str] = []
+
+    async def reply_text(self, text):
+        self.replies.append(text)
+
+
+class _Doc:
+    def __init__(self, name: str, data: bytes, *, declared_size: int | None = None) -> None:
+        self.file_name = name
+        self.file_size = declared_size if declared_size is not None else len(data)
+        self._data = data
+
+    async def get_file(self):
+        return self
+
+    async def download_as_bytearray(self):
+        return bytearray(self._data)
+
+
+def _doc_update(document, caption: str = ""):
+    from types import SimpleNamespace
+
+    msg = _DocMsg(document, caption)
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=42),
+        message=msg,
+        effective_chat=SimpleNamespace(id=42),
+    )
+
+
+@pytest.fixture
+def _tg_bound(tmp_path, monkeypatch):
+    """Bind handlers to a throwaway workspace and capture start_turn calls."""
+    from orbweaver.channels import telegram as tg
+
+    monkeypatch.setattr(settings, "telegram_allowlist", "42")
+    started: list[dict] = []
+
+    async def fake_ws(*_a, **_k):
+        store = reset_store_for_tests()
+        op = await tg.session_for_telegram_user(store, 42, chat_id=42)
+        return tg.Bound(
+            store=store,
+            operator=op,
+            target=op,
+            ws=LocalWorkspace("workspace:default", str(tmp_path)),
+            kind="local",
+            chat_id=42,
+        )
+
+    def fake_start(update, context, text, images=None, **kw):
+        started.append({"text": text, "images": images})
+
+    monkeypatch.setattr(tg, "_session_workspace", fake_ws)
+    monkeypatch.setattr(tg, "start_turn", fake_start)
+    return started, tmp_path
+
+
+@pytest.mark.asyncio
+async def test_telegram_accepts_a_text_document(_tg_bound):
+    from orbweaver.channels.telegram import handle_document
+
+    started, root = _tg_bound
+    doc = _Doc("notes.txt", b"the roof needs replacing by spring")
+    await handle_document(_doc_update(doc, caption="what does this say?"), None)
+
+    assert len(started) == 1
+    text = started[0]["text"]
+    assert "what does this say?" in text
+    assert "attachments/notes.txt" in text
+    assert "the roof needs replacing by spring" in text
+    assert started[0]["images"] is None
+    assert (root / "attachments" / "notes.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_telegram_image_document_still_uses_vision(_tg_bound):
+    """The pre-existing photo/image path must not regress."""
+    from orbweaver.channels.telegram import handle_document
+
+    started, _root = _tg_bound
+    doc = _Doc("diagram.png", _png_bytes())
+    await handle_document(_doc_update(doc), None)
+
+    assert len(started) == 1
+    images = started[0]["images"]
+    assert images and images[0].get("media_type") == "image/jpeg"
+    assert "attachments/diagram.jpg" in started[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_rejects_an_oversize_document_before_downloading(_tg_bound):
+    from orbweaver.channels.telegram import TELEGRAM_MAX_BYTES, handle_document
+
+    started, _root = _tg_bound
+
+    class _NeverDownloads(_Doc):
+        async def get_file(self):
+            raise AssertionError("must not download a file we already know is too big")
+
+    doc = _NeverDownloads("huge.zip", b"x", declared_size=TELEGRAM_MAX_BYTES + 1)
+    update = _doc_update(doc)
+    await handle_document(update, None)
+
+    assert started == []
+    assert update.message.replies
+    reply = update.message.replies[0].lower()
+    assert "bot download limit" in reply
+    assert "huge.zip" in reply
+
+
+@pytest.mark.asyncio
+async def test_telegram_ignores_documents_from_strangers(_tg_bound, monkeypatch):
+    from types import SimpleNamespace
+
+    from orbweaver.channels.telegram import handle_document
+
+    started, _root = _tg_bound
+    doc = _Doc("secrets.txt", b"hello")
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=9999),
+        message=_DocMsg(doc),
+        effective_chat=SimpleNamespace(id=9999),
+    )
+    await handle_document(update, None)
+    assert started == []

@@ -194,7 +194,7 @@
       width:100%; margin-top:0.2rem; padding:0.35rem 0.45rem;
     }
     .mic { width:100%; margin-top:0.5rem; color:var(--ink); font-size:0.75rem; text-align:center; }
-    #stage { flex:1; min-width:0; display:flex; flex-direction:column; }
+    #stage { flex:1; min-width:0; display:flex; flex-direction:column; position:relative; }
     header.chat-bar { padding:0.45rem 0.55rem 0.35rem; }
     header.chat-bar .lcd {
       display:flex; flex-direction:column; gap:0.4rem;
@@ -314,6 +314,30 @@
     .ghost.hidden, #continue.hidden, #queue-btn.hidden, #inject.hidden { display:none; }
     #composer-hint { padding:0 0.55rem 0.55rem; font-size:0.72rem; color:var(--lcd-dim); }
     #composer-hint.hidden { display:none; padding:0; }
+    /* Attachments: chips above the textarea, plus a drop overlay on the chat
+       pane. The overlay only paints while a file drag is in flight. */
+    #attach-strip { display:flex; flex-wrap:wrap; gap:0.35rem; padding:0 0.55rem; }
+    #attach-strip.hidden { display:none; }
+    .chip {
+      display:flex; align-items:center; gap:0.4rem; max-width:18rem;
+      padding:0.2rem 0.45rem; border:1px solid var(--line); border-radius:2px;
+      background:var(--lcd); font-size:0.75rem; color:#c8c8d0;
+    }
+    .chip.pending { opacity:0.6; }
+    .chip.failed { border-color:#7a3333; background:#2a1414; color:#f0a0a0; }
+    .chip .chip-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .chip .chip-size { color:var(--muted); flex:none; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .chip .chip-x { flex:none; color:var(--muted); padding:0 0.15rem; background:none; border:none; cursor:pointer; }
+    .chip .chip-x:hover { color:var(--amber); }
+    #drop-veil {
+      position:absolute; inset:0; z-index:40; display:none;
+      align-items:center; justify-content:center;
+      background:rgba(10,16,10,0.82); border:2px dashed var(--amber);
+      color:var(--amber); font-size:0.95rem; letter-spacing:0.04em;
+      font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    #drop-veil.on { display:flex; }
+    #attach-btn { font-size:0.95rem; line-height:1; padding:0.2rem 0.5rem; }
     .msg.injected { border-left-color:#8aa0c8; }
     .msg.ask { border-left-color:#8aa0c8; }
     .msg.permission { border-left-color:#d9a441; }
@@ -604,12 +628,15 @@
       </div>
       <div id="followups" class="hidden"></div>
       <div id="composer">
+        <div id="attach-strip" class="hidden"></div>
         <textarea id="text" placeholder="Message (Shift+Enter for newline)"></textarea>
         <div class="composer-toolbar">
           <select id="model" title="Model for this chat (default is Auto)" aria-label="Model">
             <option value="">default model</option>
           </select>
           <div class="composer-btns">
+            <input type="file" id="attach-input" multiple hidden>
+            <button type="button" id="attach-btn" class="ghost" title="Attach files (or drag them onto the chat)" aria-label="Attach files">&#128206;</button>
             <button type="button" id="queue-btn" class="ghost hidden" title="Run after this turn finishes">Queue</button>
             <button type="button" id="inject" class="ghost hidden" title="Fold into the live turn (Ctrl+Enter)">Add to turn</button>
             <button type="button" id="continue" class="ghost hidden" title="Resume the stopped turn">Continue</button>
@@ -619,6 +646,7 @@
       </div>
       <div id="composer-hint" class="hidden"></div>
     </div>
+    <div id="drop-veil" aria-hidden="true">Drop files to attach</div>
   </div>
   <div id="chat-menu" class="ctx-menu hidden" role="menu" aria-hidden="true">
     <div class="ctx-label" id="chat-menu-label"></div>
@@ -1906,7 +1934,11 @@
       }
     }
     async function api(path, opts={}) {
-      const headers = Object.assign({"content-type":"application/json"}, opts.headers||{});
+      // FormData must set its own multipart content-type (it carries the
+      // boundary); forcing application/json here would corrupt an upload.
+      const isForm = typeof FormData !== "undefined" && opts.body instanceof FormData;
+      const base = isForm ? {} : {"content-type":"application/json"};
+      const headers = Object.assign(base, opts.headers||{});
       const tok = $("token").value.trim();
       if (tok) headers.authorization = "Bearer " + tok;
       const res = await fetch($("base").value + path, Object.assign({}, opts, { headers }));
@@ -2901,10 +2933,137 @@
       $("text").value = next.text;
       await send();
     }
+    // --- Attachments -----------------------------------------------------
+    // Files upload as soon as they are dropped/picked, so the turn only has to
+    // carry the stored paths. Chips live until the next send, then clear.
+    const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+    let attachments = [];   // {id, name, size, path, kind, state, error}
+    let attachSeq = 0;
+
+    function fmtBytes(n) {
+      if (n < 1024) return n + " B";
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+      return (n / (1024 * 1024)).toFixed(1) + " MB";
+    }
+    function paintAttachments() {
+      const strip = $("attach-strip");
+      strip.replaceChildren();
+      strip.classList.toggle("hidden", attachments.length === 0);
+      for (const a of attachments) {
+        const chip = el("span", "chip" + (a.state === "pending" ? " pending" : a.state === "failed" ? " failed" : ""));
+        chip.dataset.name = a.name;
+        chip.appendChild(el("span", "chip-name", a.name));
+        chip.appendChild(el("span", "chip-size", a.state === "failed" ? (a.error || "failed") : fmtBytes(a.size)));
+        const x = el("button", "chip-x", "\u00D7");
+        x.type = "button";
+        x.title = "Remove";
+        x.setAttribute("aria-label", "Remove " + a.name);
+        x.onclick = () => { attachments = attachments.filter((o) => o.id !== a.id); paintAttachments(); };
+        chip.appendChild(x);
+        strip.appendChild(chip);
+      }
+    }
+    async function uploadOne(file) {
+      const rec = {
+        id: ++attachSeq, name: file.name || "file", size: file.size || 0,
+        path: "", kind: "", state: "pending", error: "",
+      };
+      attachments.push(rec);
+      paintAttachments();
+      // Reject oversize client-side too: no point pushing 100MB at a 413.
+      if (rec.size > MAX_UPLOAD_BYTES) {
+        rec.state = "failed";
+        rec.error = "too large";
+        $("status").textContent = rec.name + " is larger than " + fmtBytes(MAX_UPLOAD_BYTES) + ".";
+        paintAttachments();
+        return;
+      }
+      try {
+        if (!currentSid()) await createSession($("wuri").value, $("wkind").value);
+        const body = new FormData();
+        body.append("file", file, rec.name);
+        const r = await api("/v1/sessions/" + currentSid() + "/uploads", { method: "POST", body });
+        rec.path = r.path || "";
+        rec.kind = r.kind || "";
+        rec.size = r.size != null ? r.size : rec.size;
+        rec.state = "ok";
+        $("status").textContent = "Attached " + rec.name + ".";
+      } catch (e) {
+        rec.state = "failed";
+        rec.error = String(e && e.message ? e.message : e).slice(0, 60);
+        $("status").textContent = "Upload failed: " + rec.error;
+      }
+      paintAttachments();
+    }
+    async function addFiles(list) {
+      const files = Array.from(list || []).filter(Boolean);
+      if (!files.length) return;
+      await Promise.all(files.map(uploadOne));
+    }
+    // Only the stored paths go into the message; the gateway already extracted
+    // the text and left it in the workspace for the agent to Read.
+    function attachmentPreamble() {
+      const ok = attachments.filter((a) => a.state === "ok" && a.path);
+      if (!ok.length) return "";
+      const lines = ok.map((a) => "- " + a.path + " (" + a.name + ")");
+      return "[Attached " + ok.length + " file" + (ok.length === 1 ? "" : "s") + "]\n" + lines.join("\n") + "\n\n";
+    }
+    function clearAttachments() { attachments = []; paintAttachments(); }
+
+    $("attach-btn").onclick = () => $("attach-input").click();
+    $("attach-input").onchange = async (e) => {
+      await addFiles(e.target.files);
+      e.target.value = "";   // let the same file be picked twice in a row
+    };
+    $("text").addEventListener("paste", (e) => {
+      const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
+      if (!files.length) return;   // plain text paste: leave it alone
+      e.preventDefault();
+      addFiles(files);
+    });
+    // Drag/drop over the whole stage. dragenter/dragleave fire per descendant,
+    // so count them instead of toggling on every event.
+    let dragDepth = 0;
+    function dragHasFiles(e) {
+      const dt = e.dataTransfer;
+      if (!dt) return false;
+      return Array.from(dt.types || []).includes("Files");
+    }
+    const stage = $("stage");
+    stage.addEventListener("dragenter", (e) => {
+      if (!dragHasFiles(e)) return;
+      e.preventDefault();
+      dragDepth += 1;
+      $("drop-veil").classList.add("on");
+    });
+    stage.addEventListener("dragover", (e) => {
+      if (!dragHasFiles(e)) return;
+      e.preventDefault();   // without this the browser navigates to the file
+      e.dataTransfer.dropEffect = "copy";
+    });
+    stage.addEventListener("dragleave", (e) => {
+      if (!dragHasFiles(e)) return;
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) $("drop-veil").classList.remove("on");
+    });
+    stage.addEventListener("drop", (e) => {
+      if (!dragHasFiles(e)) return;
+      e.preventDefault();
+      dragDepth = 0;
+      $("drop-veil").classList.remove("on");
+      addFiles(e.dataTransfer.files);
+    });
+    // A file dropped outside the stage would still navigate away otherwise.
+    window.addEventListener("dragover", (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+    window.addEventListener("drop", (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+
     async function send() {
       if (currentFlight()) return;
-      const text = $("text").value.trim();
-      if (!text) return;
+      const typed = $("text").value.trim();
+      const preamble = attachmentPreamble();
+      // Attachments alone are a valid message: "here, look at this".
+      if (!typed && !preamble) return;
+      const text = preamble + typed;
       if (!currentSid()) {
         try { await createSession($("wuri").value, $("wkind").value); }
         catch (e) { addError(e); return; }
@@ -2917,6 +3076,7 @@
       const ph = $("log").querySelector(".placeholder");
       if (ph) ph.remove();
       $("text").value = "";
+      clearAttachments();
       const userEl = add("user", text, { extraClass: "pending" });
       attachUserActions(userEl, text, null, true);
       const workingEl = addWorking();
