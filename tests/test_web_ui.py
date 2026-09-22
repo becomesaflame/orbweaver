@@ -73,8 +73,13 @@ async def test_index_references_vendored_scripts():
             assert "function setGatewayRunning(ids)" in r.text
             assert "default is Auto" in r.text
             assert 'id === "auto"' in r.text
-            assert 'classList.toggle("running", running)' in r.text
-            assert 'classList.toggle("done", done)' in r.text
+            # A pending approval outranks both: the rail shows the warning state
+            # instead of the spinner, so `running` / `done` are suppressed while
+            # the turn waits on the user (#185).
+            assert 'classList.toggle("running", running && !permWaiting)' in r.text
+            assert 'classList.toggle("done", done && !permWaiting)' in r.text
+            assert 'classList.toggle("perm-waiting", permWaiting)' in r.text
+            assert ".chat.perm-waiting {" in r.text
             assert "b.onclick = () => { markSeen(s.id); setActive(s); };" in r.text
             assert "function markSeen(sid)" in r.text
             assert "function trackUnseen()" in r.text
