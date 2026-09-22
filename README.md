@@ -62,23 +62,27 @@ call stays with the overflow path.
 
 HTTP 503 (and Anthropic 529 overloaded) means the *model* is unavailable.
 Orbweaver does not sleep-retry the same id; it falls back to a different model,
-preferring a different provider (Anthropic ↔ Earth Runtime). Auto uses that
-same ranking to pick the first live model.
+preferring a different provider (Anthropic ↔ Earth Runtime).
 
 ### Per-channel models and the picker
 
 Each client channel has its own default. Web chat and Telegram default to
-**Auto** (the router picks a concrete model that currently has a provider).
-VS Code, cron jobs, and subagents use `ORBWEAVER_MODEL` unless overridden:
+**Auto**. Auto runs the user prompt through a lightweight model
+(`ORBWEAVER_ROUTER_MODEL`, Haiku by default) that replies with one id from the
+live catalog; if that call fails or the reply is unusable, Auto uses the ranked
+default (`ORBWEAVER_MODEL` first, then a different provider). Empty
+`ORBWEAVER_ROUTER_MODEL` skips the LLM pass. VS Code, cron jobs, and subagents
+use `ORBWEAVER_MODEL` unless overridden:
 
 | Env | Channel | Unset default |
 | --- | --- | --- |
 | `ORBWEAVER_WEB_MODEL` | web chat | `auto` |
 | `ORBWEAVER_TELEGRAM_MODEL` | Telegram | `auto` |
 | `ORBWEAVER_VSCODE_MODEL` | VS Code extension | `ORBWEAVER_MODEL` |
-| `ORBWEAVER_MODEL` | cron, subagents, Auto's preferred first pick | `claude-sonnet-4-6` |
+| `ORBWEAVER_MODEL` | cron, subagents, Auto's ranked fallback | `claude-sonnet-4-6` |
+| `ORBWEAVER_ROUTER_MODEL` | Auto's classifier | `claude-haiku-4-5` |
 
-The web composer and the VS Code chat view have a model `<select>` fed by `GET /v1/models` (supported ids including `auto`, a short label, whether a key is configured for each, and the channel defaults). Picking one stores it on the session (`model` on the session JSON-LD; also accepted on `POST /v1/sessions`, `PATCH /v1/sessions/{id}`, `POST …/turns` and the WebSocket `text` frame), so every later turn of that chat, from any client, uses it. "Default" clears the override. Telegram does the same with `/model` (list) and `/model <id>` (switch; prefixes and labels match when unique; `/model auto` selects the router; `/model default` clears). A turn resolves its model as: turn `model` → session `model` → channel env → `ORBWEAVER_MODEL`; Auto is then replaced with a concrete id. The context window and compaction budget follow the model actually called. `orbweaver.model` in VS Code settings seeds new chats when no picker choice was made. `/health` reports the web default.
+The web composer and the VS Code chat view have a model `<select>` fed by `GET /v1/models` (supported ids including `auto`, a short label, whether a key is configured for each, and the channel defaults). Picking one stores it on the session (`model` on the session JSON-LD; also accepted on `POST /v1/sessions`, `PATCH /v1/sessions/{id}`, `POST …/turns` and the WebSocket `text` frame), so every later turn of that chat, from any client, uses it. "Default" clears the override. Telegram does the same with `/model` (list) and `/model <id>` (switch; prefixes and labels match when unique; `/model auto` selects the router; `/model default` clears). A turn resolves its model as: turn `model` → session `model` → channel env → `ORBWEAVER_MODEL`; Auto is then replaced with a concrete id via the prompt router. The context window and compaction budget follow the model actually called. `orbweaver.model` in VS Code settings seeds new chats when no picker choice was made. `/health` reports the web default.
 
 For a VPS, bind `ORBWEAVER_HOST=127.0.0.1` and publish the UI on your Tailscale interface (`tailscale serve http://127.0.0.1:8080`) instead of `0.0.0.0`.
 

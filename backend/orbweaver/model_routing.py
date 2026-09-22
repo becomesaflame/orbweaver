@@ -5,7 +5,10 @@ session → channel default (``ORBWEAVER_WEB_MODEL`` / ``ORBWEAVER_VSCODE_MODEL`
 / ``ORBWEAVER_TELEGRAM_MODEL``) → ``ORBWEAVER_MODEL``. Web and Telegram default
 to the virtual id ``auto``, which the router replaces with a concrete model
 that currently has a provider. Provider routing is otherwise unchanged: Claude
-ids go to Anthropic, catalog names to Earth Runtime.
+ids go to Anthropic, catalog names to Earth Runtime. Auto runs the user prompt
+through a lightweight hosted model (``ORBWEAVER_ROUTER_MODEL``, Haiku by
+default) that replies with one catalog id; a failure falls back to the ranked
+default.
 
 The resolved *concrete* model is published through a ``ContextVar`` for the
 duration of the turn so context-window maths (``settings.event_budget``) follow
@@ -148,6 +151,7 @@ CONFIGURED_MODEL_ENV: tuple[tuple[str, str], ...] = (
     ("ORBWEAVER_TELEGRAM_MODEL", "orbweaver_telegram_model"),
     ("ORBWEAVER_CLASSIFIER_MODEL", "orbweaver_classifier_model"),
     ("ORBWEAVER_INJECTION_PROBE_MODEL", "orbweaver_injection_probe_model"),
+    ("ORBWEAVER_ROUTER_MODEL", "orbweaver_router_model"),
     ("ORBWEAVER_COMPACT_MODEL", "orbweaver_compact_model"),
 )
 
@@ -292,11 +296,34 @@ def pick_auto_model(*, skip: set[str] | None = None) -> str:
 
 
 def realize_turn_model(model: str | None, *, skip: set[str] | None = None) -> str:
-    """Replace ``auto`` with a concrete id; pass other ids through."""
+    """Replace ``auto`` with the ranked default; pass other ids through.
+
+    Agent turns with a user prompt should call ``realize_turn_model_async`` so
+    the lightweight router LLM can pick. This sync path is the ranked fallback
+    (catalog, classifier, empty prompt).
+    """
     mid = (model or "").strip()
     if is_auto_model(mid):
         return pick_auto_model(skip=skip)
     return mid
+
+
+async def realize_turn_model_async(
+    model: str | None,
+    *,
+    prompt: str = "",
+    skip: set[str] | None = None,
+    extra: str = "",
+) -> str:
+    """Replace ``auto`` using the prompt router; pass other ids through."""
+    mid = (model or "").strip()
+    if not is_auto_model(mid):
+        return mid
+    if not (prompt or "").strip() and not extra.strip():
+        return pick_auto_model(skip=skip)
+    from orbweaver.auto_router import route_auto_model
+
+    return await route_auto_model(prompt, skip=skip, extra=extra)
 
 
 def fallback_model(failed: str, *, tried: set[str] | None = None) -> str:

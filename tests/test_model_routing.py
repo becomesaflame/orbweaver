@@ -252,6 +252,7 @@ async def test_agent_turn_falls_back_to_other_provider_on_503(tmp_path, monkeypa
     monkeypatch.setattr(settings, "orbweaver_model", "claude-sonnet-4-6")
     monkeypatch.setattr(settings, "orbweaver_web_model", "auto")
     monkeypatch.setattr(settings, "orbweaver_telegram_model", "auto")
+    monkeypatch.setattr(settings, "orbweaver_router_model", "")
     monkeypatch.setattr(settings, "ollama_base_url", "")
     monkeypatch.setattr(settings, "ollama_model", "")
 

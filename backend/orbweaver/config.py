@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     orbweaver_telegram_model: str = "auto"
     orbweaver_classifier_model: str = "claude-sonnet-4-6"
     orbweaver_injection_probe_model: str = "claude-haiku-4-5"
+    # Cheap model that classifies an Auto turn's prompt onto a concrete id.
+    # Empty disables the LLM pass (ranked fallback only).
+    orbweaver_router_model: str = "claude-haiku-4-5"
     # off | scoped | all. scoped skips in-project Read/Grep/Glob/WorkspaceSearch and
     # benign Bash; all probes every eligible result (pre-0.33.22 behaviour).
     orbweaver_injection_probe_mode: str = "scoped"

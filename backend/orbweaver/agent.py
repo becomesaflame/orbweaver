@@ -2175,7 +2175,7 @@ async def agent_turn(
     check()
     from orbweaver.llm import make_agent_client, no_llm_echo
     from orbweaver.model_routing import (
-        realize_turn_model,
+        realize_turn_model_async,
         reset_current_model,
         resolve_turn_model,
         set_current_model,
@@ -2186,7 +2186,12 @@ async def agent_turn(
     requested_model = resolve_turn_model(
         override=model, session=sess.jsonld if sess else None, channel=resolved_channel
     )
-    turn_model = realize_turn_model(requested_model)
+    route_extra = ""
+    if images:
+        route_extra = f"The user attached {len(images)} image(s)."
+    turn_model = await realize_turn_model_async(
+        requested_model, prompt=user_text or "", extra=route_extra
+    )
     # Published for the turn so event_budget / compact follow this model.
     model_token = set_current_model(turn_model)
     client = make_agent_client(model=turn_model) if turn_model else None
