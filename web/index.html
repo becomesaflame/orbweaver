@@ -2042,11 +2042,26 @@
         if (!groups.has(k)) groups.set(k, []);
         groups.get(k).push(s);
       }
+      // Order workspace groups by when the workspace was first used (its oldest
+      // chat's created_at), not by recent activity. `sessions` comes back from
+      // the gateway sorted by last_event_at, so grouping in that order would
+      // make workspaces jump around the rail every time a chat in one of them
+      // gets a new message. Groups should stay put; only the chats inside a
+      // group re-sort with activity.
+      const groupOrder = [...groups.entries()].sort((a, b) => {
+        const oldest = (items) => items.reduce(
+          (min, s) => (s.created_at && (!min || s.created_at < min) ? s.created_at : min),
+          ""
+        );
+        const ca = oldest(a[1]);
+        const cb = oldest(b[1]);
+        return ca < cb ? -1 : ca > cb ? 1 : 0;
+      });
       const head = document.createElement("div");
       head.className = "sec-label";
       head.innerHTML = "<span>Sessions</span><span class=\"tcount\">" + filtered.length + "</span>";
       root.appendChild(head);
-      for (const [key, items] of groups) {
+      for (const [key, items] of groupOrder) {
         const first = items[0];
         const wrap = document.createElement("div");
         wrap.className = "ws";
