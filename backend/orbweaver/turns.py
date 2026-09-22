@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from uuid import UUID
 
@@ -56,6 +57,16 @@ _DRAIN_EXEMPT = frozenset({"subagent"})
 
 _running: dict[UUID, RunningTurn] = {}
 _draining = False
+_current_session: ContextVar[UUID | None] = ContextVar("orbweaver_running_session", default=None)
+
+
+def current_session_id() -> UUID | None:
+    """Session of the in-flight ``running_turn``, if any.
+
+    Used so ``log.exception`` during a turn can be attributed (self-heal skips
+    errors from its own session).
+    """
+    return _current_session.get()
 
 
 def begin_drain() -> None:
@@ -135,9 +146,11 @@ async def running_turn(session_id: UUID, channel: str = "") -> AsyncIterator[Run
     if state is None:
         current = _running.get(session_id)
         raise TurnBusy(session_id, current.channel if current else "")
+    token: Token[UUID | None] = _current_session.set(session_id)
     try:
         yield state
     finally:
+        _current_session.reset(token)
         release(session_id, state)
 
 

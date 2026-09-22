@@ -336,3 +336,93 @@ async def test_cron_resumes_stopped_session_without_reprompting(tmp_path, monkey
     assert captured["text"] == ""
     kinds = [e.kind for e in await store.list_events(sid)]
     assert kinds.count("user") == 1
+
+
+def _cron_session(sid):
+    return Entity(
+        id=sid,
+        at_id=session_at_id(sid),
+        at_type=SESSION_TYPE,
+        jsonld={
+            "@id": session_at_id(sid),
+            "@type": SESSION_TYPE,
+            "workspace_uri": "workspace:default",
+            "workspace_kind": "local",
+            "channel": "cron",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_cron_failed_one_shot_does_not_reprompt(tmp_path, monkeypatch):
+    """Self-heal jobs that raise used to stay due-now; the 30s sweeper then
+    appended another copy of the same prompt on every tick."""
+    turns.reset_for_tests()
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    prompt = "You are Orbweaver's self-heal session. Fix ONE production failure."
+
+    async def fake_turn(store, sid, text, *_a, **kwargs):
+        if not kwargs.get("resume"):
+            await store.append_event(sid, "user", {"text": text or prompt})
+        raise RuntimeError("NotFoundError")
+
+    monkeypatch.setattr(cron, "agent_turn", fake_turn)
+    sid = uuid4()
+    sess = _cron_session(sid)
+    await store.put_entity(sess)
+    job = Job(
+        id=uuid4(),
+        due_at=datetime.now(UTC) - timedelta(seconds=1),
+        payload={"message": prompt, "selfheal": True, "fingerprint": "NotFoundError:x"},
+        session_id=sid,
+    )
+    await store.put_job(job)
+    await cron._run_job(store, job)
+    users = [e for e in await store.list_events(sid) if e.kind == "user"]
+    assert [e.payload.get("text") for e in users] == [prompt]
+    kept = await store.due_jobs(datetime.now(UTC) + timedelta(days=1))
+    row = next(j for j in kept if j.id == job.id)
+    assert row.payload.get("resume") is True
+    assert row.due_at > datetime.now(UTC)
+
+    row.due_at = datetime.now(UTC) - timedelta(seconds=1)
+    await store.reschedule_job(row)
+    await cron._run_job(store, row)
+    users = [e for e in await store.list_events(sid) if e.kind == "user"]
+    assert len(users) == 1
+
+
+@pytest.mark.asyncio
+async def test_cron_one_shot_already_started_resumes_without_flag(tmp_path, monkeypatch):
+    """Jobs queued before resume-on-failure still must not re-prompt."""
+    turns.reset_for_tests()
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    captured: dict[str, object] = {}
+    prompt = "ORIGINAL SELFHEAL PROMPT"
+
+    async def fake_turn(_store, _sid, text, *_a, **kwargs):
+        captured["text"] = text
+        captured["resume"] = kwargs.get("resume")
+        return []
+
+    monkeypatch.setattr(cron, "agent_turn", fake_turn)
+    sid = uuid4()
+    sess = _cron_session(sid)
+    await store.put_entity(sess)
+    job = Job(
+        id=uuid4(),
+        due_at=datetime.now(UTC),
+        payload={"message": prompt, "selfheal": True, "fingerprint": "KeyError:x"},
+        session_id=sid,
+    )
+    await store.append_event(sid, "cron", {"job_id": str(job.id)})
+    await store.append_event(sid, "user", {"text": prompt})
+    keep = await cron._run_job_turn(store, sess, sid, job, prompt)
+    assert keep is False
+    assert captured["resume"] is True
+    assert captured["text"] == ""
+    kinds = [e.kind for e in await store.list_events(sid)]
+    assert kinds.count("user") == 1
+    assert kinds.count("cron") == 1

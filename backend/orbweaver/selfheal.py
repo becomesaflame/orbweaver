@@ -464,6 +464,12 @@ async def finish_attempt(job: Job, events: list[Event], store: Store | None = No
         await notify_selfheal(pr_notice(fp, pr))
 
 
+def _source_session_id():
+    from orbweaver.turns import current_session_id
+
+    return current_session_id()
+
+
 class SelfHealLogHandler(logging.Handler):
     """Enqueue from ``log.exception`` on ``orbweaver.*`` (not this module)."""
 
@@ -481,7 +487,13 @@ class SelfHealLogHandler(logging.Handler):
             loop = _loop
             if loop is None or not loop.is_running():
                 return
-            coro = note_exception(exc, tb, message=record.getMessage(), logger_name=record.name)
+            coro = note_exception(
+                exc,
+                tb,
+                message=record.getMessage(),
+                logger_name=record.name,
+                source_session_id=_source_session_id(),
+            )
             loop.call_soon_threadsafe(loop.create_task, coro)
         except Exception:
             self.handleError(record)

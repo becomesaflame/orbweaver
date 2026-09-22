@@ -249,6 +249,34 @@ async def test_log_exception_enqueues():
 
 
 @pytest.mark.asyncio
+async def test_log_exception_skips_in_flight_selfheal_session():
+    from orbweaver.selfheal import attach_log_handler, bind_loop
+    from orbweaver.turns import reset_for_tests as reset_turns
+    from orbweaver.turns import running_turn
+
+    reset_turns()
+    store = reset_store_for_tests()
+    first = await maybe_enqueue("OSError:sandbox.py:run", store=store)
+    assert first is not None
+    bind_loop(asyncio.get_running_loop())
+    attach_log_handler()
+    async with running_turn(first.session_id, "cron"):
+        try:
+            validate_workspace_uri("/nope")
+        except WorkspaceURIError:
+            logging.getLogger("orbweaver.app").exception("selfheal turn failed")
+        deadline = asyncio.get_running_loop().time() + 2
+        jobs: list = []
+        while asyncio.get_running_loop().time() < deadline:
+            jobs = await store.due_jobs(datetime.now(UTC) + timedelta(days=1))
+            if len(jobs) > 1:
+                break
+            await asyncio.sleep(0)
+    fps = {j.payload.get("fingerprint") for j in jobs}
+    assert fps == {"OSError:sandbox.py:run"}
+
+
+@pytest.mark.asyncio
 async def test_web_turn_api_status_error_enqueues(auth_header, monkeypatch):
     """Web UI 502 from Anthropic 400 used to skip intake (WARNING in the LLM
     client, then HTTPException without log.exception)."""
