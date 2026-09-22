@@ -78,11 +78,12 @@ test("a workspace group does not jump ahead when its chat gets new activity", as
   const groupNames = () => page.locator(".ws-name").allTextContents();
   // workspace:old was created first, so it renders above workspace:new even
   // though workspace:new's chat currently has the more recent event.
-  await expect.poll(groupNames).toEqual(["old-ws", "new-ws"]);
+  // wsLabel() strips the "workspace:" prefix for display.
+  await expect.poll(groupNames).toEqual(["old", "new"]);
 
   // New activity lands on the older workspace's chat, making it the most
   // recently updated session overall. The group order must not change.
   world.lastEventAt[SID_OLD] = "2026-09-16T02:00:00Z";
   await page.waitForTimeout(300);
-  await expect.poll(groupNames).toEqual(["old-ws", "new-ws"]);
+  await expect.poll(groupNames).toEqual(["old", "new"]);
 });
