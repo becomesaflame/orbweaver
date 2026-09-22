@@ -5,10 +5,10 @@ import { expect, test, type Page } from "@playwright/test";
 // carried into the next turn's message.
 const SID = "402e8376-ec10-4a76-960b-82b6d436c108";
 
-type Calls = { uploads: string[]; turnText: string[] };
+type Calls = { uploads: string[] };
 
 async function mockGateway(page: Page, opts: { uploadStatus?: number; uploadBody?: string } = {}) {
-  const calls: Calls = { uploads: [], turnText: [] };
+  const calls: Calls = { uploads: [] };
   const row = {
     id: SID,
     title: "alpha chat",
@@ -51,11 +51,6 @@ async function mockGateway(page: Page, opts: { uploadStatus?: number; uploadBody
         },
       });
     }
-    if (/\/turns$/.test(url) && method === "POST") {
-      const payload = JSON.parse(req.postData() || "{}");
-      calls.turnText.push(String(payload.text || ""));
-      return route.fulfill({ json: { events: [], status: "ok" } });
-    }
     if (method === "GET" && /\/v1\/sessions\/[0-9a-f-]{36}\/events/i.test(url)) {
       return route.fulfill({ json: { events: [] } });
     }
@@ -69,6 +64,49 @@ test.beforeEach(async ({ page }) => {
     localStorage.setItem("orbweaver.jwt", "test-jwt");
   });
 });
+
+// Turns run over a WebSocket, not POST /turns, so capture what the page sends
+// on the socket. The fake opens, records, and never completes the turn.
+async function captureTurnSocket(page: Page) {
+  await page.evaluate(() => {
+    const w = window as unknown as { WebSocket: typeof WebSocket; __sent: string[] };
+    w.__sent = [];
+    class FakeWS {
+      readyState = 0;
+      onopen: ((ev?: object) => void) | null = null;
+      onmessage: ((ev: { data: string }) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: ((ev: { code: number }) => void) | null = null;
+      constructor() {
+        queueMicrotask(() => {
+          this.readyState = 1;
+          if (this.onopen) this.onopen({});
+        });
+      }
+      send(data: string) {
+        w.__sent.push(String(data));
+      }
+      close() {}
+    }
+    w.WebSocket = FakeWS as unknown as typeof WebSocket;
+  });
+}
+
+async function sentTurnText(page: Page): Promise<string> {
+  const frames = await page.evaluate(
+    () => (window as unknown as { __sent: string[] }).__sent || [],
+  );
+  // The turn payload is the frame carrying the message text.
+  for (const raw of frames) {
+    try {
+      const msg = JSON.parse(raw);
+      if (typeof msg.text === "string") return msg.text;
+    } catch {
+      /* non-JSON control frame */
+    }
+  }
+  return "";
+}
 
 test("the paperclip picker uploads and shows a chip", async ({ page }) => {
   const calls = await mockGateway(page);
@@ -108,8 +146,9 @@ test("dropping a file on the stage attaches it and shows the veil", async ({ pag
 });
 
 test("attached paths ride along with the next message", async ({ page }) => {
-  const calls = await mockGateway(page);
+  await mockGateway(page);
   await page.goto("/");
+  await captureTurnSocket(page);
 
   await page.setInputFiles("#attach-input", {
     name: "report.pdf",
@@ -121,17 +160,16 @@ test("attached paths ride along with the next message", async ({ page }) => {
   await page.locator("#text").fill("summarise this");
   await page.locator("#send").click();
 
-  await expect.poll(() => calls.turnText.length).toBeGreaterThan(0);
-  const sent = calls.turnText[0];
-  expect(sent).toContain("attachments/report.pdf");
-  expect(sent).toContain("summarise this");
+  await expect.poll(() => sentTurnText(page)).toContain("attachments/report.pdf");
+  expect(await sentTurnText(page)).toContain("summarise this");
   // Chips clear once the turn is away.
   await expect(page.locator("#attach-strip .chip")).toHaveCount(0);
 });
 
 test("a chip can be removed before sending", async ({ page }) => {
-  const calls = await mockGateway(page);
+  await mockGateway(page);
   await page.goto("/");
+  await captureTurnSocket(page);
 
   await page.setInputFiles("#attach-input", {
     name: "scratch.txt",
@@ -144,13 +182,14 @@ test("a chip can be removed before sending", async ({ page }) => {
 
   await page.locator("#text").fill("never mind");
   await page.locator("#send").click();
-  await expect.poll(() => calls.turnText.length).toBeGreaterThan(0);
-  expect(calls.turnText[0]).not.toContain("scratch.txt");
+  await expect.poll(() => sentTurnText(page)).toContain("never mind");
+  expect(await sentTurnText(page)).not.toContain("scratch.txt");
 });
 
 test("a rejected upload reports the error and does not reach the turn", async ({ page }) => {
-  const calls = await mockGateway(page, { uploadStatus: 413, uploadBody: "file too large" });
+  await mockGateway(page, { uploadStatus: 413, uploadBody: "file too large" });
   await page.goto("/");
+  await captureTurnSocket(page);
 
   await page.setInputFiles("#attach-input", {
     name: "huge.bin",
@@ -163,13 +202,14 @@ test("a rejected upload reports the error and does not reach the turn", async ({
 
   await page.locator("#text").fill("look at this");
   await page.locator("#send").click();
-  await expect.poll(() => calls.turnText.length).toBeGreaterThan(0);
-  expect(calls.turnText[0]).not.toContain("huge.bin");
+  await expect.poll(() => sentTurnText(page)).toContain("look at this");
+  expect(await sentTurnText(page)).not.toContain("huge.bin");
 });
 
 test("attachments alone can be sent with no typed text", async ({ page }) => {
-  const calls = await mockGateway(page);
+  await mockGateway(page);
   await page.goto("/");
+  await captureTurnSocket(page);
 
   await page.setInputFiles("#attach-input", {
     name: "shot.png",
@@ -179,6 +219,5 @@ test("attachments alone can be sent with no typed text", async ({ page }) => {
   await expect(page.locator("#attach-strip .chip")).toHaveCount(1);
 
   await page.locator("#send").click();
-  await expect.poll(() => calls.turnText.length).toBeGreaterThan(0);
-  expect(calls.turnText[0]).toContain("attachments/shot.png");
+  await expect.poll(() => sentTurnText(page)).toContain("attachments/shot.png");
 });
