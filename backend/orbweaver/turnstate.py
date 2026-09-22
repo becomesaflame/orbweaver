@@ -25,6 +25,7 @@ __all__ = [
     "STATUS_OK",
     "STATUS_STOPPED",
     "STATUS_WAITING_ASK",
+    "STATUS_WAITING_PERM",
     "session_turn_status",
 ]
 
@@ -36,6 +37,9 @@ STATUS_STOPPED = "stopped"
 
 STATUS_WAITING_ASK = "waiting_ask"
 """The agent called AskUser and the answer never arrived."""
+
+STATUS_WAITING_PERM = "waiting_perm"
+"""The agent is paused waiting for the user to approve or deny a permission request."""
 
 # Kinds that end a turn with something the user can read as the outcome.
 # ``turn_aborted`` is always followed by an assistant message carrying the same
@@ -81,8 +85,27 @@ def pending_ask(events: list[Event]) -> bool:
     return pending_ask_user(events) is not None
 
 
+def pending_permission(events: list[Event]) -> bool:
+    """Is a ``permission_request`` still waiting for a ``permission_response``?
+
+    Scans the event list for unresolved permission requests: a
+    ``permission_request`` that has no matching ``permission_response`` or
+    ``tool_result`` for the same ``tool_use_id``.
+    """
+    resolved: set[str] = set()
+    pending_ids: list[str] = []
+    for ev in events:
+        payload = ev.payload or {}
+        tid = str(payload.get("tool_use_id") or "")
+        if ev.kind == "permission_request" and tid:
+            pending_ids.append(tid)
+        elif ev.kind in {"permission_response", "tool_result", "MemoryRecall"} and tid:
+            resolved.add(tid)
+    return any(tid not in resolved for tid in pending_ids)
+
+
 def session_turn_status(events: list[Event]) -> str:
-    """Classify the session's last turn as ok / stopped / waiting_ask.
+    """Classify the session's last turn as ok / stopped / waiting_ask / waiting_perm.
 
     An empty session is ``ok``: there is no turn to resume.
     """
@@ -90,6 +113,8 @@ def session_turn_status(events: list[Event]) -> str:
         return STATUS_OK
     if pending_ask(events):
         return STATUS_WAITING_ASK
+    if pending_permission(events):
+        return STATUS_WAITING_PERM
     for ev in reversed(events):
         if ev.kind in BOOKKEEPING_KINDS:
             continue

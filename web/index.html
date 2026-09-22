@@ -113,8 +113,27 @@
     .chat.done { background:rgba(255,176,40,0.1); color:var(--amber); box-shadow:inset 2px 0 0 var(--amber); }
     .chat.done .chat-title { font-weight:700; }
     .chat.done .chat-time { color:var(--amber); }
+    /* Waiting for permission: very noticeable amber/orange pulsing border + badge */
+    .chat.perm-waiting {
+      background:rgba(255,140,0,0.18); color:#ffcf6a;
+      box-shadow:inset 3px 0 0 #ff8c00, 0 0 0 1px rgba(255,140,0,0.25);
+      animation:perm-glow 1.6s ease-in-out infinite;
+    }
+    .chat.perm-waiting .chat-title { font-weight:700; }
+    .chat.perm-waiting .chat-state .perm-badge {
+      display:flex; align-items:center; justify-content:center;
+      width:0.95rem; height:0.95rem; border-radius:2px;
+      background:#ff8c00; color:#111; font-size:0.6rem; font-weight:900;
+      line-height:1; animation:perm-pulse 1.2s ease-in-out infinite;
+    }
+    .chat-state .perm-badge { display:none; }
     @keyframes chat-spin { to { transform:rotate(360deg); } }
     @keyframes chat-blip { 0%, 100% { opacity:1; } 50% { opacity:0.35; } }
+    @keyframes perm-pulse { 0%, 100% { opacity:1; transform:scale(1); } 50% { opacity:0.7; transform:scale(0.88); } }
+    @keyframes perm-glow {
+      0%, 100% { background:rgba(255,140,0,0.18); box-shadow:inset 3px 0 0 #ff8c00, 0 0 0 1px rgba(255,140,0,0.25); }
+      50% { background:rgba(255,140,0,0.30); box-shadow:inset 3px 0 0 #ffa020, 0 0 8px rgba(255,140,0,0.45); }
+    }
     /* Activity inside a collapsed group (or below the "More" cutoff) rolls up
        onto the workspace header so it is never invisible. */
     .ws-activity { flex:none; display:none; align-items:center; gap:0.3rem; font-size:0.68rem; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
@@ -123,10 +142,15 @@
     .ws-activity .run::before { content:"◴ "; }
     .ws-activity .fin { color:var(--amber); }
     .ws-activity .fin::before { content:"● "; }
-    .ws-activity .run.off, .ws-activity .fin.off { display:none; }
+    .ws-activity .perm { color:#ff8c00; animation:perm-pulse 1.2s ease-in-out infinite; }
+    .ws-activity .perm::before { content:"⚠ "; }
+    .ws-activity .run.off, .ws-activity .fin.off, .ws-activity .perm.off { display:none; }
     @media (prefers-reduced-motion: reduce) {
       .chat.running .chat-state .spin { animation:pulse 1.4s ease-in-out infinite; }
       .chat.done .chat-state .bell { animation:none; }
+      .chat.perm-waiting { animation:none; }
+      .chat.perm-waiting .chat-state .perm-badge { animation:none; }
+      .ws-activity .perm { animation:none; }
     }
     .more { color:var(--muted); font-size:0.8rem; padding:0.2rem 0.45rem 0.35rem 1.35rem; }
     /* Right-click menu for a chat row. Fixed-positioned at the pointer and
@@ -630,6 +654,7 @@
     let historyGen = 0;
     let stoppedSids = new Set();
     let waitingAskSids = new Set();
+    let waitingPermSids = new Set();  // sessions with an unresolved permission_request
     const followupQueues = new Map();
     let collapsed = new Set(JSON.parse(localStorage.getItem(LS.collapsed) || "[]"));
     let expandedExtra = new Set(JSON.parse(localStorage.getItem(LS.expanded) || "[]"));
@@ -1564,8 +1589,16 @@
         renderPermission(ev, p);
       } else if (kind === "permission_request") {
         renderPermissionRequest(p, ev.seq);
+        // Mark this session as awaiting approval in the rail immediately.
+        if (logSid) { waitingPermSids.add(logSid); paintActivity(); }
       } else if (kind === "permission_response") {
         resolvePermissionCard(p.tool_use_id, permissionOutcomeLabel(p.decision, p.scope));
+        // Clear the waiting indicator once a decision arrives.
+        if (logSid && !pendingPermFromEvents([...renderedSeqs].map(() => null).filter(Boolean))) {
+          // Re-scan the DOM for any still-unresolved permission card.
+          const anyOpen = $("log").querySelector(".msg.permission:not(.resolved) .perm-actions");
+          if (!anyOpen) { waitingPermSids.delete(logSid); paintActivity(); }
+        }
       } else if (kind === "permission_rule_added") {
         renderNote(ev, "Allowed for this session: " + (p.tool || "") + "(" + (p.subject || "*") + ")", "permission");
       } else if (kind === "injection_warning") {
@@ -1590,11 +1623,14 @@
         renderNote(ev, "Scheduled task requested: " + summarizeInputClient("ScheduleTask", p.input || {}), "schedule");
       } else if (kind === "turn_aborted") {
         add("assistant", p.text || "Turn aborted", { seq: ev.seq, extraClass: "stopped", markdown: false });
+        if (logSid) { waitingPermSids.delete(logSid); paintActivity(); }
       } else if (kind === "cron_result") {
         const extra = p.status === "aborted" ? "stopped" : "";
         add("assistant", p.text || "Scheduled task finished.", { seq: ev.seq, extraClass: extra });
+        if (logSid) { waitingPermSids.delete(logSid); paintActivity(); }
       } else if (kind === "turn_interrupted") {
         renderStopped(ev.seq);
+        if (logSid) { waitingPermSids.delete(logSid); paintActivity(); }
       } else if (ev.kind === "assistant_delta" || ev.kind === "tool_use_progress") {
         return;
       } else if (ev.kind === "subagent_event") {
@@ -1780,6 +1816,22 @@
       }
       return asks.some((id) => id && !answered.has(String(id)));
     }
+    // Return true when there is a permission_request in `evs` that has no
+    // corresponding permission_response (the turn is paused waiting for user approval).
+    function pendingPermFromEvents(evs) {
+      const resolved = new Set();
+      const pending = [];
+      for (const ev of evs) {
+        const p = ev.payload || {};
+        if (ev.kind === "permission_request" && p.tool_use_id) pending.push(String(p.tool_use_id));
+        if (ev.kind === "permission_response" && p.tool_use_id) resolved.add(String(p.tool_use_id));
+        // A tool_result for the same tool_use_id means the request was also resolved.
+        if ((ev.kind === "tool_result" || ev.kind === "MemoryRecall") && p.tool_use_id) {
+          resolved.add(String(p.tool_use_id));
+        }
+      }
+      return pending.some((id) => !resolved.has(id));
+    }
     function syncComposer() {
       const busy = !!currentFlight();
       const waiting = !busy && waitingAskSids.has(currentSid());
@@ -1904,7 +1956,7 @@
         headBtn.innerHTML =
           '<span class="chev">' + (isCollapsed ? "▸" : "▾") + "</span>" +
           '<span class="ws-name"></span>' +
-          '<span class="ws-activity"><span class="run"></span><span class="fin"></span></span>' +
+          '<span class="ws-activity"><span class="run"></span><span class="fin"></span><span class="perm"></span></span>' +
           '<span class="ws-kind"></span>';
         headBtn.querySelector(".ws-name").textContent = wsLabel(first.workspace_uri);
         headBtn.querySelector(".ws-kind").textContent = first.workspace_kind || "";
@@ -1954,20 +2006,28 @@
     function paintChatState(b, sid) {
       const running = runningSids.has(sid);
       const done = !running && doneSids.has(sid);
-      b.classList.toggle("running", running);
-      b.classList.toggle("done", done);
-      b.title = running
-        ? "Working…"
-        : done
-          ? "Finished — click to open"
-          : "Double-click to rename";
+      const permWaiting = waitingPermSids.has(sid);  // visible even while running
+      b.classList.toggle("running", running && !permWaiting);
+      b.classList.toggle("done", done && !permWaiting);
+      b.classList.toggle("perm-waiting", permWaiting);
+      b.title = permWaiting
+        ? "⚠ Waiting for your approval — click to open"
+        : running
+          ? "Working…"
+          : done
+            ? "Finished — click to open"
+            : "Double-click to rename";
       const time = b.querySelector(".chat-time");
-      if (!time) return;
-      if (running) time.textContent = "…";
-      else {
-        const row = sessions.find((s) => s.id === sid);
-        time.textContent = row ? timeAgo(row.last_event_at || row.created_at) : "";
+      if (time) {
+        if (permWaiting) time.textContent = "⚠";
+        else if (running) time.textContent = "…";
+        else {
+          const row = sessions.find((s) => s.id === sid);
+          time.textContent = row ? timeAgo(row.last_event_at || row.created_at) : "";
+        }
       }
+      const badge = b.querySelector(".perm-badge");
+      if (badge) badge.style.display = permWaiting ? "" : "none";
     }
     function paintActivity() {
       const root = $("session-list");
@@ -1982,17 +2042,24 @@
         const hidden = sids.filter((sid) => !shown.has(sid));
         const running = hidden.filter((sid) => runningSids.has(sid)).length;
         const finished = hidden.filter((sid) => !runningSids.has(sid) && doneSids.has(sid)).length;
+        const permWaiting = hidden.filter((sid) => waitingPermSids.has(sid)).length;
         const box = head.querySelector(".ws-activity");
         if (!box) return;
-        box.classList.toggle("on", running > 0 || finished > 0);
+        box.classList.toggle("on", running > 0 || finished > 0 || permWaiting > 0);
         const run = box.querySelector(".run");
         const fin = box.querySelector(".fin");
+        const perm = box.querySelector(".perm");
         run.textContent = running ? String(running) : "";
         run.classList.toggle("off", !running);
         fin.textContent = finished ? String(finished) : "";
         fin.classList.toggle("off", !finished);
+        if (perm) {
+          perm.textContent = permWaiting ? String(permWaiting) : "";
+          perm.classList.toggle("off", !permWaiting);
+        }
         const bits = [];
         if (running) bits.push(running + " working");
+        if (permWaiting) bits.push(permWaiting + " awaiting approval");
         if (finished) bits.push(finished + " finished");
         box.title = bits.join(", ");
       });
@@ -2005,7 +2072,7 @@
       b.dataset.sid = s.id;
       const state = document.createElement("span");
       state.className = "chat-state";
-      state.innerHTML = '<span class="spin"></span><span class="bell"></span>';
+      state.innerHTML = '<span class="spin"></span><span class="bell"></span><span class="perm-badge" style="display:none">!</span>';
       const title = document.createElement("span");
       title.className = "chat-title";
       title.textContent = s.title || "New chat";
@@ -2127,6 +2194,7 @@
       sessions = sessions.filter((s) => s.id !== sid);
       stoppedSids.delete(sid);
       waitingAskSids.delete(sid);
+      waitingPermSids.delete(sid);
       followupQueues.delete(sid);
       try { sessionStorage.removeItem("orbweaver.queue." + sid); } catch (e) {}
       if (!wasCurrent) {
@@ -2313,6 +2381,7 @@
         const evs = r.events || [];
         stoppedSids.delete(sid);
         waitingAskSids.delete(sid);
+        waitingPermSids.delete(sid);
         if (!evs.length) {
           $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
         } else {
@@ -2323,10 +2392,13 @@
           // trail a finished turn and used to show a stray Continue button.
           const status = r.last_turn_state;
           if (status === "waiting_ask") waitingAskSids.add(sid);
+          else if (status === "waiting_perm") waitingPermSids.add(sid);
           else if (status === "stopped") stoppedSids.add(sid);
-          else if (status === undefined && pendingAskFromEvents(evs)) {
-            waitingAskSids.add(sid);  // older gateway: fall back to the ask scan
+          else if (status === undefined) {
+            if (pendingAskFromEvents(evs)) waitingAskSids.add(sid);  // older gateway
+            else if (pendingPermFromEvents(evs)) waitingPermSids.add(sid);
           }
+          paintActivity();
         }
         const flight = flightFor(sid);
         if (flight) {
@@ -2720,6 +2792,7 @@
       if (!sid) return;
       stoppedSids.delete(sid);
       waitingAskSids.delete(sid);
+      waitingPermSids.delete(sid);
       const ph = $("log").querySelector(".placeholder");
       if (ph) ph.remove();
       $("log").querySelectorAll(".msg.stopped").forEach((n) => n.remove());
@@ -2739,6 +2812,7 @@
         finishWorking(sid, workingEl);
         if (currentSid() === sid) {
           if (r.status === "waiting_ask") waitingAskSids.add(sid);
+          if (r.status === "waiting_perm") { waitingPermSids.add(sid); paintActivity(); }
           if (r.status === "stopped") stoppedSids.add(sid);
         }
         await refreshSessions();
@@ -2777,6 +2851,7 @@
       const sid = currentSid();
       stoppedSids.delete(sid);
       waitingAskSids.delete(sid);
+      waitingPermSids.delete(sid);
       const ph = $("log").querySelector(".placeholder");
       if (ph) ph.remove();
       $("text").value = "";
@@ -2822,6 +2897,7 @@
           if (liveUser) attachUserActions(liveUser, text, r.user_seq, false);
           syncRestoreDefaults();
           if (r.status === "waiting_ask") waitingAskSids.add(sid);
+          if (r.status === "waiting_perm") { waitingPermSids.add(sid); paintActivity(); }
           if (r.status === "stopped") stoppedSids.add(sid);
         }
         await refreshSessions();
