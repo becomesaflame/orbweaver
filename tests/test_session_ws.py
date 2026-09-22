@@ -465,6 +465,30 @@ def test_ws_streams_turn_events(ws_session):
         assert last["status"] == "ok"
 
 
+def test_ws_events_and_history_carry_created_at(ws_session):
+    """Chat messages need a timestamp: every event frame (live or replayed)
+    carries an ISO ``created_at`` so the web UI can render one."""
+    client, token, headers, sid = ws_session
+    with _ws_connect(client, sid, token) as ws:
+        assert ws.receive_json()["kind"] == "subscribed"
+        ws.send_json({"text": "hello from vscode"})
+        live_events = []
+        while True:
+            msg = ws.receive_json()
+            if "seq" in msg and "kind" in msg:
+                live_events.append(msg)
+            if msg["kind"] == "turn_done":
+                break
+        assert live_events, "expected at least one event frame"
+        for ev in live_events:
+            assert ev.get("created_at"), f"event {ev['kind']} missing created_at"
+
+    history = client.get(f"/v1/sessions/{sid}/events", headers=headers).json()["events"]
+    assert history
+    for ev in history:
+        assert ev.get("created_at"), f"history event {ev['kind']} missing created_at"
+
+
 def test_ws_broadcasts_http_turn(ws_session):
     client, token, headers, sid = ws_session
     with _ws_connect(client, sid, token) as ws:

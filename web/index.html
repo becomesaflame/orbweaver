@@ -413,9 +413,13 @@
     .msg-role {
       font-size:0.7rem; letter-spacing:0.04em; text-transform:uppercase; color:var(--muted);
       margin-bottom:0.25rem; font-weight:600;
+      display:flex; align-items:baseline; gap:0.45rem;
     }
     .msg.user .msg-role { color:var(--accent); }
     .msg.assistant .msg-role { color:var(--amber); }
+    .msg-time {
+      font-size:0.68rem; letter-spacing:0; text-transform:none; color:var(--muted); font-weight:400;
+    }
 
     /* Markdown bodies */
     .msg-body.md { white-space:normal; overflow-wrap:anywhere; }
@@ -1078,11 +1082,31 @@
       return container;
     }
 
+    function formatClockTime(iso) {
+      if (!iso) return "";
+      const t = Date.parse(iso);
+      if (!Number.isFinite(t)) return "";
+      const d = new Date(t);
+      const now = new Date();
+      const sameDay = d.toDateString() === now.toDateString();
+      const clock = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+      return sameDay ? clock : d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " " + clock;
+    }
     function add(kind, text, opts={}) {
       const d = el("div", "msg " + kind + (opts.extraClass ? " " + opts.extraClass : ""));
       if (opts.seq != null) d.dataset.seq = String(opts.seq);
       const label = opts.label != null ? opts.label : ROLE_LABEL[kind];
-      if (label) d.appendChild(el("div", "msg-role", label));
+      if (label) {
+        const roleEl = el("div", "msg-role");
+        roleEl.appendChild(document.createTextNode(label));
+        const clock = formatClockTime(opts.createdAt);
+        if (clock) {
+          const timeEl = el("span", "msg-time", clock);
+          timeEl.title = new Date(opts.createdAt).toLocaleString();
+          roleEl.appendChild(timeEl);
+        }
+        d.appendChild(roleEl);
+      }
       const body = el("div", "msg-body");
       const markdown = opts.markdown != null ? opts.markdown : (kind === "user" || kind === "assistant");
       if (markdown) renderMarkdown(body, text);
@@ -1443,7 +1467,7 @@
       expandCard(card);
     }
     function renderAskUser(ev, p) {
-      const block = add("assistant", p.question || "Waiting for your answer", { seq: ev.seq, extraClass: "ask", label: "Orbweaver asks" });
+      const block = add("assistant", p.question || "Waiting for your answer", { seq: ev.seq, extraClass: "ask", label: "Orbweaver asks", createdAt: ev.created_at });
       block.appendChild(el("div", "ask-hint", "Type your answer in the composer; it is sent back as the tool result."));
       if (p.tool_use_id) askBlocks.set(String(p.tool_use_id), block);
       return block;
@@ -1636,7 +1660,7 @@
           userTurnConcluded = true;
         }
         const extra = (p.injected || p.stuck_nudge) ? "injected" : "";
-        const node = add(kind, p.text || "", { seq: ev.seq, extraClass: extra });
+        const node = add(kind, p.text || "", { seq: ev.seq, extraClass: extra, createdAt: ev.created_at });
         if (kind === "user") attachUserActions(node, p.text || "", ev.seq, false);
       } else if (kind === "tool_call") {
         const card = renderToolCall(ev, p);
@@ -2497,7 +2521,7 @@
         const flight = flightFor(sid);
         if (flight) {
           if (flight.userEl && !flight.userEl.isConnected && flight.text && !flight.userEl.dataset.seq) {
-            flight.userEl = add("user", flight.text, { extraClass: "pending" });
+            flight.userEl = add("user", flight.text, { extraClass: "pending", createdAt: new Date().toISOString() });
             attachUserActions(flight.userEl, flight.text, null, true);
           }
           if (flight.workingEl && !flight.workingEl.isConnected) {
@@ -2723,7 +2747,7 @@
         });
         if (currentSid() === sid && r.seq != null && !renderedSeqs.has(Number(r.seq))) {
           renderedSeqs.add(Number(r.seq));
-          const node = add("user", text, { seq: r.seq, extraClass: "injected" });
+          const node = add("user", text, { seq: r.seq, extraClass: "injected", createdAt: r.event && r.event.created_at });
           attachUserActions(node, text, r.seq, false);
         }
       } catch (e) {
@@ -3077,7 +3101,7 @@
       if (ph) ph.remove();
       $("text").value = "";
       clearAttachments();
-      const userEl = add("user", text, { extraClass: "pending" });
+      const userEl = add("user", text, { extraClass: "pending", createdAt: new Date().toISOString() });
       attachUserActions(userEl, text, null, true);
       const workingEl = addWorking();
       let resolveDone;
