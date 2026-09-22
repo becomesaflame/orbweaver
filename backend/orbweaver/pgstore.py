@@ -18,6 +18,7 @@ from orbweaver.store import (
     Entity,
     Event,
     Job,
+    SessionEventStats,
     ensure_pin_budget,
     jsonld_triples,
     new_uuid,
@@ -262,6 +263,53 @@ class PostgresStore:
             )
             for r in rows
         ]
+
+    async def session_event_stats(
+        self, session_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, SessionEventStats]:
+        """Count, last timestamp, and first-user preview without event payloads.
+
+        GET /v1/sessions used to ``list_events`` every chat. Decoding those JSONB
+        rows on the asyncio loop wedged the web UI for a minute at a time.
+        """
+        if not session_ids:
+            return {}
+        pool = self._pool_req()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH stats AS (
+                    SELECT session_id,
+                           count(*)::int AS event_count,
+                           max(seq) AS max_seq,
+                           min(seq) FILTER (WHERE kind = 'user') AS first_user_seq
+                    FROM events
+                    WHERE session_id = ANY($1::uuid[])
+                    GROUP BY session_id
+                )
+                SELECT s.session_id,
+                       s.event_count,
+                       last_ev.created_at AS last_event_at,
+                       left(coalesce(first_user.payload->>'text', ''), 80) AS preview
+                FROM stats s
+                LEFT JOIN events last_ev
+                  ON last_ev.session_id = s.session_id AND last_ev.seq = s.max_seq
+                LEFT JOIN events first_user
+                  ON first_user.session_id = s.session_id
+                 AND first_user.seq = s.first_user_seq
+                """,
+                session_ids,
+            )
+        out: dict[uuid.UUID, SessionEventStats] = {
+            sid: SessionEventStats() for sid in session_ids
+        }
+        for r in rows:
+            out[r["session_id"]] = SessionEventStats(
+                event_count=int(r["event_count"]),
+                last_event_at=r["last_event_at"],
+                preview=str(r["preview"] or ""),
+            )
+        return out
 
     async def replace_events(self, session_id: uuid.UUID, events: list[Event]) -> None:
         pool = self._pool_req()

@@ -71,6 +71,7 @@ from orbweaver.store import (
     Entity,
     Job,
     PinBudgetError,
+    SessionEventStats,
     get_store,
     is_deleted_session,
     new_uuid,
@@ -478,13 +479,6 @@ async def _finish_cancelled_turn(
 
 
 
-def _preview_text(events: list) -> str:
-    for ev in events:
-        if ev.kind == "user":
-            return str(ev.payload.get("text") or "").strip()
-    return ""
-
-
 def _display_title(jsonld: dict[str, Any], preview: str = "") -> str:
     title = str(jsonld.get("title") or "").strip()
     if title in _GENERIC_TITLES:
@@ -759,13 +753,21 @@ async def create_session(body: SessionBody, _u: dict = Depends(_user)) -> dict[s
 @app.get("/v1/sessions")
 async def list_sessions(_u: dict = Depends(_user)) -> dict[str, Any]:
     store = get_store()
+    ents = [
+        ent
+        for ent in await store.list_entities(SESSION_TYPE)
+        if not is_subagent_session(ent) and not is_deleted_session(ent)
+    ]
+    stats = await store.session_event_stats([ent.id for ent in ents])
     out: list[dict[str, Any]] = []
-    for ent in await store.list_entities(SESSION_TYPE):
-        if is_subagent_session(ent) or is_deleted_session(ent):
-            continue
-        events = await store.list_events(ent.id)
-        preview = _preview_text(events)
-        last_at = events[-1].created_at.isoformat() if events else str(ent.jsonld.get("created_at") or "")
+    for ent in ents:
+        st = stats.get(ent.id) or SessionEventStats()
+        preview = st.preview
+        last_at = (
+            st.last_event_at.isoformat()
+            if st.last_event_at is not None
+            else str(ent.jsonld.get("created_at") or "")
+        )
         out.append(
             {
                 "id": str(ent.id),
@@ -777,7 +779,7 @@ async def list_sessions(_u: dict = Depends(_user)) -> dict[str, Any]:
                 "model": str(ent.jsonld.get("model") or ""),
                 "created_at": str(ent.jsonld.get("created_at") or ""),
                 "last_event_at": last_at,
-                "event_count": len(events),
+                "event_count": st.event_count,
                 "preview": preview[:80],
                 # The rail animates a spinner on chats with a live turn, including
                 # ones this browser did not start (Telegram, cron, another tab).

@@ -84,6 +84,8 @@ async def test_index_references_vendored_scripts():
             assert "function markSeen(sid)" in r.text
             assert "function trackUnseen()" in r.text
             assert "function startActivityPoll()" in r.text
+            assert "let refreshWaiters = null;" in r.text
+            assert "function refreshSessionsOnce()" in r.text
             assert ".chat.running .chat-state .spin" in r.text
             assert "@keyframes chat-spin" in r.text
             assert ".chat.done {" in r.text
