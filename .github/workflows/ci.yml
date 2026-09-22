@@ -24,16 +24,21 @@ jobs:
         with:
           enable-cache: false
       # ubuntu-latest is 24.04 (noble) amd64. Skip apt-get update; dpkg the
-      # noble packages GitHub's own install used (bubblewrap from noble-updates,
-      # ripgrep from noble/universe).
+      # noble packages. -updates/-security revisions are *removed* from the
+      # pool when superseded (0.9.0-1ubuntu0.1 404'd), so pick the newest
+      # 0.9.0 amd64 deb instead of pinning a revision.
       - name: Install bubblewrap and ripgrep
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/bubblewrap.deb \
-            http://archive.ubuntu.com/ubuntu/pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.1_amd64.deb
+          pool=http://archive.ubuntu.com/ubuntu/pool
+          bwrap_deb=$(curl -fsSL "$pool/main/b/bubblewrap/" \
+            | grep -oE 'bubblewrap_0\.9\.0-[^"<>]+_amd64\.deb' | sort -V | tail -1)
+          test -n "$bwrap_deb"
+          curl -fsSL -o /tmp/bubblewrap.deb "$pool/main/b/bubblewrap/$bwrap_deb"
           curl -fsSL -o /tmp/ripgrep.deb \
-            http://archive.ubuntu.com/ubuntu/pool/universe/r/rust-ripgrep/ripgrep_14.1.0-1_amd64.deb
+            "$pool/universe/r/rust-ripgrep/ripgrep_14.1.0-1_amd64.deb"
           sudo dpkg -i /tmp/bubblewrap.deb /tmp/ripgrep.deb
+          echo "installed $bwrap_deb"
       # Ubuntu 24.04 withholds CAP_NET_ADMIN in unprivileged userns, so
       # bwrap --unshare-net dies with RTM_NEWADDR. Same profile as README.
       - name: Allow bwrap netns

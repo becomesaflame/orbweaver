@@ -39,6 +39,16 @@ def _no_workspace_checkpoints(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _disable_auto_router_llm(monkeypatch):
+    """Auto's prompt router would otherwise consume scripted ``messages.create`` calls.
+
+    Tests that exercise the LLM pass set ``orbweaver_router_model`` back and inject
+    a client, or patch ``route_auto_model``.
+    """
+    monkeypatch.setattr(settings, "orbweaver_router_model", "")
+
+
+@pytest.fixture(autouse=True)
 def _dev_insecure_secret(monkeypatch):
     """Tests sign with the default secret; opt into dev mode so startup passes.
 

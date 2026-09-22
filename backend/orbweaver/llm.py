@@ -94,12 +94,12 @@ def openrouter_configured() -> bool:
 
 
 def unknown_model(model: str | None) -> bool:
-    """A non-empty id that is not a Claude name, a catalog name, or the Ollama model.
+    """A non-empty id that is not Auto, a Claude name, a catalog name, or Ollama.
 
     Empty is "unspecified", not unknown, so the provider defaults still apply.
     """
     m = (model or "").strip()
-    if not m or is_open_model(m) or is_claude_model(m):
+    if not m or m.lower() == "auto" or is_open_model(m) or is_claude_model(m):
         return False
     ollama = settings.ollama_model.strip()
     return not (ollama and m == ollama)
@@ -108,12 +108,18 @@ def unknown_model(model: str | None) -> bool:
 def select_provider(model: str | None = None) -> str:
     """Claude names → Anthropic; catalog names → Earth Runtime; the Ollama model → Ollama.
 
-    An id we do not recognise routes nowhere. It used to fall through to Anthropic,
-    which answered ``404 not_found_error`` on every turn — that is what
-    ``ORBWEAVER_TELEGRAM_MODEL=glm-5.3-flash`` looked like in production while that
-    (real) Earth Runtime model was missing from ``OPEN_MODELS``.
+    ``auto`` is the virtual router id: it is available when any concrete
+    provider is configured. An id we do not recognise routes nowhere. It used
+    to fall through to Anthropic, which answered ``404 not_found_error`` on
+    every turn — that is what ``ORBWEAVER_TELEGRAM_MODEL=glm-5.3-flash`` looked
+    like in production while that (real) Earth Runtime model was missing from
+    ``OPEN_MODELS``.
     """
     model = (model or settings.orbweaver_model).strip()
+    if model.lower() == "auto":
+        if settings.anthropic_api_key.strip() or openrouter_configured() or _ollama_configured():
+            return "auto"
+        return "none"
     if is_open_model(model):
         return "openrouter" if openrouter_configured() else "none"
     if is_claude_model(model):
@@ -136,8 +142,13 @@ def select_provider(model: str | None = None) -> str:
 
 
 def hosted_provider(model: str | None = None) -> str:
-    """Anthropic or Earth Runtime only (classifier, probe, compact). No Ollama."""
+    """Anthropic or Earth Runtime only (classifier, probe, compact). No Ollama.
+
+    ``auto`` is not a hosted id; callers must ``realize_turn_model`` first.
+    """
     model = (model or "").strip()
+    if model.lower() == "auto":
+        return "none"
     if is_open_model(model):
         return "openrouter" if openrouter_configured() else "none"
     if unknown_model(model):
@@ -614,12 +625,29 @@ class OpenAICompatClient:
             return data
 
 
-# Transient upstream statuses. 429 is the shared open-model pool shedding load;
-# 500/502/503/504 are gateway-level blips. 502 is deliberately *not* retried
-# here: Earth Runtime wraps context-overflow failures as 502, and compacting is
-# the right response to those, so that judgement stays with
-# compact.overflow.should_overflow_retry() rather than being burned on sleeps.
-_RETRY_STATUSES = frozenset({429, 500, 503, 504})
+# Transient same-model retries. 429 is the shared open-model pool shedding load;
+# 500/504 are gateway-level blips. 502 is deliberately *not* retried here:
+# Earth Runtime wraps context-overflow failures as 502, and compacting is the
+# right response, so that judgement stays with
+# compact.overflow.should_overflow_retry(). 503 (and Anthropic 529 overloaded)
+# means the *model* is unavailable: the Auto router / turn loop switches to a
+# different model, preferably another provider, instead of sleeping on this id.
+_RETRY_STATUSES = frozenset({429, 500, 504})
+_UNAVAILABLE_STATUSES = frozenset({503, 529})
+
+
+def is_upstream_unavailable(exc: BaseException) -> bool:
+    """True when the provider says this model cannot serve the request now.
+
+    HTTP 503 from Earth Runtime ("The model is temporarily rate limited") and
+    Anthropic 529 overloaded are the production cases. Same-model retry will
+    not help; a different model (ideally a different provider) might.
+    """
+    status = int(getattr(exc, "status_code", 0) or 0)
+    if status in _UNAVAILABLE_STATUSES:
+        return True
+    err_type = str(getattr(exc, "type", "") or "").lower()
+    return err_type in {"overloaded_error", "overloaded"}
 
 
 def _resp_headers(resp: Any) -> dict[str, str]:

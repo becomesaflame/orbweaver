@@ -581,7 +581,7 @@
       <div id="composer">
         <textarea id="text" placeholder="Message (Shift+Enter for newline)"></textarea>
         <div class="composer-toolbar">
-          <select id="model" title="Model for this chat (default follows ORBWEAVER_WEB_MODEL)" aria-label="Model">
+          <select id="model" title="Model for this chat (default is Auto)" aria-label="Model">
             <option value="">default model</option>
           </select>
           <div class="composer-btns">
@@ -755,6 +755,10 @@
     }
     function pickedModel() { return $("model").value.trim(); }
     function modelLabelFor(id) {
+      if (id === "auto") {
+        const row = modelCatalog.find((m) => m && m.id === "auto");
+        return (row && row.label) ? row.label : "Auto";
+      }
       const row = modelCatalog.find((m) => m && m.id === id);
       return (row && row.label) ? row.label : id;
     }

@@ -271,3 +271,40 @@ async def test_classifier_survives_a_transient_429(monkeypatch):
     assert out["verdict"] == "allow"
     assert out["stage"] == "fast"
     assert "Classifier error" not in out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_classifier_falls_back_to_another_model_on_503(monkeypatch):
+    from types import SimpleNamespace
+
+    from orbweaver.config import settings
+    from orbweaver.llm import OpenAICompatError
+    from orbweaver.permissions.classifier import classify_action
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test")
+    monkeypatch.setattr(settings, "openrouter_api_key", "pk-prov-test")
+    monkeypatch.setattr(settings, "orbweaver_classifier_model", "claude-sonnet-4-6")
+
+    seen: list[str] = []
+
+    class _Client:
+        class messages:
+            @staticmethod
+            async def create(**kw):
+                mid = str(kw.get("model"))
+                seen.append(mid)
+                if mid == "claude-sonnet-4-6":
+                    raise OpenAICompatError(
+                        "The model is temporarily rate limited",
+                        status_code=503,
+                    )
+                return SimpleNamespace(
+                    content=[SimpleNamespace(type="text", text="<block>no</block>")]
+                )
+
+    monkeypatch.setattr("orbweaver.llm.make_hosted_client", lambda *_a, **_k: _Client())
+    out = await classify_action([], "Read", {"path": "/var/log/syslog"}, client=_Client())
+    assert seen[0] == "claude-sonnet-4-6"
+    assert seen[1] == "glm-5.3-flash"
+    assert out["verdict"] == "allow"
+    assert "Classifier error" not in out["reason"]

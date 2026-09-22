@@ -181,7 +181,9 @@ async def classify_action(
     model = settings.orbweaver_classifier_model
     if client is None:
         from orbweaver.llm import make_hosted_client
+        from orbweaver.model_routing import realize_turn_model
 
+        model = realize_turn_model(model) or model
         client = make_hosted_client(model)
     if client is None:
         return _classified(
@@ -208,9 +210,36 @@ async def classify_action(
         parts = [getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text"]
         return "".join(parts)
 
+    async def _create(**kwargs: Any):
+        from orbweaver.llm import is_upstream_unavailable, make_hosted_client
+        from orbweaver.model_routing import MAX_UNAVAILABLE_FALLBACKS, fallback_model
+
+        nonlocal client, model
+        tried = {model}
+        leftover = MAX_UNAVAILABLE_FALLBACKS
+        while True:
+            try:
+                return await client.messages.create(model=model, **kwargs)
+            except Exception as e:
+                if leftover <= 0 or not is_upstream_unavailable(e):
+                    raise
+                nxt = fallback_model(model, tried=tried)
+                nxt_client = make_hosted_client(nxt) if nxt else None
+                if not nxt or nxt_client is None:
+                    raise
+                log.warning(
+                    "classifier model %s unavailable (%s); falling back to %s",
+                    model,
+                    getattr(e, "status_code", type(e).__name__),
+                    nxt,
+                )
+                tried.add(nxt)
+                model = nxt
+                client = nxt_client
+                leftover -= 1
+
     try:
-        stage1 = await client.messages.create(
-            model=model,
+        stage1 = await _create(
             max_tokens=64,
             system=system,
             messages=[
@@ -229,8 +258,7 @@ async def classify_action(
         return _classified("allow", "Allowed by fast classifier", "fast")
 
     try:
-        stage2 = await client.messages.create(
-            model=model,
+        stage2 = await _create(
             max_tokens=4096,
             system=system,
             messages=[

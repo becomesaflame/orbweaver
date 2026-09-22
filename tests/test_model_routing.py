@@ -13,12 +13,16 @@ from orbweaver.app import app, reset_ws_subscribers_for_tests
 from orbweaver.auth import mint_token
 from orbweaver.config import settings
 from orbweaver.model_routing import (
+    AUTO_MODEL_ID,
     channel_default_model,
     current_model,
+    fallback_model,
     format_model_id,
     is_supported_model,
     model_defaults,
     model_label,
+    pick_auto_model,
+    realize_turn_model,
     resolve_model_pick,
     resolve_turn_model,
     supported_models,
@@ -87,17 +91,20 @@ def _capture_clients(monkeypatch):
 # --- resolution -------------------------------------------------------------
 
 
-def test_channel_defaults_fall_back_to_orbweaver_model(monkeypatch):
+def test_channel_defaults_web_and_telegram_are_auto_when_unset(monkeypatch):
     monkeypatch.setattr(settings, "orbweaver_model", FALLBACK)
     monkeypatch.setattr(settings, "orbweaver_web_model", "")
     monkeypatch.setattr(settings, "orbweaver_vscode_model", "")
     monkeypatch.setattr(settings, "orbweaver_telegram_model", "")
-    for ch in ("web", "vscode", "telegram", "cron", "", None):
-        assert channel_default_model(ch) == FALLBACK
+    assert channel_default_model("web") == AUTO_MODEL_ID
+    assert channel_default_model("telegram") == AUTO_MODEL_ID
+    assert channel_default_model("vscode") == FALLBACK
+    assert channel_default_model("cron") == FALLBACK
+    assert channel_default_model(None) == FALLBACK
     assert model_defaults() == {
-        "web": FALLBACK,
+        "web": AUTO_MODEL_ID,
         "vscode": FALLBACK,
-        "telegram": FALLBACK,
+        "telegram": AUTO_MODEL_ID,
         "fallback": FALLBACK,
     }
 
@@ -128,8 +135,16 @@ def test_supported_models_and_routing(channel_models):
     assert not is_supported_model("gpt-4o")
     assert not is_supported_model("claude bad id")
     rows = {m["id"]: m for m in supported_models()}
-    # Configured defaults are listed first, then Claude ids, then the catalog.
-    assert [m["id"] for m in supported_models()][:4] == [FALLBACK, WEB, VSCODE, TELEGRAM]
+    # Auto, then configured defaults, then Claude ids, then the catalog.
+    assert [m["id"] for m in supported_models()][:5] == [
+        AUTO_MODEL_ID,
+        FALLBACK,
+        WEB,
+        VSCODE,
+        TELEGRAM,
+    ]
+    assert rows[AUTO_MODEL_ID]["label"] == "Auto"
+    assert rows[AUTO_MODEL_ID]["provider"] == "auto" and rows[AUTO_MODEL_ID]["available"]
     assert rows[WEB]["provider"] == "anthropic" and rows[WEB]["available"]
     assert rows[TELEGRAM]["provider"] == "openrouter" and rows[TELEGRAM]["available"]
     assert rows["gpt-oss-120b"]["context_window"] == 131_072
@@ -137,7 +152,9 @@ def test_supported_models_and_routing(channel_models):
     assert rows["claude-opus-5"]["label"] == "Claude Opus 5"
     assert rows[WEB]["context_window"] == settings.context_window
     assert format_model_id("claude-opus-5") == "Claude Opus 5 (claude-opus-5)"
+    assert format_model_id("auto") == "Auto"
     assert model_label("qwen3.6-35b") == "Qwen 3.6 35B"
+    assert is_supported_model("auto")
 
 
 def test_supported_models_marks_missing_key(channel_models, monkeypatch):
@@ -177,8 +194,33 @@ def test_resolve_model_pick_prefix_label_and_clear():
     chosen, matches = resolve_model_pick("qwen", ids)
     assert chosen is None and set(matches) == {"qwen3.6-35b", "qwen3.8-27b"}
     assert resolve_model_pick("120b", ids)[0] == "gpt-oss-120b"
+    assert resolve_model_pick("auto", ["auto", "claude-opus-5"]) == ("auto", ["auto"])
+    assert resolve_model_pick("Auto", ["auto", "claude-opus-5"])[0] == "auto"
     assert resolve_model_pick("nope", ids) == (None, [])
     assert resolve_model_pick("", ids) == (None, [])
+
+
+def test_auto_picks_orbweaver_model_then_other_provider(channel_models):
+    """Auto prefers ORBWEAVER_MODEL; a 503 should jump to a different provider."""
+    from orbweaver.llm import select_provider
+
+    assert realize_turn_model("auto") == FALLBACK
+    assert pick_auto_model() == FALLBACK
+    nxt = fallback_model(FALLBACK)
+    assert nxt
+    assert select_provider(nxt) != select_provider(FALLBACK)
+    assert nxt == "glm-5.3-flash"
+    # A pin stays a pin until it is unavailable.
+    assert realize_turn_model("qwen3.6-35b") == "qwen3.6-35b"
+
+
+def test_fallback_skips_already_tried_models(channel_models):
+    from orbweaver.llm import select_provider
+
+    first = fallback_model(FALLBACK, tried={FALLBACK})
+    second = fallback_model(FALLBACK, tried={FALLBACK, first})
+    assert first and second and first != second
+    assert select_provider(first) != "anthropic"
 
 
 # --- agent_turn -------------------------------------------------------------
@@ -198,6 +240,91 @@ async def test_agent_turn_uses_channel_default_and_override(tmp_path, channel_mo
     assert created == made
     # The contextvar is reset after each turn.
     assert current_model() == FALLBACK
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_falls_back_to_other_provider_on_503(tmp_path, monkeypatch):
+    """HTTP 503 is model-unavailable: switch provider instead of retrying the same id."""
+    from orbweaver.llm import OpenAICompatError
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test")
+    monkeypatch.setattr(settings, "openrouter_api_key", "pk-prov-test")
+    monkeypatch.setattr(settings, "orbweaver_model", "claude-sonnet-4-6")
+    monkeypatch.setattr(settings, "orbweaver_web_model", "auto")
+    monkeypatch.setattr(settings, "orbweaver_telegram_model", "auto")
+    monkeypatch.setattr(settings, "orbweaver_router_model", "")
+    monkeypatch.setattr(settings, "ollama_base_url", "")
+    monkeypatch.setattr(settings, "ollama_model", "")
+
+    seen: list[str] = []
+
+    class _Text:
+        type = "text"
+        text = "recovered"
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.content = [_Text()]
+            self.usage = None
+
+    class _Client:
+        class messages:
+            @staticmethod
+            async def create(**kw):
+                mid = str(kw.get("model"))
+                seen.append(mid)
+                if mid == "claude-sonnet-4-6":
+                    raise OpenAICompatError(
+                        "The model is temporarily rate limited. Retry shortly.",
+                        status_code=503,
+                    )
+                return _Resp()
+
+    monkeypatch.setattr("orbweaver.llm.make_agent_client", lambda **_k: _Client())
+    store = reset_store_for_tests()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    produced = await agent_turn(store, uuid4(), "hi", ws, channel="web")
+    assert seen[0] == "claude-sonnet-4-6"
+    assert seen[1] == "glm-5.3-flash"
+    texts = [e.payload.get("text") for e in produced if e.kind == "assistant"]
+    assert texts == ["recovered"]
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_pinned_model_also_falls_back_on_503(tmp_path, channel_models, monkeypatch):
+    from orbweaver.llm import OpenAICompatError
+
+    seen: list[str] = []
+
+    class _Text:
+        type = "text"
+        text = "ok"
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.content = [_Text()]
+            self.usage = None
+
+    class _Client:
+        class messages:
+            @staticmethod
+            async def create(**kw):
+                mid = str(kw.get("model"))
+                seen.append(mid)
+                if mid == TELEGRAM:
+                    raise OpenAICompatError("upstream unavailable", status_code=503)
+                return _Resp()
+
+    monkeypatch.setattr("orbweaver.llm.make_agent_client", lambda **_k: _Client())
+    store = reset_store_for_tests()
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    await agent_turn(store, uuid4(), "hi", ws, channel="telegram")
+    assert seen[0] == TELEGRAM
+    assert seen[1]
+    assert seen[1] != TELEGRAM
+    from orbweaver.llm import select_provider
+
+    assert select_provider(seen[1]) != "openrouter"
 
 
 @pytest.mark.asyncio
@@ -261,12 +388,28 @@ async def test_models_endpoint_and_health_defaults(channel_models, auth_header):
             "fallback": FALLBACK,
         }
         ids = [m["id"] for m in body["models"]]
-        assert {WEB, VSCODE, TELEGRAM, FALLBACK, "gpt-oss-120b"} <= set(ids)
+        assert {AUTO_MODEL_ID, WEB, VSCODE, TELEGRAM, FALLBACK, "gpt-oss-120b"} <= set(ids)
+        assert any(m["id"] == "auto" and m["label"] == "Auto" for m in body["models"])
         assert any(m["id"] == "claude-opus-5" and m["label"] == "Claude Opus 5" for m in body["models"])
         health = await client.get("/health")
         assert health.json()["llm"]["model"] == WEB
         assert health.json()["llm"]["provider"] == "anthropic"
         assert health.json()["llm"]["defaults"]["telegram"] == TELEGRAM
+
+
+@pytest.mark.asyncio
+async def test_models_and_health_default_web_telegram_to_auto(auth_header, monkeypatch):
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test")
+    monkeypatch.setattr(settings, "openrouter_api_key", "pk-prov-test")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.get("/v1/models", headers=auth_header)
+        assert r.status_code == 200
+        assert r.json()["defaults"]["web"] == AUTO_MODEL_ID
+        assert r.json()["defaults"]["telegram"] == AUTO_MODEL_ID
+        health = await client.get("/health")
+        assert health.json()["llm"]["model"] == AUTO_MODEL_ID
+        assert health.json()["llm"]["provider"] == "auto"
 
 
 @pytest.mark.asyncio
