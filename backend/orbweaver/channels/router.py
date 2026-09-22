@@ -36,6 +36,7 @@ from orbweaver.store import (
     Event,
     Store,
     is_deleted_session,
+    new_uuid,
     session_at_id,
 )
 from orbweaver.turns import get as get_running_turn
@@ -266,6 +267,51 @@ async def candidate_sessions(store: Store, *, exclude: Iterable[UUID] = ()) -> l
     return out
 
 
+def _normalize_workspace_ref(raw: str) -> str:
+    text = str(raw or "").strip() or "workspace:default"
+    if ":" not in text and not text.startswith(("/", "\\")):
+        return f"workspace:{text}"
+    return text
+
+
+async def create_candidate_session(
+    store: Store,
+    *,
+    title: str,
+    workspace_uri: str = "workspace:default",
+    channel: str = "web",
+) -> Entity:
+    """A new desk chat the operator can prompt. Raises RouterError on a bad workspace URI."""
+    from orbweaver.agent import normalize_channel
+    from orbweaver.uris import WorkspaceURIError, validate_workspace_uri
+    from orbweaver.workspace import WORKSPACE_KIND_LOCAL
+
+    try:
+        uri = validate_workspace_uri(_normalize_workspace_ref(workspace_uri))
+    except WorkspaceURIError as e:
+        raise RouterError(str(e)) from e
+    ch = normalize_channel(channel) or "web"
+    heading = (title or "New chat").strip()[:80] or "New chat"
+    uid = new_uuid()
+    ent = Entity(
+        id=uid,
+        at_id=session_at_id(uid),
+        at_type=SESSION_TYPE,
+        jsonld={
+            "@id": session_at_id(uid),
+            "@type": SESSION_TYPE,
+            "workspace_uri": uri,
+            "workspace_kind": WORKSPACE_KIND_LOCAL,
+            "title": heading,
+            "channel": ch,
+            "status": "active",
+            "created_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    await store.put_entity(ent)
+    return ent
+
+
 def _running_channel(session_id: UUID) -> str | None:
     state = get_running_turn(session_id)
     if state is None:
@@ -469,7 +515,8 @@ OPERATOR_TOOL_SPEC: list[dict[str, Any]] = [
             "when the user wants to continue work they started at their desk. If a turn is "
             "already running the text is injected; if the session is waiting for AskUser the "
             "text is the answer; otherwise a new turn starts. Results are reported back here. "
-            "If several sessions could match, ask which one first."
+            "If several sessions could match, ask which one first. If none is the right place, "
+            "call CreateSession instead of doing the work here."
         ),
         "input_schema": {
             "type": "object",
@@ -478,6 +525,33 @@ OPERATOR_TOOL_SPEC: list[dict[str, Any]] = [
                 "text": {"type": "string", "description": "Instruction or answer to send"},
             },
             "required": ["session", "text"],
+        },
+    },
+    {
+        "name": "CreateSession",
+        "description": (
+            "Start a new Orbweaver chat when none of the existing sessions is the right place "
+            "for this work. It appears in the web sidebar (channel web) with the given title "
+            "and workspace. Pass text to run a first instruction immediately (same as "
+            "PromptSession). Prefer PromptSession when a matching chat already exists."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Short title for the new chat"},
+                "text": {
+                    "type": "string",
+                    "description": "Optional first instruction to run on the new session",
+                },
+                "workspace": {
+                    "type": "string",
+                    "description": (
+                        "Workspace URI (workspace:name or file:./rel). A bare name becomes "
+                        "workspace:<name>. Defaults to workspace:default."
+                    ),
+                },
+            },
+            "required": [],
         },
     },
     {
@@ -502,10 +576,13 @@ OPERATOR_SYSTEM_EXTRA = (
     "they were working on, call ListSessions, then SessionDigest on the likely match, and "
     "summarize. To continue work that belongs in another session, call PromptSession with "
     "a clear instruction; that session keeps its own history, workspace, and tools, and "
-    "the result is reported back here. Replying to a tagged report on Telegram injects "
+    "the result is reported back here. If none of the existing sessions is the right "
+    "place, call CreateSession with a title (and text to start work); the new chat shows "
+    "up in the web sidebar. Replying to a tagged report on Telegram injects "
     "into that session without asking you. If more than one session could match, ask "
-    "which. Do not redo long-running work that belongs to another session; prompt it "
-    "instead. PromptSession already pings the user with a short ack."
+    "which. Do not redo long-running work that belongs to another session; prompt or "
+    "create one instead. PromptSession and CreateSession already ping the user with a "
+    "short ack when they start a turn."
 )
 
 
@@ -546,6 +623,43 @@ async def run_operator_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any])
         from orbweaver.channels.telegram import prompt_session_from_operator
 
         return await prompt_session_from_operator(store, operator, inp)
+    if name == "CreateSession":
+        title = str(inp.get("title") or "").strip()
+        text = str(inp.get("text") or "").strip()
+        if not title and not text:
+            return "error: title or text is required"
+        if not title:
+            title = text.split("\n", 1)[0].strip()[:80]
+        raw_ws = str(inp.get("workspace") or inp.get("workspace_uri") or "workspace:default")
+        try:
+            target = await create_candidate_session(
+                store, title=title, workspace_uri=raw_ws
+            )
+        except RouterError as e:
+            return f"error: {e}"
+        created: dict[str, Any] = {
+            "created": str(target.id),
+            "title": str((target.jsonld or {}).get("title") or title),
+            "workspace_uri": str((target.jsonld or {}).get("workspace_uri") or ""),
+            "channel": str((target.jsonld or {}).get("channel") or "web"),
+            "short_id": str(target.id)[:8],
+        }
+        if text:
+            from orbweaver.channels.telegram import prompt_session_from_operator
+
+            prompted = await prompt_session_from_operator(
+                store, operator, {"session": str(target.id), "text": text}
+            )
+            try:
+                created["prompt"] = json.loads(prompted)
+            except json.JSONDecodeError:
+                created["prompt"] = prompted
+        else:
+            created["note"] = (
+                "Idle chat created. PromptSession to start work, or the user can open it "
+                "in the web UI."
+            )
+        return json.dumps(created)
     if name == "StopSession":
         from orbweaver.channels.telegram import stop_session_from_operator
 

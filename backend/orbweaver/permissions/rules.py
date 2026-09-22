@@ -34,6 +34,7 @@ SAFE_ALLOWLIST = frozenset(
         "ListSessions",
         "SessionDigest",
         "PromptSession",
+        "CreateSession",
         "StopSession",
     }
 )

@@ -546,13 +546,70 @@ async def test_operator_tool_errors_are_reported_not_raised(tmp_path):
     assert (await router.run_operator_tool("PromptSession", {"session": "zzz", "text": "go"}, ctx)).startswith("error")
     assert (await router.run_operator_tool("SessionDigest", {}, ctx)).startswith("error")
     assert (await router.run_operator_tool("StopSession", {"session": "zzz"}, ctx)).startswith("error")
+    assert (await router.run_operator_tool("CreateSession", {}, ctx)).startswith("error")
+
+
+@pytest.mark.asyncio
+async def test_create_session_idle_prompts_and_rejects_bad_workspace(tmp_path, monkeypatch):
+    store = reset_store_for_tests()
+    op = await tg.session_for_telegram_user(store, 42, chat_id=42)
+    ctx = {"store": store, "session_id": op.id}
+
+    idle = json.loads(await router.run_operator_tool("CreateSession", {"title": "Airbed PID"}, ctx))
+    assert idle["title"] == "Airbed PID"
+    assert idle["channel"] == "web"
+    assert idle["workspace_uri"] == "workspace:default"
+    sid = UUID(idle["created"])
+    ent = await store.get_entity(sid)
+    assert ent is not None and ent.jsonld["channel"] == "web"
+    assert not router.is_operator_session(ent)
+    assert await store.list_events(sid) == []
+    assert "note" in idle
+
+    named = json.loads(
+        await router.run_operator_tool("CreateSession", {"title": "Docs", "workspace": "orbweaver"}, ctx)
+    )
+    assert named["workspace_uri"] == "workspace:orbweaver"
+    assert named["created"] != idle["created"]
+
+    bad = await router.run_operator_tool("CreateSession", {"title": "x", "workspace": "/etc"}, ctx)
+    assert bad.startswith("error:")
+
+    llm = _install_llm(monkeypatch, _ScriptedAnthropic([_text("started")]))
+    monkeypatch.setattr(tg, "notify_telegram_chat", AsyncMock())
+    started = json.loads(
+        await router.run_operator_tool(
+            "CreateSession", {"text": "Tune the PID loop on the airbed"}, ctx
+        )
+    )
+    assert started["title"] == "Tune the PID loop on the airbed"
+    assert started["prompt"]["action"] == "started"
+    created = UUID(started["created"])
+    op_mid = await store.get_entity(op.id)
+    assert created in router.prompted_ids(op_mid)
+    await _drain_tasks()
+    events = await store.list_events(created)
+    assert events[0].kind == "user"
+    assert events[0].payload.get("via") == "telegram"
+    assert events[0].payload.get("text") == "Tune the PID loop on the airbed"
+    op = await store.get_entity(op.id)
+    assert router.last_prompted_id(op) == created
+    assert llm.calls
+    names = {t["name"] for t in llm.calls[0]["tools"]}
+    assert "ProposePatch" not in names  # home channel is web, not vscode
+    assert not names & router.OPERATOR_TOOLS
 
 
 @pytest.mark.asyncio
 async def test_operator_tools_are_allowlisted(tmp_path):
     ws = _ws(tmp_path)
     for name in router.OPERATOR_TOOLS:
-        inp = {"session": "x", "text": "hi"} if name in {"PromptSession", "StopSession", "SessionDigest"} else {}
+        if name in {"PromptSession", "StopSession", "SessionDigest"}:
+            inp = {"session": "x", "text": "hi"}
+        elif name == "CreateSession":
+            inp = {"title": "x"}
+        else:
+            inp = {}
         decision = await can_use_tool(
             name, inp, {"workspace": ws, "headless": True, "session_id": uuid4()}
         )
