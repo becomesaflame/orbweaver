@@ -11,7 +11,8 @@ from apscheduler.triggers.cron import CronTrigger
 from orbweaver.agent import TurnCancelled, agent_turn
 from orbweaver.config import settings
 from orbweaver.store import Job, get_store
-from orbweaver.turns import GatewayDraining, TurnBusy, running_turn
+from orbweaver.turns import DRAIN_INTERRUPT, GatewayDraining, TurnBusy, running_turn
+from orbweaver.turnstate import STATUS_STOPPED, session_turn_status
 from orbweaver.workspace import bind_workspace
 
 log = logging.getLogger(__name__)
@@ -120,37 +121,51 @@ def _slots() -> asyncio.Semaphore:
     return _job_slots
 
 
-async def _run_job_turn(store, sess, session_id: UUID, job: Job, message: str) -> None:
-    """One cron turn under the per-session lock. Raises TurnBusy if the session is mid-turn."""
+async def _run_job_turn(store, sess, session_id: UUID, job: Job, message: str) -> bool:
+    """One cron turn under the per-session lock. Raises TurnBusy if the session is mid-turn.
+
+    Returns True when drain preempted the turn: keep the job queued so the next
+    process resumes instead of treating it as finished.
+    """
     async with running_turn(session_id, channel="cron") as state:
         ws, kind, changed = bind_workspace(
             sess.jsonld, settings.workspace_root, session_key=str(session_id)
         )
         if changed:
             await store.put_entity(sess)
-        await store.append_event(session_id, "cron", {"job_id": str(job.id)})
+        prior = await store.list_events(session_id)
+        resume = bool(job.payload.get("resume")) or session_turn_status(prior) == STATUS_STOPPED
+        if not resume:
+            await store.append_event(session_id, "cron", {"job_id": str(job.id)})
+        prompt = "" if resume else (message or "scheduled task")
         try:
             events = await agent_turn(
                 store,
                 session_id,
-                message,
+                prompt,
                 ws,
                 workspace_kind=kind,
                 headless=True,
                 channel="cron",
                 cancel=state.cancel,
                 turn_state=state,
+                resume=resume,
             )
         except TurnCancelled as e:
-            # Stop from the web UI now reaches cron turns through the shared registry.
-            marker = await store.append_event(session_id, "turn_interrupted", {"reason": "stop"})
+            # Stop from the web UI, or drain preempt, reaches cron through the registry.
+            reason = state.interrupt_reason or "stop"
+            marker = await store.append_event(session_id, "turn_interrupted", {"reason": reason})
             events = [*e.produced, marker]
+            if reason == DRAIN_INTERRUPT:
+                job.payload["resume"] = True
+                return True
         if job.payload.get("selfheal"):
             from orbweaver.selfheal import finish_attempt
 
             await finish_attempt(job, events, store)
         else:
             await _notify_originating_channel(store, sess, session_id, job, events)
+        return False
 
 
 async def _finish_job(store, job: Job) -> None:
@@ -171,7 +186,7 @@ async def _run_job(store, job: Job) -> None:
             if session_id and sess is not None:
                 message = str(job.payload.get("message") or "scheduled task")
                 try:
-                    await _run_job_turn(store, sess, session_id, job, message)
+                    keep = await _run_job_turn(store, sess, session_id, job, message)
                 except TurnBusy as busy:
                     log.info(
                         "cron: job %s skipped, session %s has a running turn (%s); retry in 1 min",
@@ -189,6 +204,11 @@ async def _run_job(store, job: Job) -> None:
                     )
                     job.due_at = datetime.now(UTC) + SKIP_RETRY
                     await store.reschedule_job(job)
+                    return
+                if keep:
+                    job.due_at = datetime.now(UTC)
+                    await store.reschedule_job(job)
+                    log.info("cron: job %s paused for drain; will resume after restart", job.id)
                     return
             await _finish_job(store, job)
     except Exception:

@@ -31,6 +31,8 @@ def test_acquire_raises_when_draining_new_session():
     assert holder is not None
     turns.begin_drain()
     assert turns.get(running) is holder
+    assert holder.cancel.is_set()
+    assert holder.interrupt_reason == turns.DRAIN_INTERRUPT
     assert turns.acquire(running, channel="web") is None
     with pytest.raises(turns.GatewayDraining, match="draining"):
         turns.acquire(uuid4(), channel="telegram")
@@ -246,3 +248,91 @@ async def test_cron_skips_when_gateway_is_draining(tmp_path, monkeypatch, caplog
     fake_turn.assert_not_awaited()
     assert any("draining" in r.getMessage() for r in caplog.records)
     assert not turns.is_running(sid)
+
+
+@pytest.mark.asyncio
+async def test_cron_keeps_one_shot_job_when_drain_preempts(tmp_path, monkeypatch):
+    """A sleep-280 self-heal must not be deleted so the next process can resume."""
+    from orbweaver.agent import TurnCancelled
+
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+
+    async def fake_turn(*_a, **_k):
+        turns.begin_drain()
+        raise TurnCancelled([])
+
+    monkeypatch.setattr(cron, "agent_turn", fake_turn)
+    sid = uuid4()
+    await store.put_entity(
+        Entity(
+            id=sid,
+            at_id=session_at_id(sid),
+            at_type=SESSION_TYPE,
+            jsonld={
+                "@id": session_at_id(sid),
+                "@type": SESSION_TYPE,
+                "workspace_uri": "workspace:default",
+                "workspace_kind": "local",
+                "channel": "cron",
+            },
+        )
+    )
+    job = Job(
+        id=uuid4(),
+        due_at=datetime.now(UTC) - timedelta(seconds=1),
+        payload={"message": "fix KeyError", "selfheal": True, "fingerprint": "KeyError:x"},
+        session_id=sid,
+    )
+    await store.put_job(job)
+    await cron._run_job(store, job)
+    kept = await store.due_jobs(datetime.now(UTC) + timedelta(days=1))
+    assert any(j.id == job.id for j in kept)
+    row = next(j for j in kept if j.id == job.id)
+    assert row.payload.get("resume") is True
+    events = await store.list_events(sid)
+    assert events[-1].kind == "turn_interrupted"
+    assert events[-1].payload.get("reason") == "drain"
+
+
+@pytest.mark.asyncio
+async def test_cron_resumes_stopped_session_without_reprompting(tmp_path, monkeypatch):
+    """Restart used to append the original cron prompt as a new user message."""
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    captured: dict[str, object] = {}
+
+    async def fake_turn(_store, _sid, text, *_a, **kwargs):
+        captured["text"] = text
+        captured["resume"] = kwargs.get("resume")
+        return []
+
+    monkeypatch.setattr(cron, "agent_turn", fake_turn)
+    sid = uuid4()
+    sess = Entity(
+        id=sid,
+        at_id=session_at_id(sid),
+        at_type=SESSION_TYPE,
+        jsonld={
+            "@id": session_at_id(sid),
+            "@type": SESSION_TYPE,
+            "workspace_uri": "workspace:default",
+            "workspace_kind": "local",
+            "channel": "cron",
+        },
+    )
+    await store.put_entity(sess)
+    await store.append_event(sid, "user", {"text": "already in progress"})
+    await store.append_event(sid, "tool_call", {"name": "Bash", "id": "t1"})
+    job = Job(
+        id=uuid4(),
+        due_at=datetime.now(UTC),
+        payload={"message": "ORIGINAL SELFHEAL PROMPT", "resume": True},
+        session_id=sid,
+    )
+    keep = await cron._run_job_turn(store, sess, sid, job, "ORIGINAL SELFHEAL PROMPT")
+    assert keep is False
+    assert captured["resume"] is True
+    assert captured["text"] == ""
+    kinds = [e.kind for e in await store.list_events(sid)]
+    assert kinds.count("user") == 1

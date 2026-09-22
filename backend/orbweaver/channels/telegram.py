@@ -609,7 +609,11 @@ async def _run_turn(
         # Stop from the web UI (or /stop) reaches Telegram turns through the shared registry.
         status = "stopped"
         if session_id is not None:
-            marker = await store.append_event(session_id, "turn_interrupted", {"reason": "stop"})
+            marker = await store.append_event(
+                session_id,
+                "turn_interrupted",
+                {"reason": (state.interrupt_reason if state else "") or "stop"},
+            )
             router.emit(
                 session_id,
                 {"kind": marker.kind, "payload": marker.payload, "id": str(marker.id), "seq": marker.seq},
