@@ -2041,6 +2041,7 @@ async def agent_turn(
                     "payload": user_ev.payload,
                     "id": str(user_ev.id),
                     "seq": user_ev.seq,
+                    "created_at": user_ev.created_at.isoformat(),
                 }
             )
     produced: list[Event] = []
@@ -2049,7 +2050,15 @@ async def agent_turn(
     def fire(ev: Event) -> None:
         produced.append(ev)
         if emit:
-            emit({"kind": ev.kind, "payload": ev.payload, "id": str(ev.id), "seq": ev.seq})
+            emit(
+                {
+                    "kind": ev.kind,
+                    "payload": ev.payload,
+                    "id": str(ev.id),
+                    "seq": ev.seq,
+                    "created_at": ev.created_at.isoformat(),
+                }
+            )
 
     def emit_context(events: list[Event]) -> None:
         if emit:

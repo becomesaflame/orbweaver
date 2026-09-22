@@ -438,7 +438,13 @@ async def _ws_writer(session_id: UUID, sub: _WsSubscriber) -> None:
 
 
 def _event_dict(e) -> dict[str, Any]:
-    return {"id": str(e.id), "seq": e.seq, "kind": e.kind, "payload": e.payload}
+    return {
+        "id": str(e.id),
+        "seq": e.seq,
+        "kind": e.kind,
+        "payload": e.payload,
+        "created_at": e.created_at.isoformat(),
+    }
 
 
 async def _revert_autotitle_if_needed(store, sess: Entity, discarded_text: str) -> None:
@@ -850,15 +856,7 @@ async def list_events(session_id: UUID, _u: dict = Depends(_user)) -> dict[str, 
     # "turn_status" frame carrying a boolean `running`, and these are different
     # shapes.
     body: dict[str, Any] = {
-        "events": [
-            {
-                "id": str(e.id),
-                "seq": e.seq,
-                "kind": e.kind,
-                "payload": e.payload,
-            }
-            for e in events
-        ],
+        "events": [_event_dict(e) for e in events],
         "last_turn_state": (
             "running" if turn_is_running(session_id) else session_turn_status(events)
         ),
