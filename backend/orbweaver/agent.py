@@ -1052,6 +1052,18 @@ def pending_approvals(session_id: UUID) -> list[PendingApproval]:
     return [p for p in _pending_approvals.get(session_id, {}).values() if not p.future.done()]
 
 
+def find_pending_approval(tool_use_id: str) -> UUID | None:
+    """Session waiting on this tool_use_id, or None."""
+    key = str(tool_use_id)
+    if not key:
+        return None
+    for sid, bucket in _pending_approvals.items():
+        pend = bucket.get(key)
+        if pend is not None and not pend.future.done():
+            return sid
+    return None
+
+
 def resolve_approval(
     session_id: UUID, tool_use_id: str, decision: str, scope: str = "once"
 ) -> bool:

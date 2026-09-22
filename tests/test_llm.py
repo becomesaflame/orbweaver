@@ -68,7 +68,7 @@ def test_operator_tools_wire_with_explicit_empty_required():
     from orbweaver.channels.router import OPERATOR_TOOL_SPEC
 
     by_name = {t["name"]: t for t in OPERATOR_TOOL_SPEC}
-    for name in ("ListSessions", "DetachSession"):
+    for name in ("ListSessions",):
         schema = by_name[name]["input_schema"]
         assert schema["properties"] == {}
         assert schema["required"] == []

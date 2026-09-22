@@ -1,23 +1,24 @@
-"""Session router: lets a singleton channel session drive any other session.
+"""Session router: a channel operator discovers other sessions and prompts them.
 
 A channel such as Telegram (and, later, voice) owns one *operator* session per
-identity. That session can be *attached* to another session. While attached,
-messages from the channel run ``agent_turn`` on the target instead of the
-operator, so the user continues the exact conversation they started in the web
-UI or VS Code: same event stream, workspace, model, todos, and session rules.
+identity. That session stays itself: messages from the channel run on the
+operator. To continue desk work the operator calls ``PromptSession``, which
+injects or starts a turn on the target (same event stream, workspace, model,
+todos, and tools) without moving the channel's cursor into that chat.
 
 Two process-wide registries live here so channels never import each other:
 
 * **Sinks** — per-session fan-out for live turn events. The gateway registers
-  one global sink (WebSocket subscribers); a channel registers a per-session
-  sink on the sessions it is bound to (the operator itself plus the attached
-  target). Every channel passes :func:`emitter` to ``agent_turn`` so a turn
-  started anywhere is visible everywhere.
-* **Attach hooks** — called after :func:`attach` / :func:`detach` so the owning
-  channel can move its sink to the new target.
+  one global sink (WebSocket subscribers); a channel may register a global sink
+  (Telegram dispatcher) or a per-session sink. Every channel passes
+  :func:`emitter` to ``agent_turn`` so a turn started anywhere is visible
+  everywhere.
+* **Watch set** — sessions the operator recently prompted, persisted on the
+  operator JSON-LD so a restart still reports that turn's completion.
 
-Nothing in this module knows about Telegram; the tool handlers
-(:func:`run_operator_tool`) work on the operator session in ``ctx``.
+Nothing in this module is Telegram-specific except that ``PromptSession`` /
+``StopSession`` delegate to the channel adapter (lazy import) so the operator
+tools can start or stop a turn on another session.
 """
 
 from __future__ import annotations
@@ -43,20 +44,20 @@ log = logging.getLogger(__name__)
 
 ATTACHED_KEY = "attached_session"
 ATTACHED_AT_KEY = "attached_at"
+PROMPTED_KEY = "prompted_sessions"
+LAST_PROMPTED_KEY = "last_prompted_session"
 OPERATOR_ROLE = "operator"
 SESSION_IRI_PREFIX = "urn:orbweaver:session:"
 
 Sink = Callable[[dict[str, Any]], None]
 GlobalSink = Callable[[UUID, dict[str, Any]], None]
-AttachHook = Callable[[Entity, UUID | None], None]
 
 _global_sinks: list[GlobalSink] = []
 _session_sinks: dict[UUID, dict[str, Sink]] = {}
-_attach_hooks: list[AttachHook] = []
 
 
 class RouterError(ValueError):
-    """Bad attach target or unresolvable session reference."""
+    """Bad prompt target or unresolvable session reference."""
 
 
 class AmbiguousSessionRef(RouterError):
@@ -73,6 +74,13 @@ class AmbiguousSessionRef(RouterError):
 def add_global_sink(fn: GlobalSink) -> None:
     if fn not in _global_sinks:
         _global_sinks.append(fn)
+
+
+def remove_global_sink(fn: GlobalSink) -> None:
+    try:
+        _global_sinks.remove(fn)
+    except ValueError:
+        return
 
 
 def add_sink(session_id: UUID, key: str, fn: Sink) -> None:
@@ -116,19 +124,13 @@ def emitter(session_id: UUID) -> Sink:
     return _emit
 
 
-def add_attach_hook(fn: AttachHook) -> None:
-    if fn not in _attach_hooks:
-        _attach_hooks.append(fn)
-
-
 def reset_for_tests() -> None:
-    """Clear per-session sinks and attach hooks. Global sinks are process-level
-    registrations (the gateway's WebSocket fan-out) and survive."""
+    """Clear per-session sinks. Global sinks are process-level registrations
+    (the gateway's WebSocket fan-out) and survive; Telegram removes its own."""
     _session_sinks.clear()
-    _attach_hooks.clear()
 
 
-# ------------------------------------------------------------------- attach pointer
+# ---------------------------------------------------------------- operator / watch set
 
 
 def is_operator_session(entity: Entity | None) -> bool:
@@ -138,7 +140,9 @@ def is_operator_session(entity: Entity | None) -> bool:
     return jsonld.get("role") == OPERATOR_ROLE or jsonld.get("telegram_user_id") is not None
 
 
-def _is_subagent(entity: Entity) -> bool:
+def is_subagent_session(entity: Entity | None) -> bool:
+    if entity is None:
+        return False
     jsonld = entity.jsonld or {}
     return jsonld.get("role") == "subagent" or bool(jsonld.get("parent_session"))
 
@@ -152,62 +156,61 @@ def parse_session_ref(raw: Any) -> UUID | None:
         return None
 
 
-def attached_id(operator: Entity | None) -> UUID | None:
+def clear_legacy_attach(jsonld: dict[str, Any]) -> bool:
+    """Drop leftover ``attached_session`` from the old cursor model. True if changed."""
+    changed = False
+    if ATTACHED_KEY in jsonld:
+        jsonld.pop(ATTACHED_KEY, None)
+        changed = True
+    if ATTACHED_AT_KEY in jsonld:
+        jsonld.pop(ATTACHED_AT_KEY, None)
+        changed = True
+    return changed
+
+
+def prompted_ids(operator: Entity | None) -> list[UUID]:
+    if operator is None:
+        return []
+    raw = (operator.jsonld or {}).get(PROMPTED_KEY) or []
+    if not isinstance(raw, list):
+        raw = [raw]
+    out: list[UUID] = []
+    seen: set[UUID] = set()
+    for item in raw:
+        uid = parse_session_ref(item)
+        if uid is None or uid in seen:
+            continue
+        seen.add(uid)
+        out.append(uid)
+    return out
+
+
+def last_prompted_id(operator: Entity | None) -> UUID | None:
     if operator is None:
         return None
-    return parse_session_ref((operator.jsonld or {}).get(ATTACHED_KEY))
+    return parse_session_ref((operator.jsonld or {}).get(LAST_PROMPTED_KEY))
 
 
-def _fire_hooks(operator: Entity, target: UUID | None) -> None:
-    for hook in tuple(_attach_hooks):
-        try:
-            hook(operator, target)
-        except Exception:
-            log.exception("attach hook failed for operator %s", operator.id)
+def _prompted_iris(ids: list[UUID]) -> list[str]:
+    return [session_at_id(uid) for uid in ids]
 
 
-async def attach(store: Store, operator: Entity, target_id: UUID) -> Entity:
-    """Point ``operator`` at ``target_id``. Returns the target session."""
-    if target_id == operator.id:
-        raise RouterError("cannot attach a session to itself")
-    target = await store.get_entity(target_id)
-    if target is None or target.at_type != SESSION_TYPE:
-        raise RouterError(f"session {target_id} not found")
-    if _is_subagent(target):
-        raise RouterError("cannot attach to a subagent session; use its parent")
-    if is_operator_session(target):
-        raise RouterError("cannot attach to another channel's operator session")
-    operator.jsonld[ATTACHED_KEY] = session_at_id(target_id)
-    operator.jsonld[ATTACHED_AT_KEY] = datetime.now(UTC).isoformat()
+async def mark_prompted(store: Store, operator: Entity, target_id: UUID) -> None:
+    """Record that ``operator`` prompted ``target_id`` (watch until terminal turn_done)."""
+    ids = [uid for uid in prompted_ids(operator) if uid != target_id]
+    ids.append(target_id)
+    operator.jsonld[PROMPTED_KEY] = _prompted_iris(ids)
+    operator.jsonld[LAST_PROMPTED_KEY] = session_at_id(target_id)
     await store.put_entity(operator)
-    _fire_hooks(operator, target_id)
-    return target
 
 
-async def detach(store: Store, operator: Entity) -> UUID | None:
-    """Clear the pointer. Returns the previous target id (None when not attached)."""
-    previous = attached_id(operator)
-    operator.jsonld.pop(ATTACHED_KEY, None)
-    operator.jsonld.pop(ATTACHED_AT_KEY, None)
+async def unwatch_prompted(store: Store, operator: Entity, target_id: UUID) -> None:
+    ids = [uid for uid in prompted_ids(operator) if uid != target_id]
+    if ids:
+        operator.jsonld[PROMPTED_KEY] = _prompted_iris(ids)
+    else:
+        operator.jsonld.pop(PROMPTED_KEY, None)
     await store.put_entity(operator)
-    _fire_hooks(operator, None)
-    return previous
-
-
-async def resolve_target(store: Store, operator: Entity) -> Entity:
-    """The session a message from ``operator``'s channel should run on.
-
-    A dangling pointer (target deleted) is cleared so the operator answers again.
-    """
-    target_id = attached_id(operator)
-    if target_id is None:
-        return operator
-    target = await store.get_entity(target_id)
-    if target is None or target.at_type != SESSION_TYPE:
-        log.info("router: attached session %s is gone; detaching %s", target_id, operator.id)
-        await detach(store, operator)
-        return operator
-    return target
 
 
 # ----------------------------------------------------------------------- discovery
@@ -251,11 +254,11 @@ def display_title(jsonld: dict[str, Any], events: list[Event]) -> str:
 
 
 async def candidate_sessions(store: Store, *, exclude: Iterable[UUID] = ()) -> list[Entity]:
-    """Sessions a channel may attach to: no subagents, operators, deleted, or ``exclude``."""
+    """Sessions a channel may prompt: no subagents, operators, deleted, or ``exclude``."""
     skip = set(exclude)
     out: list[Entity] = []
     for ent in await store.list_entities(SESSION_TYPE):
-        if ent.id in skip or _is_subagent(ent) or is_operator_session(ent):
+        if ent.id in skip or is_subagent_session(ent) or is_operator_session(ent):
             continue
         if is_deleted_session(ent):
             continue
@@ -376,14 +379,22 @@ def _age(iso: str) -> str:
     return f"{secs // 86400}d ago"
 
 
-def format_session_list(rows: list[dict[str, Any]], attached: UUID | None = None, limit: int = 15) -> str:
+def format_session_list(
+    rows: list[dict[str, Any]], watching: UUID | Iterable[UUID] | None = None, limit: int = 15
+) -> str:
     if not rows:
         return "No other sessions yet."
+    watched: set[str] = set()
+    if watching is not None:
+        if isinstance(watching, UUID):
+            watched = {str(watching)}
+        else:
+            watched = {str(uid) for uid in watching}
     lines = []
     for row in rows[:limit]:
         marks = []
-        if attached is not None and row["id"] == str(attached):
-            marks.append("attached")
+        if row["id"] in watched:
+            marks.append("watching")
         if row["running"]:
             marks.append(f"running via {row['running_channel']}")
         if row["pending_question"]:
@@ -451,12 +462,29 @@ OPERATOR_TOOL_SPEC: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "AttachSession",
+        "name": "PromptSession",
         "description": (
-            "Hand this chat over to another session. After this call the user's next messages "
-            "run on that session (its history, workspace, and model) until they detach. Use when "
-            "the user wants to continue work they started in the web UI or VS Code. If several "
-            "sessions could match, ask which one before attaching."
+            "Send an instruction to another Orbweaver session (web, VS Code). The target keeps "
+            "its own history, workspace, model, and tools; this chat stays the operator. Use "
+            "when the user wants to continue work they started at their desk. If a turn is "
+            "already running the text is injected; if the session is waiting for AskUser the "
+            "text is the answer; otherwise a new turn starts. Results are reported back here. "
+            "If several sessions could match, ask which one first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "session": {"type": "string"},
+                "text": {"type": "string", "description": "Instruction or answer to send"},
+            },
+            "required": ["session", "text"],
+        },
+    },
+    {
+        "name": "StopSession",
+        "description": (
+            "Cancel the running turn on another session. Accepts a session id, id prefix, "
+            "or title fragment."
         ),
         "input_schema": {
             "type": "object",
@@ -464,29 +492,20 @@ OPERATOR_TOOL_SPEC: list[dict[str, Any]] = [
             "required": ["session"],
         },
     },
-    {
-        "name": "DetachSession",
-        "description": "Return this chat to its own session (undo AttachSession).",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
 ]
 OPERATOR_TOOLS = frozenset(t["name"] for t in OPERATOR_TOOL_SPEC)
 
 OPERATOR_SYSTEM_EXTRA = (
-    "You are also the operator for this chat: the user's always-on entry point from their "
-    "phone. Besides this workspace you can see every other Orbweaver session (web, VS Code, "
-    "cron). When the user asks what they were working on, or wants to continue something "
-    "they started at their desk, call ListSessions, then SessionDigest on the likely match, "
-    "and summarize. To hand the conversation over, call AttachSession: from then on the "
-    "user's messages go straight to that session with its full history and workspace, not "
-    "to you, until they send /detach. If more than one session could match, ask which. Do "
-    "not redo work that belongs to another session; attach instead."
-)
-
-ATTACHED_TURN_HINT = (
-    "The user is driving this session from Telegram right now (away from their desk). "
-    "This session's history, workspace, and plan still apply. Keep replies short and "
-    "skimmable; long output belongs in files the user can read later."
+    "You are the operator for this Telegram chat: the user's always-on dispatcher from "
+    "their phone, not a cursor inside another conversation. Besides this workspace you "
+    "can see every other Orbweaver session (web, VS Code, cron). When the user asks what "
+    "they were working on, call ListSessions, then SessionDigest on the likely match, and "
+    "summarize. To continue work that belongs in another session, call PromptSession with "
+    "a clear instruction; that session keeps its own history, workspace, and tools, and "
+    "the result is reported back here. Replying to a tagged report on Telegram injects "
+    "into that session without asking you. If more than one session could match, ask "
+    "which. Do not redo long-running work that belongs to another session; prompt it "
+    "instead. PromptSession already pings the user with a short ack."
 )
 
 
@@ -506,48 +525,44 @@ async def run_operator_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any])
     exclude = {operator_id}
     if name == "ListSessions":
         rows = await list_sessions(store, exclude=exclude)
-        return json.dumps({"attached": _iri_or_none(attached_id(operator)), "sessions": rows})
-    if name in {"SessionDigest", "AttachSession"}:
+        return json.dumps(
+            {
+                "watching": [_iri_or_none(uid) for uid in prompted_ids(operator)],
+                "sessions": rows,
+            }
+        )
+    if name == "SessionDigest":
         ref = str(inp.get("session") or "").strip()
         if not ref:
             return "error: session is required (id, id prefix, or title fragment)"
         try:
             target = await find_session(store, ref, exclude=exclude)
         except AmbiguousSessionRef as e:
-            return json.dumps(
-                {
-                    "error": str(e),
-                    "matches": [
-                        {"id": str(m.id), "title": str((m.jsonld or {}).get("title") or "")}
-                        for m in e.matches
-                    ],
-                }
-            )
+            return _ambiguous_tool_error(e)
         if target is None:
             return f"error: no session matches '{ref}'"
-        if name == "SessionDigest":
-            return json.dumps(await session_digest(store, target.id))
-        try:
-            await attach(store, operator, target.id)
-        except RouterError as e:
-            return f"error: {e}"
-        digest = await session_digest(store, target.id)
-        return json.dumps(
-            {
-                "attached": str(target.id),
-                "title": digest["title"],
-                "workspace_uri": digest["workspace_uri"],
-                "note": (
-                    "The user's next messages run on this session. Tell them what it was "
-                    "doing and that they can send /detach to come back."
-                ),
-                "digest": digest,
-            }
-        )
-    if name == "DetachSession":
-        previous = await detach(store, operator)
-        return json.dumps({"detached": _iri_or_none(previous)})
+        return json.dumps(await session_digest(store, target.id))
+    if name == "PromptSession":
+        from orbweaver.channels.telegram import prompt_session_from_operator
+
+        return await prompt_session_from_operator(store, operator, inp)
+    if name == "StopSession":
+        from orbweaver.channels.telegram import stop_session_from_operator
+
+        return await stop_session_from_operator(store, operator, inp)
     return f"unknown operator tool {name}"
+
+
+def _ambiguous_tool_error(e: AmbiguousSessionRef) -> str:
+    return json.dumps(
+        {
+            "error": str(e),
+            "matches": [
+                {"id": str(m.id), "title": str((m.jsonld or {}).get("title") or "")}
+                for m in e.matches
+            ],
+        }
+    )
 
 
 def _iri_or_none(uid: UUID | None) -> str | None:

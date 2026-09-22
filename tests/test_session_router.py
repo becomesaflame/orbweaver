@@ -1,10 +1,9 @@
-"""Session router: Telegram operator attaches to web/VS Code sessions and drives them.
+"""Session router: Telegram operator dispatches to other sessions without attaching.
 
 These run the real ``agent_turn`` (scripted Anthropic client) so the cross-channel
-paths are exercised end to end: an attached Telegram message answers a web
-``AskUser``; a web turn's result is delivered to the attached chat; operator
-tools move the attach pointer from inside a turn; ``/stop`` cancels a
-background Telegram turn through the shared registry.
+paths are exercised end to end: PromptSession answers a web ``AskUser``; a watched
+web turn's result is delivered to the chat; unwatched completions stay quiet;
+reply-to a tagged report injects; leftover ``attached_session`` is ignored.
 """
 
 from __future__ import annotations
@@ -34,6 +33,7 @@ from orbweaver.workspace import LocalWorkspace
 def _fresh(monkeypatch, tmp_path):
     reset_store_for_tests()
     tg.reset_for_tests()
+    tg.install_telegram_sink()
     monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(settings, "telegram_allowlist", "")
@@ -92,12 +92,22 @@ def _install_llm(monkeypatch, client):
     return client
 
 
-def _update(user_id=42, chat_id=42, text="hi"):
+def _update(user_id=42, chat_id=42, text="hi", reply_text=None):
     update = MagicMock()
     update.effective_user.id = user_id
+    update.effective_user.is_bot = False
     update.effective_chat.id = chat_id
     update.message.text = text
     update.message.reply_text = AsyncMock()
+    if reply_text is None:
+        update.message.reply_to_message = None
+    else:
+        reply = MagicMock()
+        reply.text = reply_text
+        reply.caption = None
+        reply.from_user = MagicMock()
+        reply.from_user.is_bot = True
+        update.message.reply_to_message = reply
     return update
 
 
@@ -113,55 +123,6 @@ async def _drain_tasks():
 
 
 # --------------------------------------------------------------------- router core
-
-
-@pytest.mark.asyncio
-async def test_attach_detach_and_resolve_target():
-    store = reset_store_for_tests()
-    op = await tg.session_for_telegram_user(store, 42, chat_id=42)
-    assert op.jsonld["role"] == router.OPERATOR_ROLE
-    web = _session(uuid4(), title="Fix the proxy", channel="web")
-    await store.put_entity(web)
-
-    assert (await router.resolve_target(store, op)).id == op.id
-    target = await router.attach(store, op, web.id)
-    assert target.id == web.id
-    assert op.jsonld[router.ATTACHED_KEY] == session_at_id(web.id)
-    assert router.attached_id(op) == web.id
-    assert (await router.resolve_target(store, op)).id == web.id
-    # The pointer is an IRI, so it is indexed as a graph edge like parent_session.
-    assert any(p == router.ATTACHED_KEY for _s, p, _o in await store.graph(op.at_id))
-
-    assert await router.detach(store, op) == web.id
-    assert router.ATTACHED_KEY not in op.jsonld
-    assert await router.detach(store, op) is None
-
-
-@pytest.mark.asyncio
-async def test_attach_refuses_self_subagents_and_operators():
-    store = reset_store_for_tests()
-    op = await tg.session_for_telegram_user(store, 42, chat_id=42)
-    other_op = await tg.session_for_telegram_user(store, 7, chat_id=7)
-    child = _session(uuid4(), role="subagent", parent_session=session_at_id(uuid4()))
-    await store.put_entity(child)
-    with pytest.raises(router.RouterError):
-        await router.attach(store, op, op.id)
-    with pytest.raises(router.RouterError):
-        await router.attach(store, op, child.id)
-    with pytest.raises(router.RouterError):
-        await router.attach(store, op, other_op.id)
-    with pytest.raises(router.RouterError):
-        await router.attach(store, op, uuid4())
-
-
-@pytest.mark.asyncio
-async def test_dangling_attach_pointer_detaches():
-    store = reset_store_for_tests()
-    op = await tg.session_for_telegram_user(store, 42, chat_id=42)
-    op.jsonld[router.ATTACHED_KEY] = session_at_id(uuid4())
-    await store.put_entity(op)
-    assert (await router.resolve_target(store, op)).id == op.id
-    assert router.ATTACHED_KEY not in op.jsonld
 
 
 @pytest.mark.asyncio
@@ -190,7 +151,7 @@ async def test_find_session_by_uuid_prefix_and_title():
 
 
 @pytest.mark.asyncio
-async def test_deleted_sessions_are_not_attach_candidates():
+async def test_deleted_sessions_are_not_prompt_candidates():
     """A chat deleted in the web UI must not be reachable from another channel."""
     store = reset_store_for_tests()
     op = await tg.session_for_telegram_user(store, 42, chat_id=42)
@@ -204,7 +165,6 @@ async def test_deleted_sessions_are_not_attach_candidates():
         await store.put_entity(s)
     ex = {op.id}
     assert [e.id for e in await router.candidate_sessions(store, exclude=ex)] == [live.id]
-    # Neither by id nor by title, and "airbed" is no longer ambiguous.
     assert await router.find_session(store, str(gone.id), exclude=ex) is None
     assert (await router.find_session(store, "airbed", exclude=ex)).id == live.id
 
@@ -231,8 +191,8 @@ async def test_list_and_digest_report_running_and_pending():
         row = rows[0]
         assert row["running"] and row["running_channel"] == "web"
         assert row["pending_question"] == "Port?"
-        listing = router.format_session_list(rows, attached=web.id)
-        assert "attached" in listing and "running via web" in listing
+        listing = router.format_session_list(rows, watching=web.id)
+        assert "watching" in listing and "running via web" in listing
         digest = await router.session_digest(store, web.id)
         assert digest["open_todo_count"] == 1
         assert digest["compact_summary"].startswith("Earlier")
@@ -246,7 +206,11 @@ async def test_list_and_digest_report_running_and_pending():
 def test_emit_fans_out_to_global_and_session_sinks_and_survives_errors():
     sid, other = uuid4(), uuid4()
     seen: list[tuple[str, UUID, str]] = []
-    router.add_global_sink(lambda s, m: seen.append(("global", s, m["kind"])))
+
+    def capture(s, m):
+        seen.append(("global", s, m["kind"]))
+
+    router.add_global_sink(capture)
 
     def boom(_msg):
         raise RuntimeError("sink broke")
@@ -261,54 +225,175 @@ def test_emit_fans_out_to_global_and_session_sinks_and_survives_errors():
     assert not any(s == "session" and u == other for s, u, _k in seen)
     router.remove_sink(sid, "good")
     router.remove_sink(sid, "bad")
+    router.remove_global_sink(capture)
     assert router.sink_keys(sid) == []
 
 
-# ---------------------------------------------------------------- chat sinks
+def test_session_tag_round_trip():
+    sid = UUID("aaaaaaaa-0000-4000-8000-000000000001")
+    tag = tg.session_tag("sidebar context menu", sid)
+    assert tag == "[sidebar context menu · aaaaaaaa]"
+    assert tg.parse_session_tag(f"{tag}\nTests are green.") == "aaaaaaaa"
+    assert tg.parse_session_tag("plain text") is None
 
 
 @pytest.mark.asyncio
-async def test_sync_chat_sinks_follows_attach_pointer():
+async def test_legacy_attach_is_cleared_on_normalize(tmp_path, monkeypatch):
+    _install_llm(monkeypatch, _ScriptedAnthropic([_text("still the operator")]))
     store = reset_store_for_tests()
-    tg.install_router_hooks()
-    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
-    web = _session(uuid4(), title="web work", channel="web")
+    web = _session(uuid4(), title="sidebar context menu", channel="web")
     await store.put_entity(web)
-    tg.sync_chat_sinks(op)
-    assert router.sink_keys(op.id) == ["telegram:900"]
-    assert router.sink_keys(web.id) == []
-
-    await router.attach(store, op, web.id)  # hook re-syncs
-    assert router.sink_keys(web.id) == ["telegram:900"]
-    assert tg.chats_for_session(web.id) == [900]
-    assert tg._telegram_chat_id(web) == 900  # SendPhoto on the attached session reaches the chat
-
-    await router.detach(store, op)
-    assert router.sink_keys(web.id) == []
-    assert router.sink_keys(op.id) == ["telegram:900"]
-
-
-@pytest.mark.asyncio
-async def test_rehydrate_chat_sinks_after_restart():
-    store = reset_store_for_tests()
-    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
-    web = _session(uuid4(), channel="web")
-    await store.put_entity(web)
+    op = await tg.session_for_telegram_user(store, 42, chat_id=42)
     op.jsonld[router.ATTACHED_KEY] = session_at_id(web.id)
     await store.put_entity(op)
-    tg.reset_for_tests()
-    router.reset_for_tests()
-    assert await tg.rehydrate_chat_sinks(store) == 1
-    assert router.sink_keys(web.id) == ["telegram:900"]
-    assert router.sink_keys(op.id) == ["telegram:900"]
+    update, context = _update(), _context()
+    await tg._run_turn(update, context, "what's up")
+    op = await store.get_entity(op.id)
+    assert router.ATTACHED_KEY not in (op.jsonld or {})
+    assert [e.payload.get("text") for e in await store.list_events(web.id) if e.kind == "user"] == []
+    assert [e.kind for e in await store.list_events(op.id)][:2] == ["user", "assistant"]
 
 
-# ------------------------------------------------ attached turns (real agent loop)
+# ---------------------------------------------------------------- dispatcher sink
 
 
 @pytest.mark.asyncio
-async def test_attached_telegram_message_answers_web_ask_user(tmp_path, monkeypatch, auth_header):
-    """Web turn parks on AskUser; the reply typed on Telegram lands on that session."""
+async def test_approval_from_unwatched_session_reaches_telegram(tmp_path, monkeypatch):
+    store = reset_store_for_tests()
+    sent: list[tuple[int, str]] = []
+
+    async def fake_approval(chat_id, payload, *, tag=""):
+        sent.append((chat_id, tag, payload.get("tool_use_id")))
+
+    monkeypatch.setattr(tg, "notify_telegram_approval", fake_approval)
+    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
+    web = _session(uuid4(), title="Ship the router", channel="web")
+    await store.put_entity(web)
+    _remember = op
+    del _remember
+    router.emit(
+        web.id,
+        {
+            "kind": "permission_request",
+            "payload": {"tool_use_id": "tu-9", "name": "Bash", "summary": "rm -rf build", "reason": "ask"},
+        },
+    )
+    await _drain_tasks()
+    assert sent and sent[0][0] == 900 and sent[0][2] == "tu-9"
+    assert "Ship the router" in sent[0][1] and str(web.id)[:8] in sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_unwatched_ok_is_silent_watched_ok_and_abort_report(tmp_path, monkeypatch):
+    store = reset_store_for_tests()
+    sent: list[tuple[int, str]] = []
+
+    async def fake_notify(chat_id, text):
+        sent.append((chat_id, text))
+
+    monkeypatch.setattr(tg, "notify_telegram_chat", fake_notify)
+    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
+    web = _session(uuid4(), title="Ship the router", channel="web")
+    await store.put_entity(web)
+    await store.append_event(web.id, "assistant", {"text": "desk-only reply"})
+    router.emit(web.id, {"kind": "turn_done", "status": "ok", "user_seq": 0, "channel": "web"})
+    await _drain_tasks()
+    assert sent == []
+
+    await router.mark_prompted(store, op, web.id)
+    tg._watched_chats[web.id] = 900
+    await store.append_event(web.id, "assistant", {"text": "prompted reply"})
+    router.emit(web.id, {"kind": "turn_done", "status": "ok", "user_seq": 0, "channel": "web"})
+    await _drain_tasks()
+    assert len(sent) == 1
+    assert "Ship the router" in sent[0][1] and "prompted reply" in sent[0][1]
+    op = await store.get_entity(op.id)
+    assert web.id not in router.prompted_ids(op)
+
+    other = _session(uuid4(), title="Unwatched fail", channel="web")
+    await store.put_entity(other)
+    await store.append_event(other.id, "turn_aborted", {"text": "classifier denied"})
+    await store.append_event(other.id, "assistant", {"text": "Turn aborted: classifier denied"})
+    router.emit(other.id, {"kind": "turn_done", "status": "ok", "user_seq": 0, "channel": "web"})
+    await _drain_tasks()
+    assert any("Unwatched fail" in t and "classifier denied" in t for _c, t in sent)
+
+
+@pytest.mark.asyncio
+async def test_web_turn_result_is_delivered_when_watched(tmp_path, monkeypatch, auth_header):
+    _install_llm(monkeypatch, _ScriptedAnthropic([_text("Tests are green, PR is up.")]))
+    store = reset_store_for_tests()
+    sent: list[tuple[int, str]] = []
+
+    async def fake_notify(chat_id, text):
+        sent.append((chat_id, text))
+
+    monkeypatch.setattr(tg, "notify_telegram_chat", fake_notify)
+    web = _session(uuid4(), title="Ship the router", channel="web")
+    await store.put_entity(web)
+    bound = await tg._session_workspace(_update(chat_id=900), _context())
+    await router.mark_prompted(store, bound.operator, web.id)
+    tg._watched_chats[web.id] = 900
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.post(
+            f"/v1/sessions/{web.id}/turns", json={"text": "run the tests"}, headers=auth_header
+        )
+        assert r.status_code == 200
+    await _drain_tasks()
+    assert sent
+    assert sent[-1][0] == 900
+    assert "Ship the router" in sent[-1][1]
+    assert "Tests are green, PR is up." in sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_send_photo_on_prompted_session_uses_operator_chat(tmp_path, monkeypatch):
+    import httpx
+
+    class _Resp:
+        status_code = 200
+        text = "ok"
+
+    class _FakeAsyncClient:
+        seen: dict | None = None
+
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, data=None, files=None, json=None):
+            _FakeAsyncClient.seen = {"url": url, "data": data}
+            return _Resp()
+
+    monkeypatch.setattr(settings, "telegram_bot_token", "tok")
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    store = reset_store_for_tests()
+    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
+    web = _session(uuid4(), title="Target", channel="web")
+    await store.put_entity(web)
+    await router.mark_prompted(store, op, web.id)
+    tg._watched_chats[web.id] = 900
+    ws = _ws(tmp_path)
+    ws.write_bytes("shot.jpg", b"\xff\xd8\xff")
+    result = await tg.send_session_photo(
+        {"workspace": ws, "store": store, "session_id": web.id},
+        {"path": "shot.jpg", "caption": "here"},
+    )
+    assert '"sent": true' in result
+    assert _FakeAsyncClient.seen["data"]["chat_id"] == "900"
+
+
+# ------------------------------------------------ prompted turns (real agent loop)
+
+
+@pytest.mark.asyncio
+async def test_prompt_session_answers_web_ask_user(tmp_path, monkeypatch, auth_header):
     llm = _install_llm(monkeypatch, _ScriptedAnthropic([
         SimpleNamespace(content=[_ToolUse("AskUser", {"question": "Port?"}, "tu-ask")]),
     ]))
@@ -325,106 +410,88 @@ async def test_attached_telegram_message_answers_web_ask_user(tmp_path, monkeypa
         )
         assert paused.json()["status"] == "waiting_ask"
 
-    update, context = _update(), _context()
+    update, context = _update(chat_id=900), _context()
     bound = await tg._session_workspace(update, context)
-    await tg.attach_text(bound, "pick a port")
     llm._responses.append(_text("8080 it is"))
-    await tg._run_turn(update, context, "8080")
+    monkeypatch.setattr(tg, "notify_telegram_chat", AsyncMock())
+    result = json.loads(await tg.prompt_session(bound.store, bound.operator, "pick a port", "8080"))
+    assert result["action"] == "started"
+    await _drain_tasks()
 
     events = await store.list_events(sid)
     user_events = [e for e in events if e.kind == "user"]
-    assert user_events[-1].payload == {"text": "8080", "ask_answer": True, "via": "telegram"}
+    assert user_events[-1].payload["text"] == "8080"
+    assert user_events[-1].payload.get("ask_answer") is True
+    assert user_events[-1].payload.get("via") == "telegram"
     results = [e for e in events if e.kind == "tool_result" and e.payload.get("name") == "AskUser"]
     assert results and results[0].payload["content"] == "8080"
     assert pending_ask_user(events) is None
-    assert update.message.reply_text.await_args.args[0] == "8080 it is"
-    # Nothing was written to the operator's own session.
-    assert await store.list_events(bound.operator.id) == []
-    # The Telegram-driven turn told WebSocket clients it finished (via the router).
-    from orbweaver.app import _last_turn_done
-
-    assert _last_turn_done[sid]["status"] == "ok"
-    await _drain_tasks()
+    op_users = [e for e in await store.list_events(bound.operator.id) if e.kind == "user"]
+    assert op_users == []
 
 
 @pytest.mark.asyncio
-async def test_web_turn_result_is_delivered_to_attached_chat(tmp_path, monkeypatch, auth_header):
-    _install_llm(monkeypatch, _ScriptedAnthropic([_text("Tests are green, PR is up.")]))
+async def test_unreplied_text_stays_on_the_operator(tmp_path, monkeypatch):
+    _install_llm(monkeypatch, _ScriptedAnthropic([_text("operator here")]))
     store = reset_store_for_tests()
-    sent: list[tuple[int, str]] = []
-
-    async def fake_notify(chat_id, text):
-        sent.append((chat_id, text))
-
-    monkeypatch.setattr(tg, "notify_telegram_chat", fake_notify)
-    web = _session(uuid4(), title="Ship the router", channel="web")
-    await store.put_entity(web)
-    bound = await tg._session_workspace(_update(chat_id=900), _context())
-    await router.attach(store, bound.operator, web.id)
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        r = await client.post(
-            f"/v1/sessions/{web.id}/turns", json={"text": "run the tests"}, headers=auth_header
-        )
-        assert r.status_code == 200
-    await _drain_tasks()
-    assert sent == [(900, "[Ship the router]\nTests are green, PR is up.")]
-
-
-@pytest.mark.asyncio
-async def test_telegram_driven_turn_does_not_echo_through_its_own_sink(tmp_path, monkeypatch):
-    _install_llm(monkeypatch, _ScriptedAnthropic([_text("hello from the target")]))
-    store = reset_store_for_tests()
-    sent: list[tuple[int, str]] = []
-
-    async def fake_notify(chat_id, text):
-        sent.append((chat_id, text))
-
-    monkeypatch.setattr(tg, "notify_telegram_chat", fake_notify)
     web = _session(uuid4(), title="Target", channel="web")
     await store.put_entity(web)
-    update, context = _update(chat_id=900), _context()
-    bound = await tg._session_workspace(update, context)
-    await router.attach(store, bound.operator, web.id)
-    await tg._run_turn(update, context, "hi")
-    await _drain_tasks()
-    update.message.reply_text.assert_awaited_once_with("hello from the target")
-    assert sent == []
+    update, context = _update(), _context()
+    await tg._run_turn(update, context, "what's going on")
+    assert await store.list_events(web.id) == []
+    assert [e.kind for e in await store.list_events((await tg._session_workspace(update, context)).operator.id)][:2] == [
+        "user",
+        "assistant",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_attached_turn_uses_channel_tools_and_hint(tmp_path, monkeypatch):
+async def test_reply_to_tagged_report_injects_without_operator_turn(tmp_path, monkeypatch):
+    store = reset_store_for_tests()
+    web = _session(uuid4(), title="Airbed controller", channel="web")
+    await store.put_entity(web)
+    update, context = _update(
+        chat_id=900,
+        text="bump the gain",
+        reply_text=f"{tg.session_tag('Airbed controller', web.id)}\nGains look fine.",
+    ), _context()
+    assert tg._reply_session_ref(update) == str(web.id)[:8]
+    running = turns.acquire(web.id, channel="web")
+    try:
+        bound = await tg._session_workspace(update, context)
+        await tg._prompt_from_reply(update, context, "bump the gain", str(web.id)[:8])
+        ev = (await store.list_events(web.id))[-1]
+        assert ev.kind == "user"
+        assert ev.payload == {"text": "bump the gain", "injected": True, "via": "telegram"}
+        assert await store.list_events(bound.operator.id) == []
+        assert update.message.reply_text.await_count == 1
+        assert "Airbed controller" in update.message.reply_text.await_args.args[0]
+    finally:
+        turns.release(web.id, running)
+
+
+@pytest.mark.asyncio
+async def test_prompt_session_starts_target_with_home_channel_tools(tmp_path, monkeypatch):
     llm = _install_llm(monkeypatch, _ScriptedAnthropic([_text("ok")]))
     store = reset_store_for_tests()
     vscode = _session(uuid4(), title="Editor session", channel="vscode")
     await store.put_entity(vscode)
-    update, context = _update(), _context()
+    update, context = _update(chat_id=900), _context()
     bound = await tg._session_workspace(update, context)
-    await router.attach(store, bound.operator, vscode.id)
-    await tg._run_turn(update, context, "continue")
+    monkeypatch.setattr(tg, "notify_telegram_chat", AsyncMock())
+    await tg.prompt_session(bound.store, bound.operator, "Editor", "continue")
+    await _drain_tasks()
     call = llm.calls[0]
     names = {t["name"] for t in call["tools"]}
-    assert "ProposePatch" not in names  # Telegram cannot render a diff overlay
-    assert not names & router.OPERATOR_TOOLS  # operator tools stay on the operator
-    system_text = json.dumps(call["system"])
-    assert "driving this session from Telegram" in system_text
-
-
-# ------------------------------------------------------------ operator tools
-
-
-@pytest.mark.asyncio
-async def test_operator_tools_are_allowlisted(tmp_path):
-    ws = _ws(tmp_path)
-    for name in router.OPERATOR_TOOLS:
-        decision = await can_use_tool(
-            name, {"session": "x"}, {"workspace": ws, "headless": True, "session_id": uuid4()}
-        )
-        assert decision.behavior == "allow", (name, decision)
+    assert "ProposePatch" in names
+    assert not names & router.OPERATOR_TOOLS
+    events = await store.list_events(vscode.id)
+    assert events[0].kind == "user"
+    assert events[0].payload.get("via") == "telegram"
 
 
 @pytest.mark.asyncio
-async def test_operator_turn_lists_and_attaches(tmp_path, monkeypatch):
+async def test_operator_turn_lists_and_prompts(tmp_path, monkeypatch):
     store = reset_store_for_tests()
     web = _session(uuid4(), title="Airbed controller", channel="web")
     await store.put_entity(web)
@@ -433,15 +500,16 @@ async def test_operator_turn_lists_and_attaches(tmp_path, monkeypatch):
     llm = _install_llm(monkeypatch, _ScriptedAnthropic([
         SimpleNamespace(content=[_ToolUse("ListSessions", {}, "tu-list")]),
         SimpleNamespace(content=[_ToolUse("SessionDigest", {"session": "airbed"}, "tu-digest")]),
-        SimpleNamespace(content=[_ToolUse("AttachSession", {"session": "airbed"}, "tu-attach")]),
-        _text("You're on the airbed session now."),
+        SimpleNamespace(content=[_ToolUse("PromptSession", {"session": "airbed", "text": "keep going"}, "tu-prompt")]),
+        _text("I prompted the airbed session."),
+        _text("continuing"),
     ]))
+    monkeypatch.setattr(tg, "notify_telegram_chat", AsyncMock())
     update, context = _update(chat_id=900), _context()
     await tg._run_turn(update, context, "what was I doing with the airbed?")
 
     op = (await tg._session_workspace(update, context)).operator
-    assert router.attached_id(op) == web.id
-    assert router.sink_keys(web.id) == ["telegram:900"]
+    assert router.prompted_ids(op) == [web.id]
     results = {
         e.payload["tool_use_id"]: json.loads(e.payload["content"])
         for e in await store.list_events(op.id)
@@ -449,18 +517,17 @@ async def test_operator_turn_lists_and_attaches(tmp_path, monkeypatch):
     }
     assert results["tu-list"]["sessions"][0]["title"] == "Airbed controller"
     assert results["tu-digest"]["last_assistant_text"] == "Gains adjusted; tests pass."
-    assert results["tu-attach"]["attached"] == str(web.id)
-    assert update.message.reply_text.await_args.args[0] == "You're on the airbed session now."
+    assert results["tu-prompt"]["action"] == "started"
     names = {t["name"] for t in llm.calls[0]["tools"]}
     assert router.OPERATOR_TOOLS <= names
-    assert "operator for this chat" in json.dumps(llm.calls[0]["system"])
+    assert "AttachSession" not in names
+    assert "dispatcher" in json.dumps(llm.calls[0]["system"])
+    await _drain_tasks()
+    assert [e.payload.get("via") for e in await store.list_events(web.id) if e.kind == "user"][-1] == "telegram"
 
-    # The next plain message runs on the attached session, not the operator.
-    llm._responses.append(_text("continuing"))
-    await tg._run_turn(update, context, "keep going")
-    assert [e.payload["text"] for e in await store.list_events(web.id) if e.kind == "user"][-1] == (
-        "keep going"
-    )
+    llm._responses.append(_text("still operator"))
+    await tg._run_turn(update, context, "thanks")
+    assert [e.payload.get("text") for e in await store.list_events(op.id) if e.kind == "user"][-1] == "thanks"
 
 
 @pytest.mark.asyncio
@@ -472,16 +539,27 @@ async def test_operator_tool_errors_are_reported_not_raised(tmp_path):
     await store.put_entity(a)
     await store.put_entity(b)
     ctx = {"store": store, "session_id": op.id}
-    out = json.loads(await router.run_operator_tool("AttachSession", {"session": "airbed"}, ctx))
+    out = json.loads(
+        await router.run_operator_tool("PromptSession", {"session": "airbed", "text": "go"}, ctx)
+    )
     assert "matches" in out and len(out["matches"]) == 2
-    assert router.attached_id(await store.get_entity(op.id)) is None
-    assert (await router.run_operator_tool("AttachSession", {"session": "zzz"}, ctx)).startswith("error")
+    assert (await router.run_operator_tool("PromptSession", {"session": "zzz", "text": "go"}, ctx)).startswith("error")
     assert (await router.run_operator_tool("SessionDigest", {}, ctx)).startswith("error")
-    detached = json.loads(await router.run_operator_tool("DetachSession", {}, ctx))
-    assert detached == {"detached": None}
+    assert (await router.run_operator_tool("StopSession", {"session": "zzz"}, ctx)).startswith("error")
 
 
-# ----------------------------------------------------------- commands / phase 3
+@pytest.mark.asyncio
+async def test_operator_tools_are_allowlisted(tmp_path):
+    ws = _ws(tmp_path)
+    for name in router.OPERATOR_TOOLS:
+        inp = {"session": "x", "text": "hi"} if name in {"PromptSession", "StopSession", "SessionDigest"} else {}
+        decision = await can_use_tool(
+            name, inp, {"workspace": ws, "headless": True, "session_id": uuid4()}
+        )
+        assert decision.behavior == "allow", (name, decision)
+
+
+# ----------------------------------------------------------- commands
 
 
 @pytest.mark.asyncio
@@ -492,19 +570,13 @@ async def test_command_texts(tmp_path):
     update, context = _update(), _context()
     bound = await tg._session_workspace(update, context)
     status = await tg.status_text(bound)
-    assert "not attached" in status and "/sessions" in status
+    assert "not watching" in status and "/sessions" in status
     listing = await tg.sessions_text(bound)
-    assert "Ship it" in listing and "/attach" in listing
-    attached = await tg.attach_text(bound, "ship")
-    assert attached.startswith("Attached.") and "Ship it" in attached
+    assert "Ship it" in listing and "PromptSession" in listing
+    await router.mark_prompted(store, bound.operator, web.id)
     bound = await tg._session_workspace(update, context)
-    assert bound.attached
     status = await tg.status_text(bound)
-    assert "attached to: Ship it" in status and "/detach" in status
-    assert (await tg.attach_text(bound, "")).startswith(listing.split("\n", 1)[0])
-    assert "No session matches" in await tg.attach_text(bound, "nope")
-    assert (await tg.detach_text(bound)).startswith("Detached from")
-    assert (await tg.detach_text(bound)).startswith("Not attached")
+    assert "watching:" in status and "Ship it" in status
 
 
 def _picker_keys(monkeypatch):
@@ -519,7 +591,7 @@ def _picker_keys(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_model_command_lists_sets_attached_and_clears(tmp_path, monkeypatch):
+async def test_model_command_lists_sets_and_clears(tmp_path, monkeypatch):
     _picker_keys(monkeypatch)
     store = reset_store_for_tests()
     web = _session(uuid4(), title="Ship it", channel="web")
@@ -529,13 +601,9 @@ async def test_model_command_lists_sets_attached_and_clears(tmp_path, monkeypatc
 
     listed = await tg.model_text(bound, "")
     assert "Available:" in listed and "qwen3.6-35b" in listed
-    assert "auto — Auto" in listed
     assert "/model <id>" in listed
     status = await tg.status_text(bound)
     assert "model: default" in status and "qwen3.6-35b" in status
-    auto_msg = await tg.model_text(bound, "auto")
-    assert auto_msg.startswith("This chat now uses Auto")
-    assert (await store.get_entity(bound.operator.id)).jsonld["model"] == "auto"
 
     set_msg = await tg.model_text(bound, "opus")
     assert "claude-opus-5" in set_msg
@@ -549,15 +617,9 @@ async def test_model_command_lists_sets_attached_and_clears(tmp_path, monkeypatc
     assert "default" in cleared.lower()
     op = await store.get_entity(bound.operator.id)
     assert not op.jsonld.get("model")
-
-    await tg.attach_text(bound, "ship")
-    bound = await tg._session_workspace(update, context)
     await tg.model_text(bound, "gpt-oss-120b")
-    assert (await store.get_entity(web.id)).jsonld["model"] == "gpt-oss-120b"
-    assert not (await store.get_entity(bound.operator.id)).jsonld.get("model")
-    listed = await tg.model_text(bound, "")
-    assert "this chat: Ship it" in listed
-    assert "> gpt-oss-120b" in listed
+    assert (await store.get_entity(bound.operator.id)).jsonld["model"] == "gpt-oss-120b"
+    assert not (await store.get_entity(web.id)).jsonld.get("model")
 
 
 @pytest.mark.asyncio
@@ -582,11 +644,11 @@ async def test_start_turn_runs_in_background_and_stop_cancels(tmp_path, monkeypa
         if turns.is_running(bound.session_id):
             break
         await asyncio.sleep(0.005)
-    assert turns.is_running(bound.session_id)  # the handler returned while the turn runs
+    assert turns.is_running(bound.session_id)
     assert not task.done()
     state = turns.get(bound.session_id)
     assert state is not None and state.channel == "telegram"
-    state.cancel.set()  # what /stop (and the web Stop button) does
+    state.cancel.set()
     await asyncio.wait_for(task, 5)
     assert not turns.is_running(bound.session_id)
     kinds = [e.kind for e in await store.list_events(bound.session_id)]
@@ -595,30 +657,19 @@ async def test_start_turn_runs_in_background_and_stop_cancels(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_operator_only_turn_bypasses_attachment(tmp_path, monkeypatch):
-    _install_llm(monkeypatch, _ScriptedAnthropic([_text("operator here")]))
-    store = reset_store_for_tests()
-    web = _session(uuid4(), title="Target", channel="web")
-    await store.put_entity(web)
-    update, context = _update(), _context()
-    bound = await tg._session_workspace(update, context)
-    await router.attach(store, bound.operator, web.id)
-    await tg._run_turn(update, context, "what sessions do I have?", operator_only=True)
-    assert await store.list_events(web.id) == []
-    assert [e.kind for e in await store.list_events(bound.operator.id)][:2] == ["user", "assistant"]
-
-
-@pytest.mark.asyncio
-async def test_approval_on_attached_session_resolves_from_callback(tmp_path, monkeypatch):
-    """The keyboard callback carries only the tool_use id; the adapter finds the session."""
-    from orbweaver.agent import PendingApproval, _register_approval, _unregister_approval
+async def test_approval_resolves_from_callback_across_sessions(tmp_path, monkeypatch):
+    from orbweaver.agent import (
+        PendingApproval,
+        _register_approval,
+        _unregister_approval,
+        find_pending_approval,
+    )
 
     store = reset_store_for_tests()
     web = _session(uuid4(), title="Target", channel="web")
     await store.put_entity(web)
     update, context = _update(), _context()
-    bound = await tg._session_workspace(update, context)
-    await router.attach(store, bound.operator, web.id)
+    await tg._session_workspace(update, context)
     loop = asyncio.get_running_loop()
     pend = PendingApproval(
         session_id=web.id,
@@ -630,26 +681,26 @@ async def test_approval_on_attached_session_resolves_from_callback(tmp_path, mon
     )
     _register_approval(pend)
     try:
-        assert tg._approval_session([bound.operator.id, web.id], "tu-9") == web.id
-        assert tg._approval_session([bound.operator.id], "tu-9") is None
+        assert find_pending_approval("tu-9") == web.id
+        assert find_pending_approval("missing") is None
     finally:
         _unregister_approval(pend)
 
 
 @pytest.mark.asyncio
-async def test_via_tag_on_injected_message(tmp_path, monkeypatch):
+async def test_via_tag_on_injected_prompt(tmp_path, monkeypatch):
     store = reset_store_for_tests()
     web = _session(uuid4(), title="Target", channel="web")
     await store.put_entity(web)
-    update, context = _update(), _context()
+    update, context = _update(chat_id=900), _context()
     bound = await tg._session_workspace(update, context)
-    await router.attach(store, bound.operator, web.id)
     running = turns.acquire(web.id, channel="web")
     try:
-        await tg._run_turn(update, context, "also do X")
+        monkeypatch.setattr(tg, "notify_telegram_chat", AsyncMock())
+        result = json.loads(await tg.prompt_session(bound.store, bound.operator, str(web.id)[:8], "also do X"))
+        assert result["action"] == "injected"
     finally:
         turns.release(web.id, running)
     ev = (await store.list_events(web.id))[-1]
     assert ev.kind == "user"
     assert ev.payload == {"text": "also do X", "injected": True, "via": "telegram"}
-    assert "/stop" in update.message.reply_text.await_args.args[0]
