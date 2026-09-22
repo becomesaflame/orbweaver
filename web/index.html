@@ -2301,7 +2301,29 @@
       $("conn-label").textContent = ok ? "Linked" : "Offline";
     }
 
+    // One in-flight GET /v1/sessions. The rail poll, turn-done, and chat
+    // switches all call this; overlapping listings used to pile up on the
+    // gateway and freeze the tab until they drained.
+    let refreshWaiters = null;
+    let refreshAgain = false;
     async function refreshSessions() {
+      if (refreshWaiters) {
+        refreshAgain = true;
+        return refreshWaiters;
+      }
+      refreshWaiters = (async () => {
+        try {
+          await refreshSessionsOnce();
+        } finally {
+          const again = refreshAgain;
+          refreshAgain = false;
+          refreshWaiters = null;
+          if (again) await refreshSessions();
+        }
+      })();
+      return refreshWaiters;
+    }
+    async function refreshSessionsOnce() {
       if (!$("token").value.trim()) {
         sessions = [];
         paintSessions();
@@ -2385,7 +2407,15 @@
         if (!evs.length) {
           $("log").innerHTML = '<div class="placeholder">Send a message to begin.</div>';
         } else {
-          for (const ev of evs) renderEvent(ev);
+          const BATCH = 24;
+          for (let i = 0; i < evs.length; i++) {
+            if (gen !== historyGen || currentSid() !== sid) return;
+            renderEvent(evs[i]);
+            if ((i + 1) % BATCH === 0 && i + 1 < evs.length) {
+              await new Promise((r) => requestAnimationFrame(r));
+            }
+          }
+          if (gen !== historyGen || currentSid() !== sid) return;
           syncRestoreDefaults();
           // The gateway classifies the last turn. Do not re-derive it from the
           // final event's kind: bookkeeping events (subagent_result, todo_state)

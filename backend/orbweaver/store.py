@@ -96,6 +96,25 @@ class Event:
 
 
 @dataclass
+class SessionEventStats:
+    """Sidebar listing fields. No event payloads — those stall GET /v1/sessions."""
+
+    event_count: int = 0
+    last_event_at: datetime | None = None
+    preview: str = ""
+
+
+def stats_from_events(events: list[Event]) -> SessionEventStats:
+    preview = ""
+    for ev in events:
+        if ev.kind == "user":
+            preview = str(ev.payload.get("text") or "").strip()
+            break
+    last = events[-1].created_at if events else None
+    return SessionEventStats(len(events), last, preview)
+
+
+@dataclass
 class Job:
     id: uuid.UUID
     due_at: datetime
@@ -120,6 +139,9 @@ class Store(Protocol):
     async def forget_chunk(self, uid: uuid.UUID) -> None: ...
     async def append_event(self, session_id: uuid.UUID, kind: str, payload: dict[str, Any]) -> Event: ...
     async def list_events(self, session_id: uuid.UUID) -> list[Event]: ...
+    async def session_event_stats(
+        self, session_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, SessionEventStats]: ...
     async def replace_events(self, session_id: uuid.UUID, events: list[Event]) -> None: ...
     async def truncate_events(self, session_id: uuid.UUID, from_seq: int) -> None: ...
     async def put_job(self, job: Job) -> Job: ...
@@ -244,6 +266,11 @@ class MemoryStore:
 
     async def list_events(self, session_id: uuid.UUID) -> list[Event]:
         return list(self.events.get(session_id, []))
+
+    async def session_event_stats(
+        self, session_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, SessionEventStats]:
+        return {sid: stats_from_events(self.events.get(sid, [])) for sid in session_ids}
 
     async def replace_events(self, session_id: uuid.UUID, events: list[Event]) -> None:
         self.events[session_id] = list(events)

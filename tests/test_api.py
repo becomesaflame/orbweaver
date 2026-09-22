@@ -118,6 +118,43 @@ async def test_list_sessions_autotitle_and_rename(tmp_path, monkeypatch, auth_he
 
 
 @pytest.mark.asyncio
+async def test_list_sessions_does_not_load_full_event_logs(auth_header, monkeypatch):
+    """The rail polls GET /v1/sessions every few seconds.
+
+    Listing used to ``list_events`` every chat. Decoding those payloads on the
+    asyncio loop froze the web UI for a minute or two until the listing
+    finished, then the next poll started the stall again.
+    """
+    from uuid import UUID
+
+    store = reset_store_for_tests()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        sess = await client.post(
+            "/v1/sessions",
+            json={"workspace_uri": "workspace:default", "title": "fat log"},
+            headers=auth_header,
+        )
+        assert sess.status_code == 200, sess.text
+        sid = UUID(sess.json()["id"])
+        await store.append_event(sid, "user", {"text": "first prompt here"})
+        blob = "x" * 50_000
+        for i in range(40):
+            await store.append_event(sid, "tool_result", {"content": blob, "i": i})
+
+        async def boom(_session_id):
+            raise AssertionError("list_events must not run for GET /v1/sessions")
+
+        monkeypatch.setattr(store, "list_events", boom)
+        listed = await client.get("/v1/sessions", headers=auth_header)
+        assert listed.status_code == 200, listed.text
+        row = next(s for s in listed.json()["sessions"] if s["id"] == str(sid))
+        assert row["event_count"] == 41
+        assert row["preview"].startswith("first prompt")
+        assert row["title"] == "fat log"
+
+
+@pytest.mark.asyncio
 async def test_delete_session_hides_it_but_keeps_events(tmp_path: Path, monkeypatch, auth_header):
     """Soft delete: gone from the listing, entity and events still in the store."""
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
