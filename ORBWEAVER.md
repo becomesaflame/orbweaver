@@ -64,6 +64,10 @@ Work on a **feature branch** in your worktree. Do not commit on `main`. Do not
    (squash)** (`gh pr merge --squash --auto`). GitHub merges when `test`
    is green. Do not click Merge yourself. Never push, force-push, or rewrite
    `main`.
+6. **Stay with the PR until it merges.** Opening it and enabling auto-merge
+   is not the end of the task. Watch CI, fix conflicts, and fix failing
+   checks (see Stay with the PR). Parallel PRs land while yours is in CI;
+   walking away is how the version bump conflicts and auto-merge stalls.
 
 Do not `git push origin HEAD:main` from a feature branch. The auto-merged
 squash is what updates production.
@@ -71,6 +75,27 @@ squash is what updates production.
 Your own feature branch is yours: rebase it and `git push --force-with-lease`
 freely. Prefer that over merging `main` back in, especially for the version
 bump — see Versioning. Leave branches you do not own alone.
+
+## Stay with the PR
+
+After every push that updates the PR, and especially after enabling
+auto-merge, wait and check progress. Do not start unrelated work and
+abandon this PR. CI still running is a reason to wait, not to leave.
+
+1. Watch required checks to completion: `gh pr checks --watch`.
+2. Refresh merge state: `gh pr view --json mergeable,mergeStateStatus,url`.
+3. If the PR is `CONFLICTING`, `DIRTY`, or `BEHIND`: `git fetch origin &&
+   git rebase origin/main`, resolve, confirm the version bump (`git diff
+   origin/main -- backend/orbweaver/__init__.py` must be non-empty), then
+   `git push --force-with-lease` and watch CI again.
+4. If a required check failed: read that job's log, fix the failure, push,
+   and watch again. Do not change CI config to make a failure pass.
+5. Repeat until the PR is `MERGED`, or you are blocked on a human decision
+   (ambiguous intent, security). Report the blocker; do not leave the PR
+   conflicted or red.
+
+Auto-merge waits forever on a DIRTY or failing PR. Your job is to get it
+green and mergeable, then stay until GitHub squash-merges.
 
 ## CI pipeline
 
@@ -91,8 +116,8 @@ is no Actions job that merges PRs. Deploy is a separate workflow so a PR
 does not show skipped promote/deploy checks. GitHub's merge is not an
 Actions `GITHUB_TOKEN` push, so deploy does start.
 
-Failed PR tests mean auto-merge waits (or the PR stays open). `main` stays
-on the last green SHA.
+Failed PR tests mean auto-merge waits (or the PR stays open). Stay and fix
+them. `main` stays on the last green SHA.
 
 The live host pulls `origin/main`, checks out `main`, waits until running
 turns finish (`orbweaver drain`), then restarts `orbweaver.service`. Agents

@@ -19,6 +19,10 @@ After reviewable work on a **feature branch** (never `main`):
 4. When the feature is ready: mark the PR ready and enable squash auto-merge
    (`gh pr merge --squash --auto`). Do not click Merge. Do not push,
    force-push, or rewrite `main`.
+5. Stay with the PR until GitHub merges it. Watch CI (`gh pr checks
+   --watch`). If it conflicts or goes behind `main`, rebase, re-bump, and
+   push. If a required check fails, fix it and push. Do not leave a DIRTY
+   or red PR.
 
 Rebasing your own feature branch and `git push --force-with-lease` is fine and
 is preferred over merging `main` back in. When a parallel PR lands the version
