@@ -356,7 +356,8 @@ def _cron_session(sid):
 @pytest.mark.asyncio
 async def test_cron_failed_one_shot_does_not_reprompt(tmp_path, monkeypatch):
     """Self-heal jobs that raise used to stay due-now; the 30s sweeper then
-    appended another copy of the same prompt on every tick."""
+    appended another copy of the same prompt on every tick. They now give up
+    after the first failure so the chat stops flickering unread."""
     turns.reset_for_tests()
     store = reset_store_for_tests()
     monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
@@ -382,15 +383,85 @@ async def test_cron_failed_one_shot_does_not_reprompt(tmp_path, monkeypatch):
     users = [e for e in await store.list_events(sid) if e.kind == "user"]
     assert [e.payload.get("text") for e in users] == [prompt]
     kept = await store.due_jobs(datetime.now(UTC) + timedelta(days=1))
-    row = next(j for j in kept if j.id == job.id)
-    assert row.payload.get("resume") is True
-    assert row.due_at > datetime.now(UTC)
+    assert not any(j.id == job.id for j in kept)
 
-    row.due_at = datetime.now(UTC) - timedelta(seconds=1)
-    await store.reschedule_job(row)
-    await cron._run_job(store, row)
+
+@pytest.mark.asyncio
+async def test_cron_selfheal_failure_cools_ledger(tmp_path, monkeypatch):
+    from orbweaver.selfheal import attempt_at_id, maybe_enqueue
+    from orbweaver.selfheal import reset_for_tests as reset_selfheal
+
+    turns.reset_for_tests()
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    monkeypatch.setattr(settings, "orbweaver_selfheal", True)
+    reset_selfheal()
+
+    async def fake_turn(*_a, **_k):
+        raise RuntimeError("still broken")
+
+    monkeypatch.setattr(cron, "agent_turn", fake_turn)
+    fp = "KeyError:agent.py:run_tools"
+    queued = await maybe_enqueue(fp, store=store)
+    assert queued is not None
+    queued.due_at = datetime.now(UTC) - timedelta(seconds=1)
+    await store.reschedule_job(queued)
+    await cron._run_job(store, queued)
+    assert not any(
+        j.id == queued.id for j in await store.due_jobs(datetime.now(UTC) + timedelta(days=1))
+    )
+    ent = await store.get_entity_by_at_id(attempt_at_id(fp))
+    assert ent is not None
+    assert ent.jsonld["state"] == "cooling-down"
+
+
+@pytest.mark.asyncio
+async def test_cron_generic_one_shot_retries_then_gives_up(tmp_path, monkeypatch):
+    turns.reset_for_tests()
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    prompt = "run the backup"
+
+    async def fake_turn(store, sid, text, *_a, **kwargs):
+        if not kwargs.get("resume"):
+            await store.append_event(sid, "user", {"text": text or prompt})
+        raise RuntimeError("backup failed")
+
+    monkeypatch.setattr(cron, "agent_turn", fake_turn)
+    sid = uuid4()
+    await store.put_entity(_cron_session(sid))
+    job = Job(
+        id=uuid4(),
+        due_at=datetime.now(UTC) - timedelta(seconds=1),
+        payload={"message": prompt},
+        session_id=sid,
+    )
+    await store.put_job(job)
+    await cron._run_job(store, job)
     users = [e for e in await store.list_events(sid) if e.kind == "user"]
     assert len(users) == 1
+    kept = await store.due_jobs(datetime.now(UTC) + timedelta(days=1))
+    row = next(j for j in kept if j.id == job.id)
+    assert row.payload.get("resume") is True
+    assert row.payload.get("failures") == 1
+
+    for _ in range(cron.MAX_ONE_SHOT_FAILURES - 1):
+        row.due_at = datetime.now(UTC) - timedelta(seconds=1)
+        await store.reschedule_job(row)
+        await cron._run_job(store, row)
+        users = [e for e in await store.list_events(sid) if e.kind == "user"]
+        assert len(users) == 1
+        row = next(
+            (
+                j
+                for j in await store.due_jobs(datetime.now(UTC) + timedelta(days=1))
+                if j.id == job.id
+            ),
+            None,
+        )
+        if row is None:
+            break
+    assert row is None
 
 
 @pytest.mark.asyncio
