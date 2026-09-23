@@ -137,6 +137,32 @@ def test_acquire_is_exclusive_per_session():
     assert turns.get(a) is again
 
 
+def test_using_session_sets_current_session_id():
+    sid = uuid4()
+    assert turns.current_session_id() is None
+    with turns.using_session(sid):
+        assert turns.current_session_id() == sid
+    assert turns.current_session_id() is None
+    state = turns.acquire(sid, channel="web")
+    assert turns.current_session_id() is None
+    with turns.using_session(sid):
+        assert turns.current_session_id() == sid
+    turns.release(sid, state)
+    assert turns.current_session_id() is None
+
+
+@pytest.mark.asyncio
+async def test_running_turn_sets_current_session_id():
+    sid = uuid4()
+
+    async def _inner():
+        async with turns.running_turn(sid, "web"):
+            assert turns.current_session_id() == sid
+
+    await _inner()
+    assert turns.current_session_id() is None
+
+
 @pytest.mark.asyncio
 async def test_running_turn_raises_busy_with_holder_channel():
     sid = uuid4()

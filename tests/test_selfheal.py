@@ -338,6 +338,61 @@ async def test_web_turn_api_status_error_enqueues(auth_header, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_web_continue_on_selfheal_session_does_not_enqueue(auth_header, monkeypatch):
+    """Continue 502 on a self-heal chat used to spawn another self-heal job
+    because acquire/release left ContextVar unset."""
+    import anthropic
+    import httpx
+    from httpx import ASGITransport, AsyncClient
+
+    from orbweaver.app import app
+    from orbweaver.selfheal import attach_log_handler, bind_loop
+    from orbweaver.store import get_store
+
+    store = reset_store_for_tests()
+    first = await maybe_enqueue("NotFoundError:_base_client.py:request", store=store)
+    assert first is not None
+    await store.append_event(first.session_id, "user", {"text": "fix this"})
+    bind_loop(asyncio.get_running_loop())
+    attach_log_handler()
+
+    async def boom(*_a, **_k):
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(400, request=request)
+        raise anthropic.APIStatusError(
+            "This model does not support assistant message prefill.",
+            response=response,
+            body={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "This model does not support assistant message prefill.",
+                },
+            },
+        )
+
+    monkeypatch.setattr("orbweaver.app.agent_turn", boom)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        cont = await client.post(
+            f"/v1/sessions/{first.session_id}/turns/continue",
+            headers=auth_header,
+        )
+        assert cont.status_code == 502, cont.text
+
+    deadline = asyncio.get_running_loop().time() + 2
+    while asyncio.get_running_loop().time() < deadline:
+        jobs = await get_store().due_jobs(datetime.now(UTC) + timedelta(days=1))
+        fps = {j.payload.get("fingerprint") for j in jobs}
+        if "APIStatusError" in "".join(str(f) for f in fps):
+            break
+        await asyncio.sleep(0)
+    jobs = await get_store().due_jobs(datetime.now(UTC) + timedelta(days=1))
+    fps = {j.payload.get("fingerprint") for j in jobs}
+    assert fps == {"NotFoundError:_base_client.py:request"}
+
+
+@pytest.mark.asyncio
 async def test_cron_finish_updates_ledger(monkeypatch):
     from orbweaver.channels.cron import _run_job_turn
 

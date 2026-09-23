@@ -11,7 +11,7 @@ from apscheduler.triggers.cron import CronTrigger
 from orbweaver.agent import TurnCancelled, agent_turn
 from orbweaver.config import settings
 from orbweaver.store import Job, get_store
-from orbweaver.turns import DRAIN_INTERRUPT, GatewayDraining, TurnBusy, running_turn
+from orbweaver.turns import DRAIN_INTERRUPT, GatewayDraining, TurnBusy, running_turn, using_session
 from orbweaver.turnstate import STATUS_STOPPED, session_turn_status
 from orbweaver.workspace import bind_workspace
 
@@ -22,6 +22,10 @@ _scheduler: AsyncIOScheduler | None = None
 MAX_CONCURRENT_JOBS = 3
 # A job whose session is mid-turn is retried after this delay.
 SKIP_RETRY = timedelta(minutes=1)
+# Generic one-shots that keep raising are deleted after this many failures.
+# Self-heal one-shots give up on the first exception: retrying every minute
+# marked the chat unread and held the session lock so Continue returned 409.
+MAX_ONE_SHOT_FAILURES = 3
 _job_slots: asyncio.Semaphore | None = None
 _job_slots_loop: asyncio.AbstractEventLoop | None = None
 _in_flight: set[UUID] = set()
@@ -160,6 +164,22 @@ async def _retry_later(store, job: Job, *, resume: bool = False) -> None:
     await store.reschedule_job(job)
 
 
+def _one_shot_failure_cap(job: Job) -> int:
+    if job.payload.get("selfheal"):
+        return 1
+    return MAX_ONE_SHOT_FAILURES
+
+
+async def _abandon_one_shot(store, job: Job, *, reason: str) -> None:
+    """Delete a one-shot that will not recover; cool down a self-heal ledger."""
+    log.warning("cron: abandoning one-shot job %s (%s)", job.id, reason)
+    if job.payload.get("selfheal"):
+        from orbweaver.selfheal import finish_attempt
+
+        await finish_attempt(job, [], store)
+    await store.delete_job(job.id)
+
+
 async def _run_job_turn(store, sess, session_id: UUID, job: Job, message: str) -> bool:
     """One cron turn under the per-session lock. Raises TurnBusy if the session is mid-turn.
 
@@ -250,8 +270,21 @@ async def _run_job(store, job: Job) -> None:
                     return
             await _finish_job(store, job)
     except Exception:
-        log.exception("cron: job %s failed", job.id)
+        # running_turn has already exited, so bind the session for this log:
+        # otherwise self-heal intake treats it as a new fingerprint and
+        # enqueues another chat.
+        if job.session_id is not None:
+            with using_session(job.session_id):
+                log.exception("cron: job %s failed", job.id)
+        else:
+            log.exception("cron: job %s failed", job.id)
         try:
+            if not job.recurrence:
+                n = int(job.payload.get("failures") or 0) + 1
+                job.payload["failures"] = n
+                if n >= _one_shot_failure_cap(job):
+                    await _abandon_one_shot(store, job, reason=f"failed {n} time(s)")
+                    return
             await _retry_later(store, job, resume=True)
         except Exception:
             log.exception("cron: job %s could not be rescheduled after failure", job.id)

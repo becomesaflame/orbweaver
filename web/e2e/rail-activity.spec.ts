@@ -124,6 +124,29 @@ test("the chat you are watching does not get a done highlight", async ({ page })
   await expect(chat(page, "beta chat")).not.toHaveClass(/done/);
 });
 
+test("a failed retry with no new events does not re-highlight a read chat", async ({
+  page,
+}) => {
+  const world: World = {
+    running: new Set(),
+    lastEventAt: { [SID_A]: "2026-09-16T00:00:00Z" },
+  };
+  await page.addInitScript((sid) => {
+    localStorage.setItem("orbweaver.seenAt", JSON.stringify([[sid, "2026-09-16T00:00:00Z"]]));
+  }, SID_A);
+  await mockGateway(page, world);
+  await page.goto("/");
+  await expect(page.locator("#chat-title")).toHaveText("beta chat");
+  await expect(chat(page, "alpha chat")).not.toHaveClass(/done/);
+
+  world.running.add(SID_A);
+  await expect(chat(page, "alpha chat")).toHaveClass(/running/);
+
+  world.running.delete(SID_A);
+  await expect(chat(page, "alpha chat")).not.toHaveClass(/running/);
+  await expect(chat(page, "alpha chat")).not.toHaveClass(/done/);
+});
+
 test("new events in a chat missed while the tab was away light it up", async ({ page }) => {
   // Nothing was ever seen running: the watermark from the previous visit is
   // what tells the rail alpha moved on.

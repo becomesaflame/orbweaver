@@ -2440,21 +2440,22 @@ async def agent_turn(
     active_tools = (
         tools if tools is not None else await session_tools(workspace, resolved_channel)
     )
-    if not resume:
-        await maybe_compact(
-            store,
-            session_id,
-            client=llm.client,
-            workspace=workspace,
-            system=system,
-            tools=active_tools,
-            model=llm.model,
-        )
-        if turn_state is not None:
-            for ev in reversed(await store.list_events(session_id)):
-                if ev.kind == "user":
-                    turn_state.user_seq = ev.seq
-                    break
+    # Resume used to skip this, so Continue on a bloated self-heal chat
+    # sent the whole live window and 400'd. No-op when still under budget.
+    await maybe_compact(
+        store,
+        session_id,
+        client=llm.client,
+        workspace=workspace,
+        system=system,
+        tools=active_tools,
+        model=llm.model,
+    )
+    if not resume and turn_state is not None:
+        for ev in reversed(await store.list_events(session_id)):
+            if ev.kind == "user":
+                turn_state.user_seq = ev.seq
+                break
 
     try:
         for round_i in range(max_rounds):

@@ -195,3 +195,31 @@ async def test_end_turn_without_tools_stops(tmp_path, monkeypatch):
     assert len(client.calls) == 1
     texts = [e.payload.get("text") for e in events if e.kind == "assistant"]
     assert texts == ["all set"]
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_compacts_on_resume(tmp_path, monkeypatch):
+    """Continue used to skip maybe_compact and 400 on bloated self-heal chats."""
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
+    called = {"n": 0}
+
+    async def spy(*_a, **_k):
+        called["n"] += 1
+
+    monkeypatch.setattr("orbweaver.agent.maybe_compact", spy)
+    client = _RecordingAnthropic(
+        [
+            SimpleNamespace(
+                stop_reason="end_turn",
+                usage=None,
+                content=[SimpleNamespace(type="text", text="ok")],
+            )
+        ]
+    )
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", lambda *a, **k: client)
+    store = reset_store_for_tests()
+    sid = uuid4()
+    await store.append_event(sid, "user", {"text": "hello"})
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    await agent_turn(store, sid, "", ws, resume=True)
+    assert called["n"] == 1

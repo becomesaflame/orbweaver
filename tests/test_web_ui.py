@@ -82,6 +82,8 @@ async def test_index_references_vendored_scripts():
             assert ".chat.perm-waiting {" in r.text
             assert "b.onclick = () => { markSeen(s.id); setActive(s); };" in r.text
             assert "function markSeen(sid)" in r.text
+            assert "function hasUnseenEvents(sid)" in r.text
+            assert "seenAt.get(sid) === undefined || hasUnseenEvents(sid)" in r.text
             assert "function trackUnseen()" in r.text
             assert "function startActivityPoll()" in r.text
             assert "let refreshWaiters = null;" in r.text

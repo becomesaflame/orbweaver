@@ -15,8 +15,8 @@ is the saved state; after boot, cron/web resume those sessions.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from uuid import UUID
@@ -61,12 +61,29 @@ _current_session: ContextVar[UUID | None] = ContextVar("orbweaver_running_sessio
 
 
 def current_session_id() -> UUID | None:
-    """Session of the in-flight ``running_turn``, if any.
+    """Session of the in-flight turn, if any.
 
-    Used so ``log.exception`` during a turn can be attributed (self-heal skips
-    errors from its own session).
+    Set by :func:`running_turn` and :func:`using_session` (web continue uses
+    acquire/release, so it must wrap the body in :func:`using_session`). Used
+    so ``log.exception`` can be attributed — self-heal skips errors from its
+    own session.
     """
     return _current_session.get()
+
+
+@contextmanager
+def using_session(session_id: UUID) -> Iterator[None]:
+    """Attribute self-heal intake to ``session_id`` for the duration of the block.
+
+    Web ``_run_turn`` and cron's failure logger call this because they log
+    after (or without) :func:`running_turn`. Nested calls restore the outer
+    session on exit.
+    """
+    token: Token[UUID | None] = _current_session.set(session_id)
+    try:
+        yield
+    finally:
+        _current_session.reset(token)
 
 
 def begin_drain() -> None:
@@ -146,11 +163,10 @@ async def running_turn(session_id: UUID, channel: str = "") -> AsyncIterator[Run
     if state is None:
         current = _running.get(session_id)
         raise TurnBusy(session_id, current.channel if current else "")
-    token: Token[UUID | None] = _current_session.set(session_id)
     try:
-        yield state
+        with using_session(session_id):
+            yield state
     finally:
-        _current_session.reset(token)
         release(session_id, state)
 
 

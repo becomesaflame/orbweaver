@@ -79,7 +79,7 @@ from orbweaver.store import (
     session_at_id,
 )
 from orbweaver.subagent import is_subagent_session
-from orbweaver.turns import GatewayDraining, RunningTurn, begin_drain
+from orbweaver.turns import GatewayDraining, RunningTurn, begin_drain, using_session
 from orbweaver.turns import acquire as acquire_turn
 from orbweaver.turns import get as get_running_turn
 from orbweaver.turns import is_running as turn_is_running
@@ -885,77 +885,80 @@ async def _run_turn(
     _last_turn_done.pop(session_id, None)
     result: dict[str, Any] | None = None
     failure: str | None = None
-    try:
-        if not resume:
-            await _maybe_autotitle(store, sess, user_text)
-        ws, kind, changed = bind_workspace(
-            sess.jsonld, settings.workspace_root, session_key=str(session_id)
-        )
-        if changed:
-            await store.put_entity(sess)
-        events = await agent_turn(
-            store,
-            session_id,
-            user_text,
-            ws,
-            workspace_kind=kind,
-            emit=lambda msg: _broadcast(session_id, msg),
-            cancel=state.cancel,
-            turn_state=state,
-            resume=resume,
-            interactive=True,
-            model=model or None,
-        )
-        if state.cancel.is_set():
-            result = await _finish_cancelled_turn(store, sess, state, events, user_text)
-        else:
-            stored = await store.list_events(session_id)
-            pending = pending_ask_user(stored)
-            status = "waiting_ask" if pending else "ok"
-            question = ""
-            if pending:
-                question = str((pending.payload or {}).get("input", {}).get("question") or "")
-                if not question:
-                    for ev in reversed(stored):
-                        if ev.kind == "ask_user":
-                            question = str((ev.payload or {}).get("question") or "")
-                            break
-            result = {
-                "events": [_event_dict(e) for e in events],
-                "status": status,
-                "user_seq": state.user_seq,
-            }
-            if question:
-                result["question"] = question
-        return result
-    except TurnCancelled as e:
-        result = await _finish_cancelled_turn(store, sess, state, e.produced, user_text)
-        return result
-    except Exception as e:
-        import anthropic
+    # acquire/release does not set ContextVar; wrap so Continue 502s on a
+    # self-heal chat are not ingested as a brand-new fingerprint.
+    with using_session(session_id):
+        try:
+            if not resume:
+                await _maybe_autotitle(store, sess, user_text)
+            ws, kind, changed = bind_workspace(
+                sess.jsonld, settings.workspace_root, session_key=str(session_id)
+            )
+            if changed:
+                await store.put_entity(sess)
+            events = await agent_turn(
+                store,
+                session_id,
+                user_text,
+                ws,
+                workspace_kind=kind,
+                emit=lambda msg: _broadcast(session_id, msg),
+                cancel=state.cancel,
+                turn_state=state,
+                resume=resume,
+                interactive=True,
+                model=model or None,
+            )
+            if state.cancel.is_set():
+                result = await _finish_cancelled_turn(store, sess, state, events, user_text)
+            else:
+                stored = await store.list_events(session_id)
+                pending = pending_ask_user(stored)
+                status = "waiting_ask" if pending else "ok"
+                question = ""
+                if pending:
+                    question = str((pending.payload or {}).get("input", {}).get("question") or "")
+                    if not question:
+                        for ev in reversed(stored):
+                            if ev.kind == "ask_user":
+                                question = str((ev.payload or {}).get("question") or "")
+                                break
+                result = {
+                    "events": [_event_dict(e) for e in events],
+                    "status": status,
+                    "user_seq": state.user_seq,
+                }
+                if question:
+                    result["question"] = question
+            return result
+        except TurnCancelled as e:
+            result = await _finish_cancelled_turn(store, sess, state, e.produced, user_text)
+            return result
+        except Exception as e:
+            import anthropic
 
-        from orbweaver.compact import ContextFullError
-        from orbweaver.llm import OpenAICompatError
+            from orbweaver.compact import ContextFullError
+            from orbweaver.llm import OpenAICompatError
 
-        failure = str(getattr(e, "message", None) or e) or type(e).__name__
-        # Map to 502 for the UI. log.exception so self-heal intake (ERROR+exc_info)
-        # sees it; _ws_turn swallows HTTPException without logging.
-        if isinstance(e, (ContextFullError, anthropic.APIStatusError, OpenAICompatError)):
-            log.exception("turn failed for %s", session_id)
-            raise HTTPException(status_code=502, detail=e.message) from e
-        raise
-    finally:
-        release_turn(session_id, state)
-        if result is not None:
-            done = {"status": result.get("status"), "user_seq": result.get("user_seq")}
-            _last_turn_done[session_id] = done
-            _broadcast(session_id, {"kind": "turn_done", **done})
-        else:
-            _last_turn_done[session_id] = {
-                "status": "error",
-                "user_seq": state.user_seq,
-                "detail": failure or "turn failed",
-            }
+            failure = str(getattr(e, "message", None) or e) or type(e).__name__
+            # Map to 502 for the UI. log.exception so self-heal intake (ERROR+exc_info)
+            # sees it; _ws_turn swallows HTTPException without logging.
+            if isinstance(e, (ContextFullError, anthropic.APIStatusError, OpenAICompatError)):
+                log.exception("turn failed for %s", session_id)
+                raise HTTPException(status_code=502, detail=e.message) from e
+            raise
+        finally:
+            release_turn(session_id, state)
+            if result is not None:
+                done = {"status": result.get("status"), "user_seq": result.get("user_seq")}
+                _last_turn_done[session_id] = done
+                _broadcast(session_id, {"kind": "turn_done", **done})
+            else:
+                _last_turn_done[session_id] = {
+                    "status": "error",
+                    "user_seq": state.user_seq,
+                    "detail": failure or "turn failed",
+                }
 
 
 @app.post("/v1/sessions/{session_id}/turns")
