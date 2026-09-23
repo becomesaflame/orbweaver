@@ -378,3 +378,63 @@ async def test_telegram_ignores_documents_from_strangers(_tg_bound, monkeypatch)
     )
     await handle_document(update, None)
     assert started == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_reply_to_tag_stores_document_on_target(tmp_path, monkeypatch):
+    """A reply to a tagged report must not land on the operator."""
+    from types import SimpleNamespace
+
+    from orbweaver.channels import telegram as tg
+    from orbweaver.store import SESSION_TYPE, Entity, session_at_id
+
+    monkeypatch.setattr(settings, "telegram_allowlist", "42")
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    store = reset_store_for_tests()
+    await tg.session_for_telegram_user(store, 42, chat_id=42)
+    sid = uuid4()
+    await store.put_entity(
+        Entity(
+            id=sid,
+            at_id=session_at_id(sid),
+            at_type=SESSION_TYPE,
+            jsonld={
+                "@id": session_at_id(sid),
+                "@type": SESSION_TYPE,
+                "title": "Airbed controller",
+                "channel": "web",
+                "workspace_uri": "workspace:default",
+                "workspace_kind": "local",
+                "status": "active",
+            },
+        )
+    )
+    prompted: list[dict] = []
+
+    def fake_prompt(update, context, ref, text, images=None):
+        prompted.append({"ref": ref, "text": text, "images": images})
+
+    monkeypatch.setattr(tg, "start_prompted", fake_prompt)
+    monkeypatch.setattr(
+        tg, "start_turn", lambda *a, **k: (_ for _ in ()).throw(AssertionError("operator turn"))
+    )
+
+    msg = _DocMsg(_Doc("notes.txt", b"the roof needs replacing by spring"), caption="read this")
+    msg.reply_to_message = SimpleNamespace(
+        text=tg.session_tag("Airbed controller", sid),
+        caption=None,
+        from_user=SimpleNamespace(is_bot=True),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=42),
+        message=msg,
+        effective_chat=SimpleNamespace(id=42),
+    )
+    await tg.handle_document(update, SimpleNamespace(user_data={}))
+
+    assert len(prompted) == 1
+    assert prompted[0]["ref"] == str(sid)[:8]
+    assert "read this" in prompted[0]["text"]
+    assert "attachments/notes.txt" in prompted[0]["text"]
+    assert prompted[0]["images"] is None
+    assert (tmp_path / "attachments" / "notes.txt").exists()
