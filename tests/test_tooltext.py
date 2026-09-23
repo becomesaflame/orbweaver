@@ -201,6 +201,43 @@ async def test_run_tools_webfetch_extracts(monkeypatch, tmp_path):
     assert "<h1>" not in out
 
 
+def test_grep_schema_is_pattern_not_workspacesearch_fields():
+    """The model copies the call shape in the tool it selected. Grep must show pattern only."""
+    from orbweaver.agent import TOOL_SPEC, static_system
+    from orbweaver.llm import _to_ollama_tool
+
+    grep = next(t for t in TOOL_SPEC if t["name"] == "Grep")
+    schema = grep["input_schema"]
+    assert set(schema["properties"]) == {"pattern", "glob", "type", "A", "B", "C"}
+    assert schema["required"] == ["pattern"]
+    assert schema["additionalProperties"] is False
+    assert '{"pattern": "sidebar"}' in grep["description"]
+    # Naming the other tool's fields here makes the model emit them.
+    assert "query" not in grep["description"]
+    assert "max_results" not in grep["description"]
+    wire = _to_ollama_tool(grep)["function"]["parameters"]
+    assert "query" not in wire["properties"]
+    assert wire["additionalProperties"] is False
+    prompt = static_system()
+    assert '{"pattern": "sidebar"}' in prompt
+    assert '{"query": "...", "max_results": 8}' in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_tools_grep_workspacesearch_args_do_not_raise(tmp_path):
+    """Production: Grep was called as {path, query, max_results} and KeyError killed the turn."""
+    ws = LocalWorkspace("workspace:default", str(tmp_path))
+    ctx = {"workspace": ws, "store": None, "session_id": uuid4(), "workspace_kind": "local"}
+    out = await run_tools(
+        "Grep",
+        {"path": "", "query": "chat sidebar", "max_results": 20},
+        ctx,
+    )
+    assert out.startswith("error:")
+    assert '"pattern"' in out
+    assert "max_results" in out
+
+
 @pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep (rg) required")
 @pytest.mark.asyncio
 async def test_run_tools_grep_passes_context_and_glob(tmp_path):
