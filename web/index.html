@@ -695,9 +695,9 @@
     // Rail activity. `runningSids` is what the rail animates: the union of this
     // tab's flights and the gateway's view (`running` on /v1/sessions), so a
     // turn started from Telegram or another tab spins here too. When a running
-    // chat you are not looking at goes idle *and wrote new events* it lands in
-    // `doneSids` and stays highlighted until you click it. A failed cron retry
-    // that acquires the lock and writes nothing must not re-light the rail.
+    // chat you are not looking at goes idle it lands in `doneSids` and stays
+    // highlighted until you click it — unless we already have a watermark and
+    // last_event_at did not move (a failed cron retry that wrote nothing).
     //
     // A running→idle transition is not enough on its own: if the tab was hidden
     // or closed for the whole turn, no poll ever saw it running. `seenAt` is the
@@ -745,9 +745,14 @@
       let changed = false;
       for (const sid of runningSids) {
         if (live.has(sid)) continue;
-        // Finished in the chat you are watching: no bell. Finished with no
-        // new events (failed self-heal retry): no bell either.
-        if (sid !== currentSid() && hasUnseenEvents(sid)) {
+        // Finished in the chat you are watching: no bell. A never-opened
+        // chat that we saw running still highlights. Once there is a
+        // watermark, only a newer last_event_at counts — otherwise a failed
+        // self-heal retry re-lights the rail every minute without writing.
+        if (
+          sid !== currentSid() &&
+          (seenAt.get(sid) === undefined || hasUnseenEvents(sid))
+        ) {
           doneSids.add(sid);
           persistDone();
         }
