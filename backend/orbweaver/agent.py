@@ -253,26 +253,39 @@ TOOL_SPEC = [
     {
         "name": "Glob",
         "description": (
-            "List files matching a glob, recursively from the workspace root (ripgrep --files). "
+            "List files from the workspace root (ripgrep --files). "
+            'Call as {"pattern": "**/*.py"}. '
             "Skips gitignored paths. Caps at 200 files."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {"pattern": {"type": "string"}},
+            "additionalProperties": False,
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": 'Glob to match. Example: "**/*.py".',
+                }
+            },
             "required": ["pattern"],
         },
     },
     {
         "name": "Grep",
         "description": (
-            "Search workspace file contents with ripgrep. Regex; use | for alternation "
-            "(a\\|b is treated as a|b). glob and type limit files. A/B/C add context lines. "
+            "Ripgrep over workspace file contents. "
+            'Call as {"pattern": "sidebar"} or {"pattern": "chat sidebar", "glob": "*.tsx"}. '
+            "pattern is the regex (| for alternation; a\\|b is treated as a|b). "
+            "Optional glob, type, A, B, and C limit files or add context lines. "
             "Skips binary and gitignored files. Caps hits."
         ),
         "input_schema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
-                "pattern": {"type": "string"},
+                "pattern": {
+                    "type": "string",
+                    "description": 'Regex to search for. Example: "sidebar".',
+                },
                 "glob": {"type": "string"},
                 "type": {
                     "type": "string",
@@ -450,9 +463,9 @@ TOOL_SPEC = [
     {
         "name": "WorkspaceSearch",
         "description": (
-            "Hybrid search over project source files in the session workspace. Indexes text "
-            "files on demand (skips binaries, huge files, .git, and gitignored paths). Use "
-            "this to find where something is implemented. Do not MemoryRemember every file. "
+            'Hybrid search over project source. Call as {"query": "sidebar", "max_results": 8}. '
+            "Indexes text files on demand (skips binaries, huge files, .git, and gitignored paths). "
+            "Use this to find where something is implemented. Do not MemoryRemember every file. "
             "MemorySearch is only for stored facts, not source."
         ),
         "input_schema": {
@@ -898,6 +911,9 @@ def static_system(channel: str = "") -> str:
         "before requesting permissions [\"full_network\"] or [\"all\"]. Hard denials "
         "stay blocked; do not route around them. Call independent tools in parallel in "
         "one round. Prefer Read offset/limit and Grep (ripgrep) over Bash for paging files. "
+        'WorkspaceSearch is called as {"query": "...", "max_results": 8}. '
+        'Grep is called as {"pattern": "sidebar"} with optional glob, type, A, B, C. '
+        'Glob is called as {"pattern": "**/*.py"}. '
         "Use WebSearch to find sources, then WebFetch a few result URLs; do not guess "
         "docs paths. Use Browser to verify JavaScript UI (navigate, click, type, snapshot). "
         "Configured MCP servers appear as mcp_<server>_<tool> and use the "
@@ -1221,6 +1237,25 @@ async def _bash_call(ws: Any, cancel: asyncio.Event | None, **kwargs: Any) -> st
     return await asyncio.to_thread(ws.bash, **kwargs)
 
 
+def _missing_pattern(name: str, inp: dict[str, Any]) -> str | None:
+    """Tell the model to call Grep/Glob again with ``pattern``.
+
+    A missing key used to raise ``KeyError: 'pattern'`` out of the turn. The model
+    then saw only "interrupted" and repeated WorkspaceSearch's ``query`` /
+    ``max_results`` shape. An error result is something it can correct.
+    """
+    pattern = inp.get("pattern")
+    if isinstance(pattern, str) and pattern.strip():
+        return None
+    sent = ", ".join(sorted(str(key) for key in inp)) or "no arguments"
+    return (
+        f'error: {name} requires "pattern" (a regex or glob). You passed {sent}. '
+        "Do not pass query, path, or max_results to "
+        f"{name}; query and max_results belong to WorkspaceSearch or WebSearch. "
+        f"Call {name} again with pattern set."
+    )
+
+
 async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     """Execute one tool call. Blocking work runs off the event loop.
 
@@ -1300,6 +1335,9 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         )
         return json.dumps(result)[:200_000]
     if name == "Glob":
+        missing = _missing_pattern("Glob", inp)
+        if missing:
+            return missing
         try:
             hits = await asyncio.to_thread(ws.glob, inp["pattern"])
             return "\n".join(hits[:200])
@@ -1308,6 +1346,9 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
     if name == "Grep":
         from orbweaver.workspace import _ctx_int
 
+        missing = _missing_pattern("Grep", inp)
+        if missing:
+            return missing
         try:
             hits = await asyncio.to_thread(
                 ws.grep,
