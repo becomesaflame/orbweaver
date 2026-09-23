@@ -1691,9 +1691,19 @@ async def _create_with_overflow_retry(
                 and unavailable_left > 0
                 and is_upstream_unavailable(e)
             ):
+                from orbweaver.spend import SpendCapped
+
+                if isinstance(e, SpendCapped):
+                    from orbweaver.llm import select_provider as _sel
+                    from orbweaver.model_routing import routed_models
+
+                    for mid in routed_models():
+                        if _sel(mid) == e.provider:
+                            live.tried.add(mid)
                 nxt = fallback_model(model, tried=live.tried)
                 nxt_client = make_agent_client(model=nxt) if nxt else None
                 if nxt and nxt_client is not None:
+                    reason = "spend_cap" if isinstance(e, SpendCapped) else "unavailable"
                     log.warning(
                         "model %s unavailable (%s); falling back to %s",
                         model,
@@ -1703,7 +1713,7 @@ async def _create_with_overflow_retry(
                     _emit_progress(
                         emit,
                         "model_fallback",
-                        {"from": model, "to": nxt, "reason": "unavailable"},
+                        {"from": model, "to": nxt, "reason": reason},
                     )
                     live.switch(nxt, nxt_client)
                     unavailable_left -= 1
@@ -1880,52 +1890,57 @@ async def _complete_llm(
     fire: Callable[[Event], None] | None,
     **kwargs: Any,
 ) -> Any:
-    long_request = streaming_required_for_max_tokens(kwargs.get("max_tokens") or 0)
-    can_stream = client_can_stream(client)
-    stream_cm: Any | None = None
-    try:
-        stream_cm = message_stream(client, **kwargs)
-    except Exception:
-        if long_request and can_stream:
-            log.warning(
-                "messages.stream() failed to open; not falling back to create (long request)",
-                exc_info=True,
-            )
-            raise
-        log.warning("messages.stream() failed to open", exc_info=True)
-    if stream_cm is not None:
+    from orbweaver.spend import run_charged
+
+    async def _do() -> Any:
+        long_request = streaming_required_for_max_tokens(kwargs.get("max_tokens") or 0)
+        can_stream = client_can_stream(client)
+        stream_cm: Any | None = None
         try:
-            return await _read_message_stream(
-                stream_cm,
-                cancel=cancel,
-                inject=inject,
-                produced=produced,
-                emit=emit,
-                store=store,
-                session_id=session_id,
-                fire=fire,
-            )
-        except (TurnCancelled, TurnInjected):
-            raise
+            stream_cm = message_stream(client, **kwargs)
         except Exception:
-            if long_request:
+            if long_request and can_stream:
                 log.warning(
-                    "LLM stream failed; not falling back to create (long request)",
+                    "messages.stream() failed to open; not falling back to create (long request)",
                     exc_info=True,
                 )
                 raise
-            log.warning("LLM stream failed; falling back to create", exc_info=True)
-    try:
-        return await _await_or_cancel(
-            client.messages.create(**kwargs),
-            cancel,
-            produced,
-            inject=inject,
-        )
-    except Exception as e:
-        if is_streaming_required_error(e):
-            log.warning("non-streaming create rejected for a long request", exc_info=True)
-        raise
+            log.warning("messages.stream() failed to open", exc_info=True)
+        if stream_cm is not None:
+            try:
+                return await _read_message_stream(
+                    stream_cm,
+                    cancel=cancel,
+                    inject=inject,
+                    produced=produced,
+                    emit=emit,
+                    store=store,
+                    session_id=session_id,
+                    fire=fire,
+                )
+            except (TurnCancelled, TurnInjected):
+                raise
+            except Exception:
+                if long_request:
+                    log.warning(
+                        "LLM stream failed; not falling back to create (long request)",
+                        exc_info=True,
+                    )
+                    raise
+                log.warning("LLM stream failed; falling back to create", exc_info=True)
+        try:
+            return await _await_or_cancel(
+                client.messages.create(**kwargs),
+                cancel,
+                produced,
+                inject=inject,
+            )
+        except Exception as e:
+            if is_streaming_required_error(e):
+                log.warning("non-streaming create rejected for a long request", exc_info=True)
+            raise
+
+    return await run_charged(str(kwargs.get("model") or ""), kwargs, _do)
 
 
 async def _create_agent_message(

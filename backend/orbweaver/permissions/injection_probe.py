@@ -43,6 +43,7 @@ from orbweaver.permissions.prompts import (
     INJECTION_WARNING,
 )
 from orbweaver.permissions.rules import _workspace_root, in_project_path
+from orbweaver.spend import charged_create
 
 log = logging.getLogger(__name__)
 
@@ -341,7 +342,8 @@ async def probe_tool_output(name: str, output: str, *, client=None) -> dict[str,
     payload = f"tool={name}\n\n{truncate_for_probe(body)}"
     t0 = time.monotonic()
     try:
-        resp = await client.messages.create(
+        resp = await charged_create(
+            client,
             model=settings.orbweaver_injection_probe_model,
             max_tokens=32,
             system=INJECTION_PROBE_SYSTEM,
@@ -382,7 +384,8 @@ async def probe_tool_outputs(items: list[tuple[str, str]], *, client=None) -> li
     payload = "\n\n".join(parts)
     t0 = time.monotonic()
     try:
-        resp = await client.messages.create(
+        resp = await charged_create(
+            client,
             model=settings.orbweaver_injection_probe_model,
             max_tokens=16 * len(items) + 16,
             system=INJECTION_PROBE_BATCH_SYSTEM,

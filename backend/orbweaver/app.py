@@ -515,6 +515,7 @@ async def _maybe_autotitle(store, sess: Entity, user_text: str) -> None:
 async def health() -> dict[str, Any]:
     from orbweaver.hindsight import enabled as hindsight_on
     from orbweaver.llm import select_provider
+    from orbweaver.spend import snapshot as spend_snapshot
 
     defaults = model_defaults()
     return {
@@ -527,6 +528,7 @@ async def health() -> dict[str, Any]:
             "model": defaults["web"],
             "defaults": defaults,
         },
+        "spend": await spend_snapshot(),
     }
 
 

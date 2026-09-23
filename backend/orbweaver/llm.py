@@ -314,8 +314,19 @@ class _ToolUseBlock:
 
 
 class _Usage:
-    def __init__(self, input_tokens: int = 0) -> None:
+    def __init__(
+        self,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
+        cache_creation_input_tokens: int = 0,
+        cost_usd: float | None = None,
+    ) -> None:
         self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cache_read_input_tokens = cache_read_input_tokens
+        self.cache_creation_input_tokens = cache_creation_input_tokens
+        self.cost_usd = cost_usd
 
 
 class _Response:
@@ -641,8 +652,13 @@ def is_upstream_unavailable(exc: BaseException) -> bool:
 
     HTTP 503 from Earth Runtime ("The model is temporarily rate limited") and
     Anthropic 529 overloaded are the production cases. Same-model retry will
-    not help; a different model (ideally a different provider) might.
+    not help; a different model (ideally a different provider) might. A daily
+    spend cap on this provider is the same shape: skip it and try another.
     """
+    from orbweaver.spend import SpendCapped
+
+    if isinstance(exc, SpendCapped):
+        return True
     status = int(getattr(exc, "status_code", 0) or 0)
     if status in _UNAVAILABLE_STATUSES:
         return True
@@ -843,9 +859,19 @@ def _from_openai_completion(data: dict[str, Any]) -> _Response:
                 raw_args if isinstance(raw_args, dict) else {},
             )
         )
-    usage_raw = data.get("usage") or {}
+    usage_raw = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    usage_raw = usage_raw or {}
+    cost = usage_raw.get("cost", data.get("cost"))
+    try:
+        cost_usd = float(cost) if cost is not None else None
+    except (TypeError, ValueError):
+        cost_usd = None
     usage = _Usage(
-        input_tokens=int(usage_raw.get("prompt_tokens") or usage_raw.get("input_tokens") or 0)
+        input_tokens=int(usage_raw.get("prompt_tokens") or usage_raw.get("input_tokens") or 0),
+        output_tokens=int(
+            usage_raw.get("completion_tokens") or usage_raw.get("output_tokens") or 0
+        ),
+        cost_usd=cost_usd,
     )
     return _Response(content, usage)
 
@@ -908,9 +934,23 @@ class StreamAssembler:
     def _note_usage(self, usage: Any) -> None:
         if usage is None:
             return
-        inp = int(_field(usage, "input_tokens", 0) or 0)
-        if inp:
-            self.usage.input_tokens = inp
+        for name in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ):
+            val = int(_field(usage, name, 0) or 0)
+            if val:
+                setattr(self.usage, name, val)
+        cost = _field(usage, "cost", None)
+        if cost is None:
+            cost = _field(usage, "cost_usd", None)
+        if cost is not None:
+            try:
+                self.usage.cost_usd = float(cost)
+            except (TypeError, ValueError):
+                pass
 
     def _index(self, event: Any) -> int:
         return int(_field(event, "index", 0) or 0)

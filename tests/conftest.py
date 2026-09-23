@@ -58,6 +58,13 @@ def _dev_insecure_secret(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _unlimited_spend_caps(monkeypatch):
+    """Production defaults Anthropic to $50/day; tests opt into a cap explicitly."""
+    monkeypatch.setattr(settings, "orbweaver_spend_cap_anthropic_usd_day", 0.0)
+    monkeypatch.setattr(settings, "orbweaver_spend_cap_openrouter_usd_day", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_rate_limiter(tmp_path_factory):
     data = tmp_path_factory.mktemp("rate-limit")
     reset_rate_limiter_for_tests(data)

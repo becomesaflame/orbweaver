@@ -133,6 +133,7 @@ async def route_auto_model(
     """
     from orbweaver.llm import make_hosted_client
     from orbweaver.model_routing import pick_auto_model, routed_models
+    from orbweaver.spend import charged_create
 
     candidates = routed_models(skip=skip)
     ranked = pick_auto_model(skip=skip)
@@ -154,7 +155,8 @@ async def route_auto_model(
     payload = _user_payload(prompt, candidates, extra=extra)
     try:
         resp = await asyncio.wait_for(
-            hosted.messages.create(
+            charged_create(
+                hosted,
                 model=router_id,
                 max_tokens=ROUTER_MAX_TOKENS,
                 system=ROUTER_SYSTEM,
