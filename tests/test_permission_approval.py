@@ -77,7 +77,6 @@ def ask_classifier(monkeypatch):
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-test")
     monkeypatch.setattr(settings, "orbweaver_sandbox", False)
     monkeypatch.setattr(settings, "orbweaver_auto_allow_bash_if_sandboxed", False)
-    monkeypatch.setattr(settings, "orbweaver_approval_timeout_s", 5.0)
     calls: list[tuple[str, dict]] = []
 
     async def classify(_events, name, inp, **_k):
@@ -207,23 +206,35 @@ async def test_deny_records_error_result_and_model_continues(
 
 
 @pytest.mark.asyncio
-async def test_timeout_records_error_and_ends_turn(
+async def test_approval_waits_until_the_user_decides(
     tmp_path, monkeypatch, ask_classifier, fake_run_tools
 ):
-    monkeypatch.setattr(settings, "orbweaver_approval_timeout_s", 0.2)
-    client = _llm(monkeypatch, [SimpleNamespace(content=[_ToolUse("Bash", dict(RM_BUILD))])])
+    """A held approval does not expire; the same call still runs when the user allows."""
+    client = _llm(
+        monkeypatch,
+        [
+            SimpleNamespace(content=[_ToolUse("Bash", dict(RM_BUILD))]),
+            SimpleNamespace(content=[SimpleNamespace(type="text", text="cleaned build")]),
+        ],
+    )
     store = reset_store_for_tests()
     sid = uuid4()
-    events = await agent_turn(store, sid, "clean up", _ws(tmp_path))
-
+    turn = asyncio.create_task(agent_turn(store, sid, "clean up", _ws(tmp_path)))
+    await _wait_pending(sid, "tu-rm")
+    await asyncio.sleep(0.3)
+    assert not turn.done()
+    assert pending_approvals(sid)
     assert fake_run_tools == []
-    results = _by_kind(events, "tool_result")
-    assert results and results[0].payload["is_error"] is True
-    assert "no approval decision within 0.2s" in results[0].payload["content"]
-    assert _by_kind(events, "permission_response")[0].payload["decision"] == "timeout"
+    assert resolve_approval(sid, "tu-rm", "allow") is True
+    events = await turn
+
+    assert fake_run_tools == [("Bash", RM_BUILD)]
+    assert _by_kind(events, "permission_response")[0].payload["decision"] == "allow"
+    assert not any(e.payload.get("decision") == "timeout" for e in _by_kind(events, "permission_response"))
     texts = [e.payload.get("text") for e in _by_kind(events, "assistant")]
-    assert any("timed out" in (t or "") for t in texts)
-    assert len(client.calls) == 1  # the turn ended; no follow-up model call
+    assert "cleaned build" in texts
+    assert not any("timed out" in (t or "") for t in texts)
+    assert len(client.calls) == 2
     assert pending_approvals(sid) == []
 
 

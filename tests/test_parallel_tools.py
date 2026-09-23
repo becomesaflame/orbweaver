@@ -331,7 +331,6 @@ async def test_held_ask_in_a_safe_batch_runs_sequentially(tmp_path, monkeypatch)
     trace = _Trace()
     _instrument(monkeypatch, trace)
     monkeypatch.setattr(settings, "orbweaver_permission_ask", "Read(f1.txt)")
-    monkeypatch.setattr(settings, "orbweaver_approval_timeout_s", 5.0)
     uses = [
         _ToolUse("Read", {"path": "f0.txt"}, "toolu_ok"),
         _ToolUse("Read", {"path": "f1.txt"}, "toolu_ask"),
