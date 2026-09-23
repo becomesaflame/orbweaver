@@ -1397,7 +1397,7 @@ async def start_telegram() -> None:
         if resolved:
             label = approval_result_label(decision, scope)
         else:
-            label = "No longer pending (timed out, cancelled, or already answered)"
+            label = "No longer pending (cancelled or already answered)"
         await query.answer(label)
         await close_approval_message(query, label)
 

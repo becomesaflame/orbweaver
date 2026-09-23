@@ -1007,23 +1007,12 @@ def _blocked_tool_result(decision) -> str:
 
 APPROVAL_DECISIONS = frozenset({"allow", "deny"})
 APPROVAL_SCOPES = frozenset({"once", "session"})
-APPROVAL_TIMEOUT_NOTICE = (
-    "The approval request timed out and the action was not executed. "
-    "Reply to continue."
-)
 
 
 def _denied_tool_result(reason: str) -> str:
     return (
         f"Denied by user. This action needed approval ({reason}) and the user declined. "
         "Do not retry the same action; adapt or ask what they want instead."
-    )
-
-
-def _approval_timeout_result(reason: str, timeout: float) -> str:
-    return (
-        f"Not executed: no approval decision within {timeout:g}s "
-        f"(needed approval: {reason})."
     )
 
 
@@ -1101,9 +1090,11 @@ def _unregister_approval(pend: PendingApproval) -> None:
 async def _wait_for_approval(
     pend: PendingApproval,
     cancel: asyncio.Event | None,
-    timeout: float,
 ) -> tuple[str, str] | None:
-    """(decision, scope) once the user answers; None on timeout or cancel."""
+    """(decision, scope) once the user answers; None if the turn is cancelled.
+
+    A held approval does not expire. Stop or discard is what ends the wait.
+    """
     watchers: set[asyncio.Future[Any]] = {pend.future}
     cancel_task: asyncio.Task[Any] | None = None
     if cancel is not None:
@@ -1112,9 +1103,7 @@ async def _wait_for_approval(
         cancel_task = asyncio.create_task(cancel.wait())
         watchers.add(cancel_task)
     try:
-        done, _pending = await asyncio.wait(
-            watchers, timeout=max(0.0, timeout), return_when=asyncio.FIRST_COMPLETED
-        )
+        done, _pending = await asyncio.wait(watchers, return_when=asyncio.FIRST_COMPLETED)
     finally:
         if cancel_task is not None:
             cancel_task.cancel()
@@ -1570,8 +1559,8 @@ class _ToolOutcome:
     """What one tool_use produced: the tool_result text plus how it was reached.
 
     ``executed`` is False when the gate text stands in for the tool (blocked, denied,
-    not approved in time). ``approval`` names the held-call outcome that did not run
-    the tool: "deny", "timeout" or "cancelled".
+    or cancelled while waiting). ``approval`` names the held-call outcome that did
+    not run the tool: "deny" or "cancelled".
     """
 
     content: str
@@ -2307,8 +2296,9 @@ async def agent_turn(
         """Hold an ask-gated tool_use until the user answers, then run exactly what they saw.
 
         Records permission_request / permission_response (and permission_rule_added
-        for allow-for-session). Deny, timeout and cancel return the gate text as an
-        is_error result without running the tool.
+        for allow-for-session). Deny and cancel return the gate text as an
+        is_error result without running the tool. The request stays up until the
+        user answers or the turn is cancelled.
         """
         recorded_input = dict(block.input) if inp is None else dict(inp)
         pend = PendingApproval(
@@ -2334,14 +2324,11 @@ async def agent_turn(
                     },
                 )
             )
-            timeout = float(settings.orbweaver_approval_timeout_s)
-            verdict = await _wait_for_approval(pend, cancel, timeout)
+            verdict = await _wait_for_approval(pend, cancel)
         finally:
             _unregister_approval(pend)
         if verdict is None:
-            cancelled = cancel is not None and cancel.is_set()
-            outcome = "cancelled" if cancelled else "timeout"
-            scope = "once"
+            outcome, scope = "cancelled", "once"
         else:
             outcome, scope = verdict
         fire(
@@ -2362,13 +2349,6 @@ async def agent_turn(
                 is_error=True,
                 executed=False,
                 approval="cancelled",
-            )
-        if outcome == "timeout":
-            return _ToolOutcome(
-                _approval_timeout_result(decision.reason, timeout),
-                is_error=True,
-                executed=False,
-                approval="timeout",
             )
         if outcome == "deny":
             return _ToolOutcome(
@@ -2565,7 +2545,6 @@ async def agent_turn(
                     continue
                 break
             stop_after_ask = False
-            approval_timed_out = False
             waiting_ask = False
             instruction_blocks: list[str] = []
             del round_probes[:]
@@ -2672,12 +2651,6 @@ async def agent_turn(
                         if outcome.approval == "cancelled":
                             # The is_error result is on record; now stop like any other cancel.
                             check()
-                        if outcome.approval == "timeout":
-                            approval_timed_out = True
-                            break
-                    if approval_timed_out:
-                        # Later tool_uses in this round never ran; the model re-plans next turn.
-                        break
                     continue
                 outcomes = await asyncio.gather(
                     *(execute_tool(b, d, inputs[str(b.id)]) for b, d in zip(batch, decisions, strict=True)),
@@ -2715,13 +2688,6 @@ async def agent_turn(
                 )
             launch_probes(list(round_probes))
             if waiting_ask:
-                break
-            if approval_timed_out:
-                fire(
-                    await store.append_event(
-                        session_id, "assistant", {"text": APPROVAL_TIMEOUT_NOTICE}
-                    )
-                )
                 break
             if stop_after_ask:
                 fire(
