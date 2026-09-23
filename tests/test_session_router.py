@@ -445,6 +445,112 @@ async def test_unreplied_text_stays_on_the_operator(tmp_path, monkeypatch):
     ]
 
 
+async def _web_waiting_ask(store, title="Merge hook"):
+    web = _session(uuid4(), title=title, channel="web")
+    await store.put_entity(web)
+    await store.append_event(
+        web.id,
+        "tool_call",
+        {"id": "tu-ask", "name": "AskUser", "input": {"question": "Install ripgrep?"}},
+    )
+    await store.append_event(
+        web.id,
+        "ask_user",
+        {"question": "Install ripgrep?", "tool_use_id": "tu-ask", "name": "AskUser"},
+    )
+    return web
+
+
+@pytest.mark.asyncio
+async def test_ask_user_ping_marks_the_next_message(tmp_path, monkeypatch):
+    store = reset_store_for_tests()
+    sent: list[tuple] = []
+
+    async def fake_notify(chat_id, text, *, force_reply=False):
+        sent.append((chat_id, text, force_reply))
+
+    monkeypatch.setattr(tg, "notify_telegram_chat", fake_notify)
+    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
+    web = await _web_waiting_ask(store)
+    router.emit(
+        web.id,
+        {"kind": "ask_user", "payload": {"question": "Install ripgrep?", "tool_use_id": "tu-ask"}},
+    )
+    await _drain_tasks()
+    op = await store.get_entity(op.id)
+    assert op.jsonld[tg.OPEN_ASK_KEY] == str(web.id)
+    assert sent and sent[0][0] == 900 and sent[0][2] is True
+    assert "Waiting for your answer" in sent[0][1]
+    assert "Install ripgrep?" in sent[0][1]
+    assert str(web.id)[:8] in sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_plain_message_answers_forwarded_ask(tmp_path, monkeypatch):
+    """Production failure: Telegram showed the question, and a bare 'yes' stayed on the operator."""
+    llm = _install_llm(monkeypatch, _ScriptedAnthropic([_text("Installing ripgrep.")]))
+    store = reset_store_for_tests()
+    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
+    web = await _web_waiting_ask(store)
+    op.jsonld[tg.OPEN_ASK_KEY] = str(web.id)
+    await store.put_entity(op)
+    monkeypatch.setattr(tg, "notify_telegram_chat", AsyncMock())
+    update, context = _update(chat_id=900, text="yes"), _context()
+    await tg.dispatch_inbound_text(update, context, "yes")
+    await _drain_tasks()
+
+    events = await store.list_events(web.id)
+    users = [e for e in events if e.kind == "user"]
+    assert users[-1].payload["text"] == "yes"
+    assert users[-1].payload.get("ask_answer") is True
+    assert users[-1].payload.get("via") == "telegram"
+    answers = [e for e in events if e.kind == "tool_result" and e.payload.get("name") == "AskUser"]
+    assert answers and answers[0].payload["content"] == "yes"
+    assert pending_ask_user(events) is None
+    assert [e for e in await store.list_events(op.id) if e.kind == "user"] == []
+    assert llm.calls
+
+
+@pytest.mark.asyncio
+async def test_plain_message_stays_on_operator_after_ask_is_answered(tmp_path, monkeypatch):
+    _install_llm(monkeypatch, _ScriptedAnthropic([_text("operator here")]))
+    store = reset_store_for_tests()
+    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
+    web = await _web_waiting_ask(store)
+    await store.append_event(
+        web.id, "tool_result", {"tool_use_id": "tu-ask", "name": "AskUser", "content": "yes"}
+    )
+    op.jsonld[tg.OPEN_ASK_KEY] = str(web.id)
+    await store.put_entity(op)
+    update, context = _update(chat_id=900, text="what's next"), _context()
+    await tg.dispatch_inbound_text(update, context, "what's next")
+    await _drain_tasks()
+    op = await store.get_entity(op.id)
+    assert tg.OPEN_ASK_KEY not in op.jsonld
+    assert [e.payload.get("text") for e in await store.list_events(web.id) if e.kind == "user"] == []
+    assert [e.kind for e in await store.list_events(op.id)][:2] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_running_operator_turn_keeps_a_plain_message(tmp_path, monkeypatch):
+    store = reset_store_for_tests()
+    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
+    web = await _web_waiting_ask(store)
+    op.jsonld[tg.OPEN_ASK_KEY] = str(web.id)
+    await store.put_entity(op)
+    routed: list[str] = []
+    monkeypatch.setattr(tg, "start_prompted", lambda *a, **k: routed.append("ask"))
+    monkeypatch.setattr(tg, "start_turn", lambda *a, **k: routed.append("operator"))
+    state = turns.acquire(op.id, channel="telegram")
+    assert state is not None
+    try:
+        update, context = _update(chat_id=900, text="yes"), _context()
+        await tg.dispatch_inbound_text(update, context, "yes")
+    finally:
+        turns.release(op.id, state)
+    assert routed == ["operator"]
+
+
 @pytest.mark.asyncio
 async def test_reply_to_tagged_report_injects_without_operator_turn(tmp_path, monkeypatch):
     store = reset_store_for_tests()
