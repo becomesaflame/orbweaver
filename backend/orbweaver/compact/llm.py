@@ -10,6 +10,7 @@ from uuid import UUID
 from orbweaver.compact.project import events_to_messages, live_events
 from orbweaver.config import settings
 from orbweaver.llm import hosted_provider
+from orbweaver.spend import charged_create
 from orbweaver.store import Entity, Event, Store
 
 log = logging.getLogger(__name__)
@@ -68,7 +69,8 @@ def _text_of(resp: Any) -> str:
 async def _complete(
     client: Any, system: Any, messages: list[dict[str, Any]], max_tokens: int = 2048
 ) -> str:
-    resp = await client.messages.create(
+    resp = await charged_create(
+        client,
         model=settings.orbweaver_compact_model,
         max_tokens=max_tokens,
         system=system,

@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # Cheap model that classifies an Auto turn's prompt onto a concrete id.
     # Empty disables the LLM pass (ranked fallback only).
     orbweaver_router_model: str = "claude-haiku-4-5"
+    # Daily UTC spend caps in USD. 0 = unlimited. Anthropic is priced from the
+    # local token table (Messages usage has no dollars). Earth Runtime
+    # (openrouter) uses usage.cost. Production: Anthropic $50, Earth Runtime 0.
+    orbweaver_spend_cap_anthropic_usd_day: float = 50.0
+    orbweaver_spend_cap_openrouter_usd_day: float = 0.0
     # off | scoped | all. scoped skips in-project Read/Grep/Glob/WorkspaceSearch and
     # benign Bash; all probes every eligible result (pre-0.33.22 behaviour).
     orbweaver_injection_probe_mode: str = "scoped"

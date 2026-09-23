@@ -1,3 +1,3 @@
 """Orbweaver backend package."""
 
-__version__ = "0.62.0"
+__version__ = "0.63.0"

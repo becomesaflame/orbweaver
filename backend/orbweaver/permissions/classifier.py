@@ -213,16 +213,24 @@ async def classify_action(
     async def _create(**kwargs: Any):
         from orbweaver.llm import is_upstream_unavailable, make_hosted_client
         from orbweaver.model_routing import MAX_UNAVAILABLE_FALLBACKS, fallback_model
+        from orbweaver.spend import SpendCapped, charged_create
 
         nonlocal client, model
         tried = {model}
         leftover = MAX_UNAVAILABLE_FALLBACKS
         while True:
             try:
-                return await client.messages.create(model=model, **kwargs)
+                return await charged_create(client, model=model, **kwargs)
             except Exception as e:
                 if leftover <= 0 or not is_upstream_unavailable(e):
                     raise
+                if isinstance(e, SpendCapped):
+                    from orbweaver.llm import select_provider as _sel
+                    from orbweaver.model_routing import routed_models
+
+                    for mid in routed_models():
+                        if _sel(mid) == e.provider:
+                            tried.add(mid)
                 nxt = fallback_model(model, tried=tried)
                 nxt_client = make_hosted_client(nxt) if nxt else None
                 if not nxt or nxt_client is None:
