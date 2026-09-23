@@ -1,12 +1,14 @@
 """Telegram adapter: a dispatcher operator, not a cursor inside another chat.
 
-Each allowlisted Telegram user owns one *operator* session. Plain messages always
-run ``agent_turn`` on that session. The operator prompts other sessions with
-``PromptSession`` (or the user replies to a tagged report); those turns keep
-the target's home channel, tools, and model, and user events carry
-``via: telegram``. A global router sink pushes approval keyboards and AskUser
-pings from any chat, plus completion summaries for sessions Telegram recently
-prompted (and errors/aborts from anywhere). Turns run as background tasks;
+Each allowlisted Telegram user owns one *operator* session. Plain messages
+run ``agent_turn`` on that session, except a reply to a tagged report and the
+next message after an AskUser ping, which answer that session. The operator
+prompts other sessions with ``PromptSession`` (or the user replies to a tagged
+report); those turns keep the target's home channel, tools, and model, and
+user events carry ``via: telegram``. A global router sink pushes approval
+keyboards and AskUser pings from any chat, plus completion summaries for
+sessions Telegram recently prompted (and errors/aborts from anywhere). Turns
+run as background tasks;
 ``/stop`` cancels the operator turn, the last prompted session, or a tagged
 reply target.
 """
@@ -75,6 +77,8 @@ TELEGRAM_IMAGE_HINT = (
     "GenerateImage creates a file and, on Telegram sessions, sends it to the chat."
 )
 CHANNEL = "telegram"
+# Operator JSON-LD: session whose forwarded AskUser the next plain message answers.
+OPEN_ASK_KEY = "telegram_open_ask"
 # [title · a1b2c3d4] — durable so a reply-to still resolves after a restart.
 _SESSION_TAG_RE = re.compile(r"\[(?P<title>.+?) · (?P<short>[0-9a-fA-F]{8})\]")
 
@@ -138,16 +142,20 @@ def _forget_watch(session_id: UUID) -> None:
     _watched_chats.pop(session_id, None)
 
 
-async def notify_telegram_chat(chat_id: int, text: str) -> None:
+async def notify_telegram_chat(chat_id: int, text: str, *, force_reply: bool = False) -> None:
     token = settings.telegram_bot_token
     if not token or not text:
         return
     import httpx
 
+    body: dict[str, Any] = {"chat_id": chat_id, "text": text[:3500]}
+    if force_reply:
+        # The client opens a reply to this message, so the answer carries the session tag.
+        body["reply_markup"] = {"force_reply": True}
     async with httpx.AsyncClient(timeout=15.0) as client:
         await client.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:3500]},
+            json=body,
         )
 
 
@@ -335,8 +343,9 @@ async def _handle_global_event(session_id: UUID, msg: dict[str, Any]) -> None:
     if kind == "ask_user":
         question = str((msg.get("payload") or {}).get("question") or "").strip()
         body = f"{tag}\nWaiting for your answer:\n{question}" if question else f"{tag}\nWaiting for your answer."
-        for _op, chat_id in operators:
-            await notify_telegram_chat(chat_id, body)
+        for op, chat_id in operators:
+            await remember_open_ask(store, op, session_id)
+            await notify_telegram_chat(chat_id, body, force_reply=True)
         return
     if kind != "turn_done":
         return
@@ -547,7 +556,7 @@ async def handle_photo(update, context) -> None:
         return
     caption = (update.message.caption or "").strip() or "[Photo]"
     stem = f"photo_{update.message.message_id}"
-    ref = _reply_session_ref(update)
+    ref = await inbound_target_ref(update, context)
     if ref:
         ws, err = await _reply_target_workspace(update, context, ref)
         if err:
@@ -598,7 +607,7 @@ async def handle_document(update, context) -> None:
     if len(data) > TELEGRAM_MAX_BYTES:
         await update.message.reply_text(document_too_large_text(name, len(data)))
         return
-    ref = _reply_session_ref(update)
+    ref = await inbound_target_ref(update, context)
     if ref:
         ws, err = await _reply_target_workspace(update, context, ref)
         if err:
@@ -947,6 +956,71 @@ async def stop_session_from_operator(store: Store, operator: Entity, inp: dict[s
     return json.dumps({"stopped": True, "session": str(target.id)})
 
 
+async def remember_open_ask(store: Store, operator: Entity, session_id: UUID) -> None:
+    """The next plain Telegram message answers ``session_id``'s AskUser."""
+    fresh = await store.get_entity(operator.id) or operator
+    if str((fresh.jsonld or {}).get(OPEN_ASK_KEY) or "") == str(session_id):
+        return
+    fresh.jsonld[OPEN_ASK_KEY] = str(session_id)
+    await store.put_entity(fresh)
+
+
+async def open_ask_target(store: Store, operator: Entity) -> Entity | None:
+    """Session a forwarded AskUser is still waiting on, or None.
+
+    A stale pointer (answered on the web, deleted session) is cleared.
+    """
+    raw = str((operator.jsonld or {}).get(OPEN_ASK_KEY) or "").strip()
+    if not raw:
+        return None
+    try:
+        sid = UUID(raw)
+    except ValueError:
+        sid = None
+    target = await store.get_entity(sid) if sid is not None else None
+    pending = None
+    if target is not None:
+        pending = pending_ask_user(await store.list_events(target.id))
+    if target is None or pending is None:
+        operator.jsonld.pop(OPEN_ASK_KEY, None)
+        await store.put_entity(operator)
+        return None
+    return target
+
+
+async def inbound_target_ref(update, context) -> str | None:
+    """Session prefix this message should run on, or None for the operator.
+
+    A reply to a tagged report wins. Otherwise a plain message answers the
+    AskUser Telegram just forwarded, unless the operator itself is mid-turn.
+    """
+    ref = _reply_session_ref(update)
+    if ref:
+        return ref
+    store, operator, _chat_id = await _operator_session(update, context)
+    if get_running_turn(operator.id) is not None:
+        return None
+    target = await open_ask_target(store, operator)
+    if target is None:
+        return None
+    log.info("telegram: plain message answers open ask %s", target.id)
+    return str(target.id)[:8]
+
+
+async def dispatch_inbound_text(
+    update,
+    context,
+    text: str,
+    images: list[dict[str, str]] | None = None,
+) -> None:
+    """Route text to a tagged reply, an open AskUser, or the operator."""
+    ref = await inbound_target_ref(update, context)
+    if ref:
+        start_prompted(update, context, ref, text, images)
+        return
+    start_turn(update, context, text, images)
+
+
 def _reply_session_ref(update) -> str | None:
     """Short id from a reply to a tagged bot message, or None."""
     message = getattr(update, "message", None)
@@ -1162,6 +1236,9 @@ async def status_text(bound: Bound) -> str:
     if pending is not None:
         question = str(((pending.payload or {}).get("input") or {}).get("question") or "")
         lines.append(f"waiting for your answer: {question}" if question else "waiting for your answer")
+    waiting = await open_ask_target(store, bound.operator)
+    if waiting is not None:
+        lines.append(f"your next message answers {_title_of(waiting, await store.list_events(waiting.id))}")
     lines.append("/sessions to list chats; reply to a tagged report to inject")
     return "\n".join(lines)
 
@@ -1351,11 +1428,7 @@ async def start_telegram() -> None:
             return
         if not user_allowed(update.effective_user.id):
             return
-        ref = _reply_session_ref(update)
-        if ref:
-            start_prompted(update, context, ref, update.message.text)
-            return
-        start_turn(update, context, update.message.text)
+        await dispatch_inbound_text(update, context, update.message.text)
 
     async def on_voice(update: Update, context) -> None:
         if not update.message or not update.message.voice:
@@ -1373,11 +1446,7 @@ async def start_telegram() -> None:
             return
         if not update.effective_user:
             return
-        ref = _reply_session_ref(update)
-        if ref:
-            start_prompted(update, context, ref, text)
-            return
-        start_turn(update, context, text)
+        await dispatch_inbound_text(update, context, text)
 
     async def on_approval(update: Update, context) -> None:
         query = update.callback_query
