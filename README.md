@@ -126,20 +126,17 @@ Then **Install from VSIX** or **Run Extension** from the `vscode/` folder. Set `
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWLIST` (comma-separated user ids). Sessions use `LocalWorkspace` (bubblewrap). Leftover `workspace_kind=docker` rows are rewritten to `local` on the next turn. Voice notes go through `/v1/stt` when `faster-whisper` is installed (`pip install -e ".[stt]"`).
 
-Each Telegram user gets one **operator** session (`workspace:default`) and can point it at any other session through the **session router** (`orbweaver.channels.router`). While attached, messages run `agent_turn` on that session — the same event stream, workspace, model, todos, and session rules the web UI or VS Code is using — so work started at the desk continues from the phone, including answering a pending `AskUser` question. User events typed this way carry `via: "telegram"`. Turn events from any channel fan out through the router: Telegram-driven turns stream to open WebSocket clients, and a turn started in the web UI on an attached session sends its approval keyboard and final reply to the chat. Turns run as background tasks so commands keep working while the agent is busy.
+Each Telegram user gets one **operator** session (`workspace:default`). That session stays the dispatcher: inbound messages always run on it. The operator can list other sessions, summarize them, **prompt** one (`PromptSession`), or **create** a new web chat (`CreateSession`) when none of the existing ones is the right place. Prompting injects into a running turn or starts a new turn on that session — same event stream, workspace, model, todos, and that session's own tools. User events typed this way carry `via: "telegram"`. Replying to a tagged bot report (`[title · a1b2c3d4]`) injects into that session without an operator hop. Approvals and `AskUser` pings from any chat are forwarded here; turn completions are reported only for sessions Telegram recently prompted (plus errors and aborts). Turns run as background tasks so commands keep working while the agent is busy.
 
 | Command | Effect |
 | --- | --- |
 | `/sessions` | List sessions (id prefix, title, age, running turn, waiting for an answer) |
-| `/attach <id\|prefix\|title>` | Route this chat to that session; replies with a digest |
-| `/detach` | Back to the operator's own session |
-| `/model` | List models for this chat (the attached session, or the operator's own) |
-| `/model <id>` | Switch this chat's model (prefix or label if unique); `/model default` clears |
-| `/status` | Attached target, current model, running turn, pending question |
-| `/stop` | Cancel the running turn on the current session |
-| `/op <text>` | Talk to the operator while attached |
+| `/model` | List models for the operator chat |
+| `/model <id>` | Switch the operator's model (prefix or label if unique); `/model default` clears |
+| `/status` | Operator session, watching list, running turn, pending question |
+| `/stop` | Cancel the operator turn, or the last prompted session; reply-to `/stop` cancels that tagged session |
 
-The operator's own turns get four extra allowlisted tools — `ListSessions`, `SessionDigest`, `AttachSession`, `DetachSession` — so "what was I doing on the airbed controller?" is answered by reading the other session's log and, on request, attaching to it. Attach pointers persist on the operator session (`attached_session`) and are rebound after a restart.
+The operator's own turns get extra allowlisted tools — `ListSessions`, `SessionDigest`, `PromptSession`, `CreateSession`, `StopSession` — so "what was I doing on the airbed controller?" is answered by reading the other session's log and prompting it, or starting a new web chat when none of the existing ones fit. A leftover `attached_session` from the old attach model is cleared on the next operator load.
 
 ### File uploads
 

@@ -17,6 +17,7 @@ from orbweaver.agent import (
     resolve_approval,
 )
 from orbweaver.app import app
+from orbweaver.channels import router
 from orbweaver.channels import telegram as tg
 from orbweaver.compact import events_to_messages
 from orbweaver.config import settings
@@ -568,18 +569,42 @@ def test_telegram_keyboard_roundtrip():
 
 
 @pytest.mark.asyncio
-async def test_telegram_chat_sink_sends_keyboard(monkeypatch):
+async def test_telegram_global_sink_sends_keyboard(monkeypatch):
     sent: list[dict] = []
 
-    async def fake_notify(chat_id, payload):
-        sent.append({"chat_id": chat_id, **payload})
+    async def fake_notify(chat_id, payload, *, tag=""):
+        sent.append({"chat_id": chat_id, "tag": tag, **payload})
 
     monkeypatch.setattr(tg, "notify_telegram_approval", fake_notify)
-    sink = tg.make_chat_sink(77, uuid4())
-    sink({"kind": "assistant", "payload": {"text": "hi"}})
-    sink({"kind": "permission_request", "payload": {"tool_use_id": "tu-1", "name": "Bash"}})
-    await asyncio.sleep(0)
-    assert sent == [{"chat_id": 77, "tool_use_id": "tu-1", "name": "Bash"}]
+    store = reset_store_for_tests()
+    tg.reset_for_tests()
+    tg.install_telegram_sink()
+    await tg.session_for_telegram_user(store, 42, chat_id=77)
+    sid = uuid4()
+    web = Entity(
+        id=sid,
+        at_id=session_at_id(sid),
+        at_type=SESSION_TYPE,
+        jsonld={
+            "@id": session_at_id(sid),
+            "@type": SESSION_TYPE,
+            "title": "Ship it",
+            "channel": "web",
+            "status": "active",
+        },
+    )
+    await store.put_entity(web)
+    router.emit(
+        sid,
+        {"kind": "permission_request", "payload": {"tool_use_id": "tu-1", "name": "Bash"}},
+    )
+    while tg._tasks:
+        await asyncio.gather(*list(tg._tasks), return_exceptions=True)
+    assert sent[0]["chat_id"] == 77
+    assert sent[0]["tool_use_id"] == "tu-1"
+    assert sent[0]["name"] == "Bash"
+    assert "Ship it" in sent[0]["tag"]
+    tg.reset_for_tests()
 
 
 class _FakeQuery:
