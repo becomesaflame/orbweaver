@@ -1,0 +1,42 @@
+name: CI Failure Notify
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types:
+      - completed
+
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find PR associated with the failed run
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const commit_sha = run.head_sha;
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha
+            });
+            if (prs.length === 0) {
+              core.setOutput('pr_number', '');
+            } else {
+              core.setOutput('pr_number', prs[0].number);
+            }
+      - name: Comment on PR about CI failure
+        if: steps.pr.outputs.pr_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ steps.pr.outputs.pr_number }};
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: "⚠️ CI checks failed. Please address the failures and update your PR."
+            });
