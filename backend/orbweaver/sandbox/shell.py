@@ -302,11 +302,13 @@ class SessionShell:
         policy: SandboxPolicy | None = None,
         full_network: bool = False,
         start_timeout: float = START_TIMEOUT_S,
+        session_id: str = "",
     ) -> None:
         self.root = Path(workspace_root).resolve()
         self.policy = policy or load_sandbox_policy(self.root)
         self.full_network = full_network
         self.start_timeout = start_timeout
+        self.session_id = str(session_id or "")
         self.proc: subprocess.Popen[str] | None = None
         self.proxy: DomainProxy | None = None
         self.gh_proxy: GhProxy | None = None
@@ -338,6 +340,7 @@ class SessionShell:
             self.root,
             policy=self.policy,
             full_network=self.full_network,
+            session_id=self.session_id,
         )
         self.proxy = proxy
         self.gh_proxy = gh_proxy
@@ -578,7 +581,7 @@ def get_session_shell(
             _SHELLS.pop(key, None)
             shell = None
         if shell is None:
-            shell = SessionShell(root, policy=pol)
+            shell = SessionShell(root, policy=pol, session_id=key)
             shell.start()
             _SHELLS[key] = shell
             _ensure_reaper()

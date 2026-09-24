@@ -1,0 +1,94 @@
+name: CI failure
+
+# Runs from the default branch after the ci workflow finishes, including
+# failures on pull requests. Posts to the Orbweaver CI operator, which
+# prompts the session that opened the PR.
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  operator:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Orbweaver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBHOOK_URL: ${{ secrets.ORBWEAVER_CI_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.ORBWEAVER_CI_WEBHOOK_SECRET }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ] || [ -z "$WEBHOOK_SECRET" ]; then
+            echo "Set repository secrets ORBWEAVER_CI_WEBHOOK_URL and ORBWEAVER_CI_WEBHOOK_SECRET" >&2
+            exit 1
+          fi
+          python3 << 'PY'
+          import json, os, urllib.parse, urllib.request
+
+          repo = os.environ["REPO"]
+          head = os.environ.get("HEAD_BRANCH") or ""
+          number = 0
+          url = ""
+          owner = repo.split("/")[0]
+          query = urllib.parse.urlencode({"head": f"{owner}:{head}", "state": "open"})
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/pulls?{query}",
+              headers={
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "orbweaver-ci-failure",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              pulls = json.load(resp)
+          if pulls:
+              number = int(pulls[0]["number"])
+              url = pulls[0]["html_url"]
+          if not number:
+              raise SystemExit(f"no open pull request for {head}")
+          jobs_req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/actions/runs/{os.environ['RUN_ID']}/jobs",
+              headers={
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "orbweaver-ci-failure",
+              },
+          )
+          with urllib.request.urlopen(jobs_req, timeout=30) as resp:
+              jobs = json.load(resp).get("jobs") or []
+          failed = [j["name"] for j in jobs if j.get("conclusion") == "failure"]
+          body = json.dumps({
+              "repo": repo,
+              "number": number,
+              "url": url,
+              "head_ref": head,
+              "head_sha": os.environ.get("HEAD_SHA") or "",
+              "run_url": os.environ.get("RUN_URL") or "",
+              "failed_jobs": failed,
+          }).encode()
+          post = urllib.request.Request(
+              os.environ["WEBHOOK_URL"],
+              data=body,
+              headers={
+                  "Authorization": f"Bearer {os.environ['WEBHOOK_SECRET']}",
+                  "Content-Type": "application/json",
+                  "User-Agent": "orbweaver-ci-failure",
+              },
+              method="POST",
+          )
+          with urllib.request.urlopen(post, timeout=30) as resp:
+              print(resp.read().decode())
+          PY

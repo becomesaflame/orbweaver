@@ -238,6 +238,7 @@ def _handle(
     gh_bin: Path,
     roots: tuple[Path, ...],
     environ: dict[str, str],
+    session_id: str = "",
 ) -> None:
     try:
         raw = _recv_frame(conn)
@@ -275,11 +276,17 @@ def _handle(
         except subprocess.TimeoutExpired:
             _send_frame(conn, _reply(124, stderr="gh: timed out\n"))
             return
+        stdout = completed.stdout or ""
+        if session_id and int(completed.returncode) == 0:
+            from orbweaver.pulls import is_pr_create, note_created_pull
+
+            if is_pr_create(argv):
+                note_created_pull(session_id, stdout)
         _send_frame(
             conn,
             _reply(
                 int(completed.returncode),
-                stdout=completed.stdout or "",
+                stdout=stdout,
                 stderr=completed.stderr or "",
             ),
         )
@@ -306,10 +313,12 @@ class GhProxy:
         extra_roots: tuple[Path, ...] = (),
         gh_bin: Path | None = None,
         environ: dict[str, str] | None = None,
+        session_id: str = "",
     ) -> None:
         self.sock_path = Path(sock_path)
         self.workspace_root = Path(workspace_root).resolve()
         self.extra_roots = tuple(Path(p).resolve() for p in extra_roots)
+        self.session_id = str(session_id or "")
         self.environ = dict(environ) if environ is not None else dict(os.environ)
         which = gh_bin or (gh_binaries(self.environ)[0] if gh_binaries(self.environ) else None)
         self.gh_bin = which
@@ -354,6 +363,7 @@ class GhProxy:
                     "gh_bin": self.gh_bin,
                     "roots": self._roots(),
                     "environ": self.environ,
+                    "session_id": self.session_id,
                 },
                 daemon=True,
             ).start()

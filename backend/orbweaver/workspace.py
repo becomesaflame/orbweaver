@@ -1142,6 +1142,7 @@ class LocalWorkspace:
                     policy=self._policy(),
                     full_network=plan.full_network,
                     cancel=cancel,
+                    session_id=key,
                 ),
                 cmd,
                 cwd,

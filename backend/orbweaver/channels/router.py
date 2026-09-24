@@ -402,6 +402,7 @@ async def session_digest(store: Store, session_id: UUID) -> dict[str, Any]:
             "open_todo_count": len(open_todos),
             "compact_summary": summary[:800],
             "created_at": str((ent.jsonld or {}).get("created_at") or ""),
+            "pull_requests": list((ent.jsonld or {}).get("pull_requests") or []),
         }
     )
     return row
