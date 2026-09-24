@@ -73,3 +73,22 @@ def test_label_output_prefixes():
     assert "Ask the user" in labeled_fs
     already = "sandbox_denied: network (x)\nrest"
     assert label_sandbox_output(already) == already
+
+
+def test_successful_git_branch_subject_is_not_a_network_denial():
+    """git branch -vv exits 0; a commit subject must not ask for full_network.
+
+    Production session 62d0a2d9 saw this on a clean listing and then refused to
+    push or open a PR until the user approved arbitrary internet.
+    """
+    subject = (
+        "  fix/deploy-health-retry  11e00f6 [origin/fix/deploy-health-retry] "
+        "Retry deploy health checks on connection refused.\n"
+    )
+    assert "sandbox_denied" not in label_sandbox_output(subject, returncode=0)
+    failed = label_sandbox_output(
+        "ssh: connect to host github.com port 22: Connection refused\n",
+        returncode=255,
+    )
+    assert failed.startswith("sandbox_denied: network")
+    assert "full_network" in failed
