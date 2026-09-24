@@ -138,6 +138,9 @@ class Settings(BaseSettings):
     compact_micro_release: float = 0.4
     # Floor: the newest N compactable results are never stubbed.
     compact_micro_keep: int = 5
+    # Latest Read of each of the N most recently read paths survives microcompact.
+    # Older reads of the same path do not. 0 disables the working set.
+    compact_micro_read_paths: int = 8
     # Independent of pressure: a result older than this many tool rounds *and*
     # larger than this many chars is stubbed (0 rounds disables the age rule).
     compact_micro_stale_rounds: int = 24
