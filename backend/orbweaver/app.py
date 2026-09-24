@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import ipaddress
 import json
 import logging
@@ -139,6 +140,9 @@ async def _lifespan(_app: FastAPI):
 
         bind_loop(asyncio.get_running_loop())
         attach_log_handler()
+    from orbweaver.pulls import bind_loop as bind_pulls
+
+    bind_pulls(asyncio.get_running_loop())
     if not testing:
         from orbweaver.resume import kickoff_drain_resumes
 
@@ -150,6 +154,9 @@ async def _lifespan(_app: FastAPI):
 
     detach_log_handler()
     unbind_selfheal(None)
+    from orbweaver.pulls import bind_loop as unbind_pulls
+
+    unbind_pulls(None)
     from orbweaver.sandbox.shell import close_all_session_shells
 
     await asyncio.to_thread(close_all_session_shells)
@@ -332,6 +339,16 @@ class JobBody(BaseModel):
     recurrence: str | None = None
 
 
+class CiFailureBody(BaseModel):
+    repo: str
+    number: int
+    url: str = ""
+    head_ref: str = ""
+    head_sha: str = ""
+    run_url: str = ""
+    failed_jobs: list[str] = []
+
+
 class CorrectionBody(BaseModel):
     text: str
     path: str | None = None
@@ -340,6 +357,17 @@ class CorrectionBody(BaseModel):
 
 def _user(request: Request) -> dict:
     return require_user(request)
+
+
+def _ci_webhook(request: Request) -> None:
+    """Bearer token shared with the GitHub Actions secret. Empty secret refuses."""
+    secret = (settings.orbweaver_ci_webhook_secret or "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="ci webhook is not configured")
+    header = request.headers.get("authorization") or ""
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    if not token or not hmac.compare_digest(token, secret):
+        raise HTTPException(status_code=401, detail="unauthorized")
 
 
 @dataclass(eq=False)
@@ -1428,6 +1456,16 @@ async def stt(file: UploadFile = File(...), _u: dict = Depends(_user)) -> dict[s
     except Exception as e:
         raise HTTPException(501, f"STT unavailable: {e}") from e
     return {"text": text}
+
+
+@app.post("/v1/webhooks/ci-failure")
+async def ci_failure_webhook(body: CiFailureBody, _ok: None = Depends(_ci_webhook)) -> dict[str, Any]:
+    from orbweaver.ci_operator import handle_ci_failure
+
+    try:
+        return await handle_ci_failure(body.model_dump())
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @app.post("/v1/jobs")

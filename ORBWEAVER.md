@@ -119,6 +119,14 @@ Actions `GITHUB_TOKEN` push, so deploy does start.
 Failed PR tests mean auto-merge waits (or the PR stays open). Stay and fix
 them. `main` stays on the last green SHA.
 
+When `ci` fails, `.github/workflows/ci-failure.yml` posts the pull request
+to `POST /v1/webhooks/ci-failure`. The gateway prompts the session that
+opened it (`gh pr create` records `pull_requests` on that session) or
+starts a new chat when none is associated. The route is off until
+`ORBWEAVER_CI_WEBHOOK_SECRET` is set on the gateway and the matching
+`ORBWEAVER_CI_WEBHOOK_SECRET` and `ORBWEAVER_CI_WEBHOOK_URL` secrets exist
+on the GitHub repo.
+
 The live host pulls `origin/main`, checks out `main`, waits until running
 turns finish (`orbweaver drain`), then restarts `orbweaver.service`. Agents
 do not deploy.

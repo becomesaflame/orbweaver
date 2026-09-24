@@ -186,6 +186,11 @@ class Settings(BaseSettings):
     orbweaver_selfheal_cooldown_s: float = 604800.0  # 7 days
     orbweaver_selfheal_daily_cap: int = 3
     orbweaver_selfheal_telegram_chat_id: int = 0
+    # Shared secret for POST /v1/webhooks/ci-failure. Empty disables the route.
+    # GitHub Actions secret ORBWEAVER_CI_WEBHOOK_SECRET must match this value.
+    orbweaver_ci_webhook_secret: str = ""
+    # Workspace a new chat uses when CI fails on a PR no agent has recorded.
+    orbweaver_ci_workspace: str = "workspace:orbweaver"
     # How long `orbweaver drain` (and therefore deploy) waits for in-flight
     # turns before restarting anyway. Approval-held turns count as running.
     orbweaver_drain_timeout_s: float = 900.0

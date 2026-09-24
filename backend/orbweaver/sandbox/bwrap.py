@@ -502,6 +502,7 @@ def _prepare_sandbox(
     *,
     policy: SandboxPolicy | None,
     full_network: bool,
+    session_id: str = "",
 ) -> tuple[list[str], Any, GhProxy | None, int | None]:
     """Start the domain proxy, open the seccomp fd, and build the bwrap argv.
 
@@ -530,6 +531,7 @@ def _prepare_sandbox(
         workspace_root=workspace_root,
         extra_roots=pol.working_set_roots(workspace_root)[1:],
         environ=dict(os.environ),
+        session_id=session_id,
     )
     gh_sock: Path | None
     try:
@@ -572,9 +574,14 @@ def spawn_sandboxed(
     *,
     policy: SandboxPolicy | None = None,
     full_network: bool = False,
+    session_id: str = "",
 ) -> SandboxSession:
     argv, proxy, gh_proxy, seccomp_fd = _prepare_sandbox(
-        command, workspace_root, policy=policy, full_network=full_network
+        command,
+        workspace_root,
+        policy=policy,
+        full_network=full_network,
+        session_id=session_id,
     )
     try:
         proc = subprocess.Popen(
@@ -604,10 +611,16 @@ async def spawn_sandboxed_async(
     *,
     policy: SandboxPolicy | None = None,
     full_network: bool = False,
+    session_id: str = "",
 ) -> AsyncSandboxSession:
     """spawn_sandboxed for the event loop: the process is an asyncio subprocess."""
     argv, proxy, gh_proxy, seccomp_fd = await asyncio.to_thread(
-        _prepare_sandbox, command, workspace_root, policy=policy, full_network=full_network
+        _prepare_sandbox,
+        command,
+        workspace_root,
+        policy=policy,
+        full_network=full_network,
+        session_id=session_id,
     )
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -678,6 +691,7 @@ async def run_sandboxed_async(
     policy: SandboxPolicy | None = None,
     full_network: bool = False,
     cancel: asyncio.Event | None = None,
+    session_id: str = "",
 ) -> str:
     """run_sandboxed without blocking the event loop.
 
@@ -688,7 +702,11 @@ async def run_sandboxed_async(
         return await _raw_async(command, workspace_root, timeout, cancel=cancel)
     started = time.monotonic()
     session = await spawn_sandboxed_async(
-        command, workspace_root, policy=policy, full_network=full_network
+        command,
+        workspace_root,
+        policy=policy,
+        full_network=full_network,
+        session_id=session_id,
     )
     try:
         out, status = await communicate_async(session.proc, timeout, cancel=cancel)
