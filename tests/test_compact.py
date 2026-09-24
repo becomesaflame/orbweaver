@@ -136,6 +136,8 @@ async def test_microcompact_under_pressure_keeps_edited_read_and_small_results(m
     """
     store = reset_store_for_tests()
     monkeypatch.setattr(settings, "event_budget_override", 2000)
+    # One-file working set: index.html is outside it, so it can still be stubbed.
+    monkeypatch.setattr(settings, "compact_micro_read_paths", 1)
     sid = new_uuid()
     await _session(store, sid)
     big = "x" * 1500
@@ -162,6 +164,56 @@ async def test_microcompact_under_pressure_keeps_edited_read_and_small_results(m
     assert "return x" in contents["r_new"]
     assert all("cleared" not in contents[f"b{i}"] for i in range(2, 6)), "newest results kept"
     assert "cleared" not in contents["e1"]
+
+
+@pytest.mark.asyncio
+async def test_microcompact_keeps_latest_read_of_each_working_file(monkeypatch):
+    """Re-reading a file must not drop the copy the model is using.
+
+    Production: a flash model read router.py ~30 times because each copy was
+    stubbed to "[Old tool result content cleared]" once five newer results
+    landed, and the model went back for the same span.
+    """
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "event_budget_override", 2000)
+    monkeypatch.setattr(settings, "compact_micro_read_paths", 2)
+    sid = new_uuid()
+    await _session(store, sid)
+    big = "x" * 1500
+    first = "router.py: lines 1-400 of 554\n" + big
+    again = "router.py: lines 1-400 of 554\nclass Router:\n" + big
+    await _tool_round(store, sid, "r0", "Read", {"path": "backend/router.py"}, first)
+    await _tool_round(store, sid, "other", "Read", {"path": "backend/selfheal.py"}, "selfheal.py: lines 1-80 of 80\n" + big)
+    for i in range(8):
+        await _tool_round(store, sid, f"b{i}", "Bash", {"command": "x"}, f"bash-{i}\n" + big)
+    await _tool_round(store, sid, "r1", "Read", {"path": "backend/router.py"}, again)
+    contents = _result_contents(prompt_events(await store.list_events(sid)))
+    assert "class Router" in contents["r1"], "latest read of a working-set file is kept"
+    assert "cleared" in contents["r0"], "the older copy of that file is stubbed"
+    assert "router.py: lines 1-400 of 554" in contents["r0"]
+    assert "selfheal.py: lines 1-80 of 80" in contents["other"]
+    assert "class Router" not in contents["r0"]
+
+
+@pytest.mark.asyncio
+async def test_microcompact_drops_reads_outside_the_working_set(monkeypatch):
+    store = reset_store_for_tests()
+    monkeypatch.setattr(settings, "event_budget_override", 400)
+    monkeypatch.setattr(settings, "compact_micro_keep", 1)
+    monkeypatch.setattr(settings, "compact_micro_read_paths", 1)
+    sid = new_uuid()
+    await _session(store, sid)
+    big = "y" * 1500
+    await _tool_round(
+        store, sid, "old", "Read", {"path": "a.py"}, "a.py: lines 1-10 of 10\n" + big
+    )
+    await _tool_round(
+        store, sid, "new", "Read", {"path": "b.py"}, "b.py: lines 1-10 of 10\n" + big
+    )
+    contents = _result_contents(prompt_events(await store.list_events(sid)))
+    assert "cleared" in contents["old"]
+    assert "a.py: lines 1-10 of 10" in contents["old"]
+    assert "b.py: lines 1-10 of 10" in contents["new"]
 
 
 @pytest.mark.asyncio

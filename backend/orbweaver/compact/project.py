@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -25,6 +26,8 @@ COMPACTABLE_TOOLS = frozenset({"Bash", "Read", "Grep", "Glob", "WebFetch", "WebS
 # Tools that change a file in place; a Read of that path is kept while it is being edited.
 EDIT_TOOLS = frozenset({"Write", "StrReplace"})
 MICRO_STUB = "[Old tool result content cleared]"
+# Read windows start with ``path: lines A-B of N`` (see tooltext.format_read).
+_READ_SPAN_RE = re.compile(r"^(.{1,240}: )?lines \d+-\d+ of \d+$")
 # Results below this many chars are not worth a prefix-cache miss to stub.
 MICRO_SMALL_RESULT_CHARS = 1000
 PAIR_KINDS = frozenset(
@@ -161,6 +164,9 @@ def _norm_path(raw: Any) -> str:
 
 def _micro_stub(payload: dict[str, Any]) -> str:
     stub = MICRO_STUB
+    first = _result_text(payload).split("\n", 1)[0].strip()
+    if _READ_SPAN_RE.match(first):
+        stub = f"{stub} {first}"
     path = payload.get("persisted_path")
     if path:
         stub = f"{stub} Full output: {path}"
@@ -203,7 +209,27 @@ def _micro_candidates(events: list[Event]) -> tuple[list[_MicroCandidate], int]:
     for idx, path, cand in reads:
         if any(e_idx > idx and e_path == path for e_idx, e_path in edits):
             cand.protected = True
+    _protect_latest_reads(reads)
     return candidates, round_no
+
+
+def _protect_latest_reads(reads: list[tuple[int, str, _MicroCandidate]]) -> None:
+    """Keep the latest Read of each of the most recently read paths.
+
+    A turn that studies a handful of files re-reads them once microcompact
+    stubs the previous copy. Older copies of the same path stay eligible, so
+    the duplicate is what gets cleared. Paths that fall out of the working set
+    are eligible again.
+    """
+    latest: dict[str, tuple[int, _MicroCandidate]] = {}
+    for idx, path, cand in reads:
+        prev = latest.get(path)
+        if prev is None or idx > prev[0]:
+            latest[path] = (idx, cand)
+    keep_n = max(0, int(settings.compact_micro_read_paths))
+    ranked = sorted(latest.items(), key=lambda item: item[1][0], reverse=True)
+    for _path, (_idx, cand) in ranked[:keep_n]:
+        cand.protected = True
 
 
 def microcompact_events(events: list[Event]) -> list[Event]:
@@ -220,6 +246,10 @@ def microcompact_events(events: list[Event]) -> list[Event]:
     * The newest ``compact_micro_keep`` compactable results are never stubbed.
     * A ``Read`` whose path was later edited by Write/StrReplace in this window
       is never stubbed; the model is working on that file.
+    * The latest ``Read`` of each of the ``compact_micro_read_paths`` most
+      recently read paths is never stubbed. Older reads of those paths are.
+      A stubbed Read keeps its ``path: lines A-B of N`` header so the span is
+      still visible.
     * Age rule: a result older than ``compact_micro_stale_rounds`` tool rounds
       and larger than ``compact_micro_stale_chars`` is stubbed regardless of
       pressure.
