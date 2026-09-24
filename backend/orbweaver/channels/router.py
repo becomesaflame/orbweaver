@@ -13,8 +13,9 @@ Two process-wide registries live here so channels never import each other:
   (Telegram dispatcher) or a per-session sink. Every channel passes
   :func:`emitter` to ``agent_turn`` so a turn started anywhere is visible
   everywhere.
-* **Watch set** — sessions the operator recently prompted, persisted on the
-  operator JSON-LD so a restart still reports that turn's completion.
+* **Watch set** — sessions the operator recently prompted or explicitly
+  watched (``WatchSession``), persisted on the operator JSON-LD so a restart
+  still reports that turn's completion.
 
 Nothing in this module is Telegram-specific except that ``PromptSession`` /
 ``StopSession`` delegate to the channel adapter (lazy import) so the operator
@@ -514,7 +515,9 @@ OPERATOR_TOOL_SPEC: list[dict[str, Any]] = [
             "its own history, workspace, model, and tools; this chat stays the operator. Use "
             "when the user wants to continue work they started at their desk. If a turn is "
             "already running the text is injected; if the session is waiting for AskUser the "
-            "text is the answer; otherwise a new turn starts. Results are reported back here. "
+            "text is the answer; otherwise a new turn starts. Results are reported back here "
+            "(the target is watched until that turn finishes). To be notified when a session "
+            "finishes without sending an instruction, call WatchSession instead. "
             "If several sessions could match, ask which one first. If none is the right place, "
             "call CreateSession instead of doing the work here."
         ),
@@ -566,6 +569,34 @@ OPERATOR_TOOL_SPEC: list[dict[str, Any]] = [
             "required": ["session"],
         },
     },
+    {
+        "name": "WatchSession",
+        "description": (
+            "Subscribe this operator chat to another session's next turn completion. "
+            "When that turn finishes the user gets a tagged Telegram report (session id, "
+            "status, short result) without starting a turn here. Use this when the user "
+            "asks to watch sessions or be notified when they finish. Do not ScheduleTask "
+            "a recurring poll to check progress. Accepts a session id, id prefix, or "
+            "title fragment. Call once per session."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"session": {"type": "string"}},
+            "required": ["session"],
+        },
+    },
+    {
+        "name": "UnwatchSession",
+        "description": (
+            "Stop reporting the next turn completion for a session previously passed to "
+            "WatchSession or PromptSession. Accepts a session id, id prefix, or title fragment."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"session": {"type": "string"}},
+            "required": ["session"],
+        },
+    },
 ]
 OPERATOR_TOOLS = frozenset(t["name"] for t in OPERATOR_TOOL_SPEC)
 
@@ -576,13 +607,17 @@ OPERATOR_SYSTEM_EXTRA = (
     "they were working on, call ListSessions, then SessionDigest on the likely match, and "
     "summarize. To continue work that belongs in another session, call PromptSession with "
     "a clear instruction; that session keeps its own history, workspace, and tools, and "
-    "the result is reported back here. If none of the existing sessions is the right "
-    "place, call CreateSession with a title (and text to start work); the new chat shows "
-    "up in the web sidebar. Replying to a tagged report on Telegram injects "
-    "into that session without asking you. If more than one session could match, ask "
-    "which. Do not redo long-running work that belongs to another session; prompt or "
-    "create one instead. PromptSession and CreateSession already ping the user with a "
-    "short ack when they start a turn."
+    "the result is reported back here. If the user asks you to watch sessions or to be "
+    "notified when their turns finish, call WatchSession for each one. Completions arrive "
+    "automatically as tagged Telegram reports (no further turn on this chat). Never "
+    "ScheduleTask a recurring minute — or any poll — to check another session's progress: "
+    "that starts a full turn on this operator session and blocks incoming Telegram "
+    "messages. If none of the existing sessions is the right place, call CreateSession "
+    "with a title (and text to start work); the new chat shows up in the web sidebar. "
+    "Replying to a tagged report on Telegram injects into that session without asking "
+    "you. If more than one session could match, ask which. Do not redo long-running work "
+    "that belongs to another session; prompt, watch, or create one instead. PromptSession "
+    "and CreateSession already ping the user with a short ack when they start a turn."
 )
 
 
@@ -664,6 +699,14 @@ async def run_operator_tool(name: str, inp: dict[str, Any], ctx: dict[str, Any])
         from orbweaver.channels.telegram import stop_session_from_operator
 
         return await stop_session_from_operator(store, operator, inp)
+    if name == "WatchSession":
+        from orbweaver.channels.telegram import watch_session_from_operator
+
+        return await watch_session_from_operator(store, operator, inp)
+    if name == "UnwatchSession":
+        from orbweaver.channels.telegram import unwatch_session_from_operator
+
+        return await unwatch_session_from_operator(store, operator, inp)
     return f"unknown operator tool {name}"
 
 

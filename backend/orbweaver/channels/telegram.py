@@ -956,6 +956,79 @@ async def stop_session_from_operator(store: Store, operator: Entity, inp: dict[s
     return json.dumps({"stopped": True, "session": str(target.id)})
 
 
+async def _resolve_operator_target(
+    store: Store, operator: Entity, ref: str
+) -> tuple[Entity | None, str | None]:
+    """(target, error JSON/text). ``ref`` already stripped."""
+    if not ref:
+        return None, "error: session is required (id, id prefix, or title fragment)"
+    try:
+        target = await router.find_session(store, ref, exclude={operator.id})
+    except router.AmbiguousSessionRef as e:
+        return None, json.dumps(
+            {
+                "error": str(e),
+                "matches": [
+                    {"id": str(m.id), "title": str((m.jsonld or {}).get("title") or "")}
+                    for m in e.matches
+                ],
+            }
+        )
+    if target is None:
+        return None, f"error: no session matches '{ref}'"
+    return target, None
+
+
+async def watch_session_from_operator(store: Store, operator: Entity, inp: dict[str, Any]) -> str:
+    """Subscribe the operator to ``session``'s next ``turn_done`` without starting a turn."""
+    fresh = await store.get_entity(operator.id) or operator
+    ref = str(inp.get("session") or "").strip()
+    target, err = await _resolve_operator_target(store, fresh, ref)
+    if err or target is None:
+        return err or "error: session is required (id, id prefix, or title fragment)"
+    await _mark_watched(store, fresh, target)
+    digest = await router.session_digest(store, target.id)
+    title = str(digest.get("title") or "session")
+    return json.dumps(
+        {
+            "action": "watching",
+            "session": str(target.id),
+            "short_id": str(target.id)[:8],
+            "title": title,
+            "tag": session_tag(title, target.id),
+            "running": bool(digest.get("running")),
+            "running_channel": str(digest.get("running_channel") or ""),
+            "pending_question": str(digest.get("pending_question") or ""),
+            "last_assistant_text": str(digest.get("last_assistant_text") or "")[:600],
+            "note": (
+                "This chat will receive a tagged report when the session's next turn "
+                "finishes. Do not ScheduleTask a progress poll; that occupies this "
+                "operator session."
+            ),
+        }
+    )
+
+
+async def unwatch_session_from_operator(store: Store, operator: Entity, inp: dict[str, Any]) -> str:
+    fresh = await store.get_entity(operator.id) or operator
+    ref = str(inp.get("session") or "").strip()
+    target, err = await _resolve_operator_target(store, fresh, ref)
+    if err or target is None:
+        return err or "error: session is required (id, id prefix, or title fragment)"
+    await router.unwatch_prompted(store, fresh, target.id)
+    _forget_watch(target.id)
+    events = await store.list_events(target.id)
+    title = _title_of(target, events)
+    return json.dumps(
+        {
+            "action": "unwatched",
+            "session": str(target.id),
+            "title": title,
+            "tag": session_tag(title, target.id),
+        }
+    )
+
+
 async def remember_open_ask(store: Store, operator: Entity, session_id: UUID) -> None:
     """The next plain Telegram message answers ``session_id``'s AskUser."""
     fresh = await store.get_entity(operator.id) or operator

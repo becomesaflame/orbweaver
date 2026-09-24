@@ -36,6 +36,8 @@ SAFE_ALLOWLIST = frozenset(
         "PromptSession",
         "CreateSession",
         "StopSession",
+        "WatchSession",
+        "UnwatchSession",
     }
 )
 

@@ -687,7 +687,10 @@ TOOL_SPEC = [
             "Ask the host to schedule a job. due_at is ISO-8601. "
             "Optional recurrence: minute, hour, or day (also 'every hour'), "
             "or a 5-field cron expression (minute hour day-of-month month "
-            "day-of-week), e.g. '0 9 * * mon'. Omit recurrence for a one-shot."
+            "day-of-week), e.g. '0 9 * * mon'. Omit recurrence for a one-shot. "
+            "Do not use this to poll whether another session's turn has finished; "
+            "call WatchSession instead. A recurring minute job on this chat holds "
+            "the turn lock and blocks incoming messages."
         ),
         "input_schema": {
             "type": "object",
