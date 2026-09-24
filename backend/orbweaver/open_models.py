@@ -19,6 +19,9 @@ class OpenModel:
     reasoning: bool = False
     max_tokens: int = 4096
     description: str = ""
+    # True when Earth Runtime serves this id only through OpenRouter.
+    # Picker labels for these end with " *".
+    openrouter: bool = False
 
 
 OPEN_MODELS: dict[str, OpenModel] = {
@@ -41,29 +44,47 @@ OPEN_MODELS: dict[str, OpenModel] = {
         max_tokens=8192,
         description="Largest open-weight option (128K context)",
     ),
+    "deepseek-v4-flash": OpenModel(
+        id="deepseek-v4-flash",
+        label="DeepSeek V4 Flash",
+        context_window=262_144,
+        reasoning=True,
+        max_tokens=16_384,
+        description="DeepSeek V4 Flash on Earth Runtime GPUs (262K context)",
+    ),
     "deepseek-v4-flash-0731": OpenModel(
         id="deepseek-v4-flash-0731",
-        label="DeepSeek V4 Flash",
+        label="DeepSeek V4 Flash 0731",
         context_window=262_144,
         reasoning=True,
         max_tokens=16_384,
         description="Reasoning-capable, good for complex problems (262K context)",
     ),
+    "qwen3-0.6b": OpenModel(
+        id="qwen3-0.6b",
+        label="Qwen 3 0.6B",
+        context_window=PROVISIONAL_CONTEXT_WINDOW,
+        description="Small Qwen 3 on Earth Runtime GPUs (context window unconfirmed)",
+    ),
     # Live on Earth Runtime but the provider's /models gives no context length,
     # so these carry the conservative 128K default until issue #155 confirms them.
     # An id missing from this table routes nowhere (see llm.select_provider), which
     # is how ORBWEAVER_TELEGRAM_MODEL=glm-5.3-flash 404'd against Anthropic.
+    # openrouter=True: Earth Runtime lists these as OpenRouter catalog only
+    # (no "our GPUs" row). Picker menus append " *".
     "glm-5.3": OpenModel(
         id="glm-5.3",
         label="GLM 5.3",
         context_window=PROVISIONAL_CONTEXT_WINDOW,
-        description="GLM 5.3 (context window unconfirmed)",
+        description="GLM 5.3 via OpenRouter (context window unconfirmed)",
+        openrouter=True,
     ),
     "glm-5.3-flash": OpenModel(
         id="glm-5.3-flash",
         label="GLM 5.3 Flash",
         context_window=PROVISIONAL_CONTEXT_WINDOW,
-        description="Faster GLM 5.3 (context window unconfirmed)",
+        description="Faster GLM 5.3 via OpenRouter (context window unconfirmed)",
+        openrouter=True,
     ),
     "deepseek-v4.1-flash": OpenModel(
         id="deepseek-v4.1-flash",
@@ -71,25 +92,29 @@ OPEN_MODELS: dict[str, OpenModel] = {
         context_window=PROVISIONAL_CONTEXT_WINDOW,
         reasoning=True,
         max_tokens=16_384,
-        description="Newer DeepSeek V4 Flash (context window unconfirmed)",
+        description="DeepSeek V4.1 Flash via OpenRouter (context window unconfirmed)",
+        openrouter=True,
     ),
     "kimi-k3": OpenModel(
         id="kimi-k3",
         label="Kimi K3",
         context_window=PROVISIONAL_CONTEXT_WINDOW,
-        description="Kimi K3 (context window unconfirmed)",
+        description="Kimi K3 via OpenRouter (context window unconfirmed)",
+        openrouter=True,
     ),
     "minimax-m3": OpenModel(
         id="minimax-m3",
         label="MiniMax M3",
         context_window=PROVISIONAL_CONTEXT_WINDOW,
-        description="MiniMax M3 (context window unconfirmed)",
+        description="MiniMax M3 via OpenRouter (context window unconfirmed)",
+        openrouter=True,
     ),
     "nemotron-3-ultra": OpenModel(
         id="nemotron-3-ultra",
         label="Nemotron 3 Ultra",
         context_window=PROVISIONAL_CONTEXT_WINDOW,
-        description="Nemotron 3 Ultra (context window unconfirmed)",
+        description="Nemotron 3 Ultra via OpenRouter (context window unconfirmed)",
+        openrouter=True,
     ),
     "hy4": OpenModel(
         id="hy4",

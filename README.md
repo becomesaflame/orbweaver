@@ -39,10 +39,20 @@ The agent loop speaks Anthropic Messages internally. For open-weight models it m
 
 | `ORBWEAVER_MODEL` | Notes |
 | --- | --- |
-| `qwen3.6-35b` | Fastest; 262K context |
-| `qwen3.8-27b` | Dense 27B; 262K context |
-| `gpt-oss-120b` | Strongest of the three; 128K context |
-| `deepseek-v4-flash-0731` | Reasoning enforced; 262K context |
+| `qwen3.6-35b` | Earth Runtime GPUs; 262K context |
+| `qwen3.8-27b` | Earth Runtime GPUs; 262K context |
+| `qwen3-0.6b` | Earth Runtime GPUs |
+| `gpt-oss-120b` | Earth Runtime GPUs; 128K context |
+| `deepseek-v4-flash` | Earth Runtime GPUs; 262K context |
+| `deepseek-v4-flash-0731` | Earth Runtime GPUs; reasoning enforced; 262K context |
+| `deepseek-v4.1-flash` * | OpenRouter |
+| `glm-5.3` * | OpenRouter |
+| `glm-5.3-flash` * | OpenRouter |
+| `kimi-k3` * | OpenRouter |
+| `minimax-m3` * | OpenRouter |
+| `nemotron-3-ultra` * | OpenRouter |
+
+A trailing `*` is the same mark the web, VS Code, and Telegram model menus append: that id is served by OpenRouter, not Earth Runtime GPUs. Ids with both a GPU row and an OpenRouter fallback stay unmarked.
 
 Get a key from [earthruntime.com](https://earthruntime.com). The same catalog names work on `ORBWEAVER_CLASSIFIER_MODEL`, `ORBWEAVER_INJECTION_PROBE_MODEL`, and `ORBWEAVER_COMPACT_MODEL`: Claude ids stay on Anthropic, catalog names use Earth Runtime.
 
