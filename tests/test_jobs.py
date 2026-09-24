@@ -64,6 +64,21 @@ async def test_job_roundtrip():
 
 
 @pytest.mark.asyncio
+async def test_delete_job_removes_it():
+    store = reset_store_for_tests()
+    job = Job(
+        id=uuid4(),
+        due_at=datetime.now(UTC) + timedelta(hours=1),
+        payload={"message": "later"},
+    )
+    await store.put_job(job)
+    await store.delete_job(job.id)
+    assert job.id not in store.jobs
+    assert await store.due_jobs(datetime.now(UTC) + timedelta(days=2)) == []
+    await store.delete_job(job.id)
+
+
+@pytest.mark.asyncio
 async def test_sweep_runs_due_job(tmp_path: Path, monkeypatch):
     store = reset_store_for_tests()
     monkeypatch.setattr(settings, "anthropic_api_key", "")
@@ -146,6 +161,27 @@ async def test_schedule_tool_persists_job(tmp_path: Path):
     assert "job_id" in result
     jobs = await store.due_jobs(datetime.now(UTC) + timedelta(days=2))
     assert any(j.payload.get("message") == "ping later" for j in jobs)
+
+
+@pytest.mark.asyncio
+async def test_schedule_tool_job_can_be_deleted(tmp_path: Path):
+    store = reset_store_for_tests()
+    sid = uuid4()
+    due = datetime.now(UTC) + timedelta(hours=1)
+    result = await run_tools(
+        "ScheduleTask",
+        {"due_at": due.isoformat(), "message": "cancel me"},
+        {
+            "workspace": LocalWorkspace("workspace:default", str(tmp_path)),
+            "store": store,
+            "session_id": sid,
+        },
+    )
+    assert "job_id" in result
+    jobs = await store.due_jobs(datetime.now(UTC) + timedelta(days=2))
+    kept = next(j for j in jobs if j.payload.get("message") == "cancel me")
+    await store.delete_job(kept.id)
+    assert await store.due_jobs(datetime.now(UTC) + timedelta(days=2)) == []
 
 
 @pytest.mark.asyncio
