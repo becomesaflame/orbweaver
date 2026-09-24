@@ -176,6 +176,37 @@ async def test_running_turn_raises_busy_with_holder_channel():
 
 
 @pytest.mark.asyncio
+async def test_acquire_when_idle_runs_after_release_and_blocks_cron():
+    sid = uuid4()
+    holder = turns.acquire(sid, channel="cron")
+    assert holder is not None
+    parked = asyncio.Event()
+    got: dict = {}
+
+    async def wait_then_hold():
+        parked.set()
+        state = await turns.acquire_when_idle(sid, "telegram")
+        got["state"] = state
+        await asyncio.sleep(0.05)
+        turns.release(sid, state)
+
+    task = asyncio.create_task(wait_then_hold())
+    await parked.wait()
+    await _wait_until(lambda: turns.pending_waiters(sid) > 0)
+    assert turns.acquire(sid, channel="cron") is None
+    turns.release(sid, holder)
+    await _wait_until(lambda: got.get("state") is not None)
+    # cron must not steal the lock from the queued human turn
+    with pytest.raises(turns.TurnBusy) as ei:
+        async with turns.running_turn(sid, channel="cron"):
+            pass
+    assert ei.value.channel == "telegram"
+    await task
+    assert not turns.is_running(sid)
+    assert turns.pending_waiters(sid) == 0
+
+
+@pytest.mark.asyncio
 async def test_second_agent_turn_on_session_is_refused_and_log_stays_pairable(
     tmp_path, monkeypatch
 ):
@@ -274,7 +305,7 @@ def _telegram_update():
 
 
 @pytest.mark.asyncio
-async def test_telegram_handler_injects_instead_of_second_turn(tmp_path, monkeypatch):
+async def test_telegram_handler_queues_instead_of_second_turn(tmp_path, monkeypatch):
     store = reset_store_for_tests()
     sid = uuid4()
     await store.put_entity(_session(sid, channel="telegram", telegram_user_id=1))
@@ -289,18 +320,77 @@ async def test_telegram_handler_injects_instead_of_second_turn(tmp_path, monkeyp
     assert running is not None
 
     update = _telegram_update()
-    await tg._run_turn(update, MagicMock(), "second message")
+    task = asyncio.create_task(tg._run_turn(update, MagicMock(), "second message"))
+    await _wait_until(lambda: turns.pending_waiters(sid) > 0)
 
     fake_turn.assert_not_awaited()
     assert turns.get(sid) is running  # the handler did not steal or drop the lock
-    assert running.inject.is_set()
-    events = await store.list_events(sid)
-    assert [(e.kind, e.payload.get("text"), e.payload.get("injected")) for e in events] == [
-        ("user", "second message", True)
-    ]
-    reply = update.message.reply_text.await_args.args[0]
-    assert "already running" in reply
-    assert "web" in reply
+    assert not running.inject.is_set()
+    assert await store.list_events(sid) == []
+    ack = update.message.reply_text.await_args.args[0]
+    assert "already running" in ack
+    assert "queued" in ack
+    assert "added to it" not in ack
+    assert "web" in ack
+
+    turns.release(sid, running)
+    await task
+    fake_turn.assert_awaited_once()
+    assert fake_turn.await_args.args[2] == "second message"
+    assert not any(
+        e.payload.get("injected") for e in await store.list_events(sid) if e.kind == "user"
+    )
+
+
+@pytest.mark.asyncio
+async def test_telegram_user_message_gets_own_turn_when_cron_holds_session(
+    tmp_path, monkeypatch
+):
+    """Production: a progress-check cron held the operator session; a new human
+    Telegram request was injected into that turn (`injected: true`) and the user
+    was told to wait or /stop. The message must become its own turn after cron
+    releases — same `_run_turn` + registry path, no inject-and-forget.
+    """
+    store = reset_store_for_tests()
+    sid = uuid4()
+    await store.put_entity(_session(sid, channel="telegram", telegram_user_id=1))
+    fake_turn = AsyncMock(return_value=[])
+    monkeypatch.setattr(tg, "agent_turn", fake_turn)
+
+    async def fake_workspace(_update, _context, **_kw):
+        return await _bound(store, sid, _ws(tmp_path))
+
+    monkeypatch.setattr(tg, "_session_workspace", fake_workspace)
+    holder = turns.acquire(sid, channel="cron")
+    assert holder is not None
+
+    update = _telegram_update()
+    task = asyncio.create_task(
+        tg._run_turn(update, MagicMock(), "Add the DELETE route for cron jobs")
+    )
+    await _wait_until(lambda: turns.pending_waiters(sid) > 0)
+
+    fake_turn.assert_not_awaited()
+    assert turns.get(sid) is holder
+    assert not holder.inject.is_set()
+    assert await store.list_events(sid) == []
+    acks = [c.args[0] for c in update.message.reply_text.await_args_list]
+    assert acks
+    assert all("added to it" not in text for text in acks)
+    assert any("queued" in text for text in acks)
+    assert any("cron" in text for text in acks)
+
+    turns.release(sid, holder)
+    await task
+    fake_turn.assert_awaited_once()
+    assert fake_turn.await_args.args[2] == "Add the DELETE route for cron jobs"
+    assert fake_turn.await_args.kwargs.get("channel") == "telegram"
+    assert fake_turn.await_args.kwargs.get("turn_state") is not holder
+    assert not holder.inject.is_set()
+    assert not any(
+        e.payload.get("injected") for e in await store.list_events(sid) if e.kind == "user"
+    )
+    assert not turns.is_running(sid)
 
 
 @pytest.mark.asyncio

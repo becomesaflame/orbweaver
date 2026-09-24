@@ -54,7 +54,7 @@ from orbweaver.store import (
     new_uuid,
     session_at_id,
 )
-from orbweaver.turns import GatewayDraining, RunningTurn
+from orbweaver.turns import GatewayDraining, RunningTurn, acquire_when_idle
 from orbweaver.turns import acquire as acquire_turn
 from orbweaver.turns import get as get_running_turn
 from orbweaver.turns import release as release_turn
@@ -748,11 +748,11 @@ async def _session_workspace(update, context, *, operator_only: bool = False) ->
     return Bound(store=store, operator=operator, target=operator, ws=ws, kind=kind, chat_id=chat_id)
 
 
-def _busy_reply(state: RunningTurn) -> str:
-    via = f" ({state.channel})" if state.channel else ""
+def _queued_reply(state: RunningTurn | None) -> str:
+    via = f" ({state.channel})" if state and state.channel else ""
     return (
-        f"A turn is already running on this session{via}; your message was added to it. "
-        "Send /stop to cancel it, or wait for it to finish."
+        f"A turn is already running on this session{via}; your message is queued "
+        "and will start when it finishes. Send /stop to cancel the current turn."
     )
 
 
@@ -1061,16 +1061,28 @@ async def _run_turn(
             status = "stopped"
             return
         if state is None:
-            from orbweaver.app import inject_into_turn
-
             running = get_running_turn(session_id)
             if running is None:
                 reply = "A turn is already running on this session; send that again in a moment."
-            else:
-                await inject_into_turn(store, session_id, running, text, images)
-                reply = _busy_reply(running)
-            log.info("telegram: session %s busy, message injected into running turn", session_id)
-        else:
+                log.info("telegram: session %s busy but holder vanished; asking user to retry", session_id)
+                return
+            if update.message:
+                try:
+                    await update.message.reply_text(_queued_reply(running))
+                except Exception:
+                    log.exception("telegram queue ack failed")
+            log.info(
+                "telegram: session %s busy via %s; queuing user message for the next turn",
+                session_id,
+                running.channel or "unknown",
+            )
+            try:
+                state = await acquire_when_idle(session_id, CHANNEL)
+            except GatewayDraining:
+                reply = "Orbweaver is updating; send that again in a minute."
+                status = "stopped"
+                return
+        if state is not None:
             extra = TELEGRAM_IMAGE_HINT + " " + OPERATOR_SYSTEM_EXTRA
             tools = await router.operator_tools(bound.ws, CHANNEL)
             events = await agent_turn(

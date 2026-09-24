@@ -54,8 +54,12 @@ class GatewayDraining(Exception):
 
 # Subagents belong to an in-flight parent turn; blocking them would stall drain.
 _DRAIN_EXEMPT = frozenset({"subagent"})
+# Cron (and other automated holders) must not steal the lock while a human
+# Telegram/web turn is queued behind the current holder.
+_AUTOMATED_CHANNELS = frozenset({"cron"})
 
 _running: dict[UUID, RunningTurn] = {}
+_waiters: dict[UUID, list[asyncio.Event]] = {}
 _draining = False
 _current_session: ContextVar[UUID | None] = ContextVar("orbweaver_running_session", default=None)
 
@@ -108,18 +112,32 @@ def is_draining() -> bool:
     return _draining
 
 
+def _wake_next(session_id: UUID) -> None:
+    pending = _waiters.get(session_id)
+    if pending:
+        pending[0].set()
+
+
+def pending_waiters(session_id: UUID) -> int:
+    """Queued ``acquire_when_idle`` waiters for ``session_id`` (tests / cron yield)."""
+    return len(_waiters.get(session_id, []))
+
+
 def acquire(session_id: UUID, channel: str = "") -> RunningTurn | None:
     """Register a turn on ``session_id``. Return None when one is already running.
 
     The check-and-set is atomic under asyncio because there is no await here;
     callers must :func:`release` the returned state in a ``finally`` block.
     Raises :class:`GatewayDraining` when a deploy is waiting for idle and this
-    is not a subagent of an already-running turn.
+    is not a subagent of an already-running turn. Automated channels yield when
+    a human turn is already queued behind the current holder.
     """
     if session_id in _running:
         return None
     if _draining and channel not in _DRAIN_EXEMPT:
         raise GatewayDraining()
+    if channel in _AUTOMATED_CHANNELS and _waiters.get(session_id):
+        return None
     state = RunningTurn(channel=channel, session_id=session_id)
     _running[session_id] = state
     return state
@@ -129,6 +147,7 @@ def release(session_id: UUID, state: RunningTurn) -> None:
     """Drop ``state`` from the registry if it is still the one registered."""
     if _running.get(session_id) is state:
         _running.pop(session_id, None)
+        _wake_next(session_id)
 
 
 def get(session_id: UUID) -> RunningTurn | None:
@@ -170,7 +189,44 @@ async def running_turn(session_id: UUID, channel: str = "") -> AsyncIterator[Run
         release(session_id, state)
 
 
+async def acquire_when_idle(session_id: UUID, channel: str = "") -> RunningTurn:
+    """Acquire the session lock, waiting in FIFO order if another turn holds it.
+
+    The waiter stays registered until this call returns so an automated channel
+    cannot slip in between the previous release and this acquire. Raises
+    :class:`GatewayDraining` the same way :func:`acquire` does.
+    """
+    ev = asyncio.Event()
+    parked = False
+    try:
+        while True:
+            state = acquire(session_id, channel)
+            if state is not None:
+                return state
+            if not parked:
+                if session_id not in _running:
+                    continue
+                _waiters.setdefault(session_id, []).append(ev)
+                parked = True
+            else:
+                ev.clear()
+            await ev.wait()
+    finally:
+        if parked:
+            queued = _waiters.get(session_id)
+            if queued is not None:
+                try:
+                    queued.remove(ev)
+                except ValueError:
+                    pass
+                if not queued:
+                    _waiters.pop(session_id, None)
+            if session_id not in _running:
+                _wake_next(session_id)
+
+
 def reset_for_tests() -> None:
     global _draining
     _running.clear()
+    _waiters.clear()
     _draining = False
