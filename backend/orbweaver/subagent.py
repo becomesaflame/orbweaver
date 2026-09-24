@@ -29,7 +29,9 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-CHILD_BLOCKED_TOOLS = frozenset({"SpawnSubagent", "SubagentWait", "AskUser", "ScheduleTask"})
+CHILD_BLOCKED_TOOLS = frozenset(
+    {"SpawnSubagent", "SubagentWait", "AskUser", "ScheduleTask", "CancelTask"}
+)
 # Independent of the parent turn. Do not share a small cap that starves both.
 SUBAGENT_MAX_ROUNDS = 256
 RESULT_TEXT_CAP = 8000
