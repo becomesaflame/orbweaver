@@ -2020,7 +2020,47 @@
       if (!opts.skipHistory) loadHistory();
     }
 
+    // The rail scrolls (`.rail-list` is `overflow-y:auto`). paintSessions() is
+    // called from every /v1/sessions poll, from setActive(), and from rename /
+    // delete, and it rebuilds the list from scratch. Without this the node
+    // holding the scroll offset is thrown away and the rail snaps back to the
+    // top on the next poll while you are reading further down. Capture the
+    // scroll position (and the search box's focus/caret, which sits in the same
+    // column) before emptying the list and put them back after the repaint.
+    function captureRailView() {
+      const root = $("session-list");
+      const search = $("search");
+      return {
+        scrollTop: root.scrollTop,
+        searchFocused: document.activeElement === search,
+        searchStart: search.selectionStart,
+        searchEnd: search.selectionEnd,
+        searchScroll: search.scrollLeft
+      };
+    }
+    function restoreRailView(view) {
+      const root = $("session-list");
+      // Assigning scrollTop after the rows are in the DOM forces layout, so the
+      // value sticks instead of being clamped against the old (empty) height.
+      root.scrollTop = view.scrollTop;
+      const search = $("search");
+      if (view.searchScroll) search.scrollLeft = view.searchScroll;
+      if (!view.searchFocused) return;
+      if (document.activeElement !== search) search.focus();
+      try {
+        search.selectionStart = view.searchStart;
+        search.selectionEnd = view.searchEnd;
+      } catch (e) {}
+    }
     function paintSessions() {
+      const view = captureRailView();
+      try {
+        paintSessionsRows();
+      } finally {
+        restoreRailView(view);
+      }
+    }
+    function paintSessionsRows() {
       const q = $("search").value.trim().toLowerCase();
       const root = $("session-list");
       root.replaceChildren();

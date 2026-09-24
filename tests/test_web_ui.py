@@ -88,6 +88,15 @@ async def test_index_references_vendored_scripts():
             assert "function startActivityPoll()" in r.text
             assert "let refreshWaiters = null;" in r.text
             assert "function refreshSessionsOnce()" in r.text
+            # The rail scroll offset must survive a poll-driven repaint. The
+            # poll rebuilds #session-list from scratch, which threw away the
+            # scroll position (and the search box's focus) every 3-8s.
+            assert "function captureRailView()" in r.text
+            assert "function restoreRailView(view)" in r.text
+            assert "function paintSessionsRows()" in r.text
+            assert "const view = captureRailView();" in r.text
+            assert "restoreRailView(view);" in r.text
+            assert "root.scrollTop = view.scrollTop;" in r.text
             assert ".chat.running .chat-state .spin" in r.text
             assert "@keyframes chat-spin" in r.text
             assert "function markDuplicateUser()" in r.text
