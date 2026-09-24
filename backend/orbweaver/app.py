@@ -1444,6 +1444,16 @@ async def list_jobs(_u: dict = Depends(_user)) -> dict[str, Any]:
     }
 
 
+@app.delete("/v1/jobs/{job_id}")
+async def delete_job(job_id: UUID, _u: dict = Depends(_user)) -> dict[str, str]:
+    store = get_store()
+    jobs = await store.due_jobs(datetime.max.replace(tzinfo=UTC))
+    if not any(j.id == job_id for j in jobs):
+        raise HTTPException(404, "job not found")
+    await store.delete_job(job_id)
+    return {"id": str(job_id)}
+
+
 if WEB_DIR.is_dir():
     app.mount("/ui", StaticFiles(directory=str(WEB_DIR), html=True), name="ui")
 

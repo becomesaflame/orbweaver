@@ -1,4 +1,6 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -334,6 +336,43 @@ async def test_session_channel_vscode(auth_header):
         listed = await client.get("/v1/sessions", headers=auth_header)
         row = next(s for s in listed.json()["sessions"] if s["id"] == created.json()["id"])
         assert row["channel"] == "vscode"
+
+
+@pytest.mark.asyncio
+async def test_delete_job_cancels_scheduled_job(auth_header):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        due = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        created = await client.post(
+            "/v1/jobs",
+            json={"due_at": due, "message": "ping later"},
+            headers=auth_header,
+        )
+        assert created.status_code == 200, created.text
+        job_id = created.json()["id"]
+
+        listed = await client.get("/v1/jobs", headers=auth_header)
+        assert listed.status_code == 200, listed.text
+        assert any(j["id"] == job_id for j in listed.json()["jobs"])
+
+        deleted = await client.delete(f"/v1/jobs/{job_id}", headers=auth_header)
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["id"] == job_id
+
+        listed = await client.get("/v1/jobs", headers=auth_header)
+        assert job_id not in {j["id"] for j in listed.json()["jobs"]}
+
+
+@pytest.mark.asyncio
+async def test_delete_job_is_404_unknown_and_requires_auth(auth_header):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        missing = await client.delete(f"/v1/jobs/{uuid4()}", headers=auth_header)
+        assert missing.status_code == 404
+        assert missing.json()["detail"] == "job not found"
+
+        denied = await client.delete(f"/v1/jobs/{uuid4()}")
+        assert denied.status_code == 401
 
 
 @pytest.mark.asyncio
