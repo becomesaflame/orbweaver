@@ -709,6 +709,20 @@ TOOL_SPEC = [
         },
     },
     {
+        "name": "CancelTask",
+        "description": (
+            "Cancel a previously scheduled job by id so it stops running. "
+            "Use the job id returned by ScheduleTask."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Job id from ScheduleTask or /v1/jobs."},
+            },
+            "required": ["id"],
+        },
+    },
+    {
         "name": "SendPhoto",
         "description": (
             "Send an image file from the workspace to the user on Telegram. "
@@ -1579,6 +1593,15 @@ async def run_tools(name: str, inp: dict[str, Any], ctx: dict[str, Any]) -> str:
         )
         await store.put_job(job)
         return json.dumps({"job_id": str(job.id), "due_at": due.isoformat()})
+    if name == "CancelTask":
+        raw = str(inp.get("id") or "").strip()
+        try:
+            job_id = UUID(raw)
+        except ValueError:
+            return f"invalid job id: {raw}"
+        if not await store.delete_job(job_id):
+            return f"job not found: {job_id}"
+        return json.dumps({"job_id": str(job_id), "status": "deleted"})
     if name == "SendPhoto":
         from orbweaver.channels.telegram import send_session_photo
 

@@ -44,6 +44,14 @@ async def test_session_and_turn_without_anthropic(tmp_path: Path, monkeypatch, a
 
 
 @pytest.mark.asyncio
+async def test_delete_job_route_rejects_bad_id(auth_header):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        bad = await client.delete("/v1/jobs/not-a-uuid", headers=auth_header)
+        assert bad.status_code == 422, bad.text
+
+
+@pytest.mark.asyncio
 async def test_rejects_absolute_workspace_uri(auth_header):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -180,8 +181,68 @@ async def test_schedule_tool_job_can_be_deleted(tmp_path: Path):
     assert "job_id" in result
     jobs = await store.due_jobs(datetime.now(UTC) + timedelta(days=2))
     kept = next(j for j in jobs if j.payload.get("message") == "cancel me")
-    await store.delete_job(kept.id)
+    assert await store.delete_job(kept.id) is True
+    assert await store.delete_job(kept.id) is False
     assert await store.due_jobs(datetime.now(UTC) + timedelta(days=2)) == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_tool_deletes_job(tmp_path: Path):
+    store = reset_store_for_tests()
+    sid = uuid4()
+    due = datetime.now(UTC) + timedelta(hours=1)
+    scheduled = await run_tools(
+        "ScheduleTask",
+        {"due_at": due.isoformat(), "message": "ping later"},
+        {
+            "workspace": LocalWorkspace("workspace:default", str(tmp_path)),
+            "store": store,
+            "session_id": sid,
+        },
+    )
+    job_id = json.loads(scheduled)["job_id"]
+    assert await store.due_jobs(datetime.now(UTC) + timedelta(days=2)) != []
+    result = await run_tools(
+        "CancelTask",
+        {"id": job_id},
+        {
+            "workspace": LocalWorkspace("workspace:default", str(tmp_path)),
+            "store": store,
+            "session_id": sid,
+        },
+    )
+    assert "deleted" in result
+    assert await store.due_jobs(datetime.now(UTC) + timedelta(days=2)) == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_tool_reports_missing_job(tmp_path: Path):
+    store = reset_store_for_tests()
+    result = await run_tools(
+        "CancelTask",
+        {"id": str(uuid4())},
+        {
+            "workspace": LocalWorkspace("workspace:default", str(tmp_path)),
+            "store": store,
+            "session_id": uuid4(),
+        },
+    )
+    assert "not found" in result
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_tool_rejects_bad_id(tmp_path: Path):
+    store = reset_store_for_tests()
+    result = await run_tools(
+        "CancelTask",
+        {"id": "not-a-uuid"},
+        {
+            "workspace": LocalWorkspace("workspace:default", str(tmp_path)),
+            "store": store,
+            "session_id": uuid4(),
+        },
+    )
+    assert "invalid job id" in result
 
 
 @pytest.mark.asyncio
