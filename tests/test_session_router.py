@@ -3,6 +3,7 @@
 These run the real ``agent_turn`` (scripted Anthropic client) so the cross-channel
 paths are exercised end to end: PromptSession answers a web ``AskUser``; a watched
 web turn's result is delivered to the chat; unwatched completions stay quiet;
+WatchSession subscribes without a polling cron that would hold the operator lock;
 reply-to a tagged report injects; leftover ``attached_session`` is ignored.
 """
 
@@ -348,6 +349,151 @@ async def test_web_turn_result_is_delivered_when_watched(tmp_path, monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_watch_session_notifies_without_cron_holding_operator_lock(
+    tmp_path, monkeypatch, auth_header
+):
+    """Watching a web session must not poll via cron on the operator.
+
+    Tonight a 1-minute progress cron on the Telegram operator held the
+    per-session turn lock, so later messages were refused. WatchSession
+    plus the existing ``turn_done`` sink reports completion without
+    occupying the operator.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    llm = _install_llm(
+        monkeypatch,
+        _ScriptedAnthropic(
+            [
+                SimpleNamespace(
+                    content=[_ToolUse("WatchSession", {"session": "Ship the router"}, "tu-watch")]
+                ),
+                _text("Watching Ship the router. I'll get a report when it finishes."),
+            ]
+        ),
+    )
+    store = reset_store_for_tests()
+    sent: list[tuple[int, str]] = []
+
+    async def fake_notify(chat_id, text):
+        sent.append((chat_id, text))
+
+    monkeypatch.setattr(tg, "notify_telegram_chat", fake_notify)
+    web = _session(uuid4(), title="Ship the router", channel="web")
+    await store.put_entity(web)
+    update, context = _update(chat_id=900), _context()
+    await tg._run_turn(update, context, "watch the ship session")
+
+    op = (await tg._session_workspace(update, context)).operator
+    assert turns.get(op.id) is None
+    assert await store.due_jobs(datetime.now(UTC) + timedelta(days=3650)) == []
+    results = {
+        e.payload["tool_use_id"]: json.loads(e.payload["content"])
+        for e in await store.list_events(op.id)
+        if e.kind == "tool_result"
+    }
+    assert results["tu-watch"]["action"] == "watching"
+    assert results["tu-watch"]["session"] == str(web.id)
+    assert web.id in router.prompted_ids(await store.get_entity(op.id))
+
+    llm._responses.append(_text("Tests are green, PR is up."))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.post(
+            f"/v1/sessions/{web.id}/turns", json={"text": "run the tests"}, headers=auth_header
+        )
+        assert r.status_code == 200
+    await _drain_tasks()
+    assert sent
+    assert sent[-1][0] == 900
+    assert "Ship the router" in sent[-1][1]
+    assert "Tests are green, PR is up." in sent[-1][1]
+    assert turns.get(op.id) is None
+
+    llm._responses.append(_text("got the ping"))
+    await tg._run_turn(update, context, "anything new?")
+    assert [e.payload.get("text") for e in await store.list_events(op.id) if e.kind == "user"][-1] == (
+        "anything new?"
+    )
+    assert turns.get(op.id) is None
+    assert await store.due_jobs(datetime.now(UTC) + timedelta(days=3650)) == []
+
+
+@pytest.mark.asyncio
+async def test_minute_cron_on_operator_blocks_telegram_message(tmp_path, monkeypatch):
+    """The production failure: a recurring progress cron occupies the operator lock."""
+    from datetime import UTC, datetime, timedelta
+
+    from orbweaver.channels.cron import sweep_and_wait
+    from orbweaver.store import Job
+
+    _install_llm(
+        monkeypatch,
+        _ScriptedAnthropic([_text("still running"), _text("operator after cron")], delay=0.35),
+    )
+    store = reset_store_for_tests()
+    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
+    await store.put_job(
+        Job(
+            id=uuid4(),
+            due_at=datetime.now(UTC) - timedelta(seconds=1),
+            payload={"message": "check progress on the three web sessions"},
+            recurrence="minute",
+            session_id=op.id,
+        )
+    )
+    update, context = _update(chat_id=900), _context()
+    context.user_data["session_id"] = str(op.id)
+
+    sweep_task = asyncio.create_task(sweep_and_wait())
+    running = None
+    for _ in range(80):
+        running = turns.get(op.id)
+        if running is not None:
+            break
+        await asyncio.sleep(0.02)
+    assert running is not None
+    assert running.channel == "cron"
+    assert turns.acquire(op.id, channel="telegram") is None
+
+    # #202 queues the human turn behind the cron holder; it must not start now.
+    queued = asyncio.create_task(tg._run_turn(update, context, "are they done?"))
+    for _ in range(50):
+        if update.message.reply_text.await_count:
+            break
+        await asyncio.sleep(0.02)
+    reply = update.message.reply_text.await_args.args[0]
+    assert "A turn is already running on this session" in reply
+    assert "cron" in reply
+    assert "queued" in reply
+    assert turns.pending_waiters(op.id) >= 1
+    assert turns.get(op.id) is not None and turns.get(op.id).channel == "cron"
+
+    await sweep_task
+    await queued
+    assert turns.get(op.id) is None
+
+
+@pytest.mark.asyncio
+async def test_watch_and_unwatch_operator_tools(tmp_path):
+    store = reset_store_for_tests()
+    op = await tg.session_for_telegram_user(store, 42, chat_id=900)
+    web = _session(uuid4(), title="Ship the router", channel="web")
+    await store.put_entity(web)
+    ctx = {"store": store, "session_id": op.id}
+
+    watched = json.loads(await router.run_operator_tool("WatchSession", {"session": "ship"}, ctx))
+    assert watched["action"] == "watching"
+    assert watched["session"] == str(web.id)
+    assert web.id in router.prompted_ids(await store.get_entity(op.id))
+    assert tg._watched_chats[web.id] == 900
+
+    gone = json.loads(await router.run_operator_tool("UnwatchSession", {"session": str(web.id)}, ctx))
+    assert gone["action"] == "unwatched"
+    assert web.id not in router.prompted_ids(await store.get_entity(op.id))
+    assert web.id not in tg._watched_chats
+
+
+@pytest.mark.asyncio
 async def test_send_photo_on_prompted_session_uses_operator_chat(tmp_path, monkeypatch):
     import httpx
 
@@ -627,7 +773,10 @@ async def test_operator_turn_lists_and_prompts(tmp_path, monkeypatch):
     names = {t["name"] for t in llm.calls[0]["tools"]}
     assert router.OPERATOR_TOOLS <= names
     assert "AttachSession" not in names
-    assert "dispatcher" in json.dumps(llm.calls[0]["system"])
+    system = json.dumps(llm.calls[0]["system"])
+    assert "dispatcher" in system
+    assert "WatchSession" in system
+    assert "recurring minute" in system
     await _drain_tasks()
     assert [e.payload.get("via") for e in await store.list_events(web.id) if e.kind == "user"][-1] == "telegram"
 
@@ -652,6 +801,8 @@ async def test_operator_tool_errors_are_reported_not_raised(tmp_path):
     assert (await router.run_operator_tool("PromptSession", {"session": "zzz", "text": "go"}, ctx)).startswith("error")
     assert (await router.run_operator_tool("SessionDigest", {}, ctx)).startswith("error")
     assert (await router.run_operator_tool("StopSession", {"session": "zzz"}, ctx)).startswith("error")
+    assert (await router.run_operator_tool("WatchSession", {"session": "zzz"}, ctx)).startswith("error")
+    assert (await router.run_operator_tool("UnwatchSession", {}, ctx)).startswith("error")
     assert (await router.run_operator_tool("CreateSession", {}, ctx)).startswith("error")
 
 
@@ -710,7 +861,13 @@ async def test_create_session_idle_prompts_and_rejects_bad_workspace(tmp_path, m
 async def test_operator_tools_are_allowlisted(tmp_path):
     ws = _ws(tmp_path)
     for name in router.OPERATOR_TOOLS:
-        if name in {"PromptSession", "StopSession", "SessionDigest"}:
+        if name in {
+            "PromptSession",
+            "StopSession",
+            "SessionDigest",
+            "WatchSession",
+            "UnwatchSession",
+        }:
             inp = {"session": "x", "text": "hi"}
         elif name == "CreateSession":
             inp = {"title": "x"}

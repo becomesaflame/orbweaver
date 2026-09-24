@@ -951,16 +951,31 @@ async def _run_turn(
             raise
         finally:
             release_turn(session_id, state)
+            channel = _stored_channel(sess.jsonld) or "web"
             if result is not None:
-                done = {"status": result.get("status"), "user_seq": result.get("user_seq")}
-                _last_turn_done[session_id] = done
+                done = {
+                    "status": result.get("status"),
+                    "user_seq": result.get("user_seq"),
+                    "channel": channel,
+                }
+                _last_turn_done[session_id] = {
+                    "status": done["status"],
+                    "user_seq": done["user_seq"],
+                }
                 _broadcast(session_id, {"kind": "turn_done", **done})
             else:
+                done = {
+                    "status": "error",
+                    "user_seq": state.user_seq,
+                    "detail": failure or "turn failed",
+                    "channel": channel,
+                }
                 _last_turn_done[session_id] = {
                     "status": "error",
                     "user_seq": state.user_seq,
                     "detail": failure or "turn failed",
                 }
+                _broadcast(session_id, {"kind": "turn_done", **done})
 
 
 @app.post("/v1/sessions/{session_id}/turns")
