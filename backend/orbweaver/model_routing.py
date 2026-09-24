@@ -166,7 +166,11 @@ def unsupported_configured_models() -> list[tuple[str, str]]:
 
 
 def model_label(model: str) -> str:
-    """Short picker name; falls back to the id."""
+    """Short picker name; falls back to the id.
+
+    OpenRouter-only catalog ids (no Earth Runtime GPU row) get a trailing
+    `` *`` so web, VS Code, and Telegram menus can tell them apart.
+    """
     mid = (model or "").strip()
     if is_auto_model(mid):
         return AUTO_MODEL_LABEL
@@ -174,6 +178,8 @@ def model_label(model: str) -> str:
         return CLAUDE_MODEL_LABELS[mid]
     spec = OPEN_MODELS.get(mid)
     if spec is not None:
+        if spec.openrouter:
+            return f"{spec.label} *"
         return spec.label
     return mid
 
@@ -207,16 +213,20 @@ def resolve_model_pick(
     lowered = {mid.lower(): mid for mid in catalog}
     if q.lower() in lowered:
         return lowered[q.lower()], [lowered[q.lower()]]
-    label_exact = [mid for mid in catalog if model_label(mid).lower() == q.lower()]
+    def _bare(text: str) -> str:
+        return text.strip().removesuffix("*").strip().lower()
+
+    bare = _bare(q)
+    label_exact = [mid for mid in catalog if _bare(model_label(mid)) == bare]
     if len(label_exact) == 1:
         return label_exact[0], label_exact
-    needle = q.lower()
+    needle = bare
 
     def _starts(mid: str) -> bool:
-        return mid.lower().startswith(needle) or model_label(mid).lower().startswith(needle)
+        return mid.lower().startswith(needle) or _bare(model_label(mid)).startswith(needle)
 
     def _contains(mid: str) -> bool:
-        return needle in mid.lower() or needle in model_label(mid).lower()
+        return needle in mid.lower() or needle in _bare(model_label(mid))
 
     starts = [mid for mid in catalog if _starts(mid)]
     if len(starts) == 1:

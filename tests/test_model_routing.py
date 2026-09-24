@@ -155,6 +155,29 @@ def test_supported_models_and_routing(channel_models):
     assert format_model_id("auto") == "Auto"
     assert model_label("qwen3.6-35b") == "Qwen 3.6 35B"
     assert is_supported_model("auto")
+    # Earth Runtime GPU ids have no marker; OpenRouter-only catalog ids end with " *".
+    for gpu_id in (
+        "qwen3.6-35b",
+        "qwen3.8-27b",
+        "qwen3-0.6b",
+        "gpt-oss-120b",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
+    ):
+        assert gpu_id in rows
+        assert not rows[gpu_id]["label"].endswith("*")
+    for or_id in (
+        "deepseek-v4.1-flash",
+        "minimax-m3",
+        "glm-5.3-flash",
+        "kimi-k3",
+        "glm-5.3",
+        "nemotron-3-ultra",
+    ):
+        assert rows[or_id]["label"].endswith(" *")
+    assert rows["glm-5.3"]["label"] == "GLM 5.3 *"
+    assert resolve_model_pick("GLM 5.3")[0] == "glm-5.3"
+    assert resolve_model_pick("GLM 5.3 *")[0] == "glm-5.3"
 
 
 def test_supported_models_marks_missing_key(channel_models, monkeypatch):
