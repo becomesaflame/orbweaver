@@ -364,7 +364,11 @@ def test_hardened_sandbox_seccomp_filter_mode(live_root):
 
 
 def test_hardened_sandbox_seccomp_denies_unshare_with_eperm(live_root):
-    """The filter returns EPERM (not SIGSYS) so probing tools keep running."""
+    """The filter returns EPERM (not SIGSYS) so probing tools keep running.
+
+    The probe itself exits 0. A zero exit is success and must stay unlabeled,
+    even when stdout mentions the EPERM from the blocked unshare.
+    """
     if not seccomp_enabled():
         pytest.skip("seccomp resolved to off on this host")
     probe = (
@@ -373,7 +377,8 @@ def test_hardened_sandbox_seccomp_denies_unshare_with_eperm(live_root):
     )
     out = run_sandboxed(probe, live_root, timeout=15)
     assert "unshare -1 Operation not permitted" in out, out
-    assert "sandbox_denied: syscall" in out
+    assert "exit 0" in out, out
+    assert "sandbox_denied:" not in out, out
 
 
 def test_hardened_sandbox_seccomp_blocks_ptrace(live_root):
