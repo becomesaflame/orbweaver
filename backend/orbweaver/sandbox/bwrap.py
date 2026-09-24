@@ -658,7 +658,7 @@ def run_sandboxed(
     out = (stdout or "") + (stderr or "")
     _raise_if_bwrap_eperm(session.proc.returncode, out)
     return format_bash_result(
-        label_sandbox_output(out[-BASH_OUTPUT_CAP:]),
+        label_sandbox_output(out[-BASH_OUTPUT_CAP:], returncode=session.proc.returncode),
         returncode=session.proc.returncode,
         elapsed_s=time.monotonic() - started,
     )
@@ -704,7 +704,7 @@ async def run_sandboxed_async(
         )
     _raise_if_bwrap_eperm(session.proc.returncode, out)
     return format_bash_result(
-        label_sandbox_output(out[-BASH_OUTPUT_CAP:]),
+        label_sandbox_output(out[-BASH_OUTPUT_CAP:], returncode=session.proc.returncode),
         returncode=session.proc.returncode,
         elapsed_s=time.monotonic() - started,
     )

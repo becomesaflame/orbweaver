@@ -74,10 +74,17 @@ def syscall_denied() -> str:
     )
 
 
-def label_sandbox_output(out: str) -> str:
-    """Prefix unlabeled failures with a constraint the model can act on."""
+def label_sandbox_output(out: str, *, returncode: int | None = None) -> str:
+    """Prefix unlabeled failures with a constraint the model can act on.
+
+    A zero exit is success. Commit subjects and other stdout can contain phrases
+    like "connection refused" without the command having been blocked, and
+    labeling those makes the agent ask for ``full_network`` it does not need.
+    """
     text = out or ""
     if "sandbox_denied:" in text or "sandbox_unavailable:" in text:
+        return text
+    if returncode == 0:
         return text
     sock = _UNIX_HINT.search(text)
     if sock and ("no such file" in text.lower() or "connection refused" in text.lower()):

@@ -1014,7 +1014,7 @@ class LocalWorkspace:
             self.close_shell(key)
             return None
         set_session_cwd(key, res.cwd)
-        body = label_sandbox_output(res.output)[-BASH_OUTPUT_CAP:]
+        body = label_sandbox_output(res.output, returncode=res.returncode)[-BASH_OUTPUT_CAP:]
         if res.status == "error":
             body = f"error: {body}"
         return with_bash_header(
