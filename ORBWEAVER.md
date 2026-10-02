@@ -198,7 +198,10 @@ for log inspection. Do not restart the gateway or edit systemd units.
 When `ORBWEAVER_SELFHEAL=1`, the gateway fingerprints `orbweaver.*` ERROR
 tracebacks (and some `turn_aborted` reasons) and enqueues a headless turn on
 `workspace:orbweaver-selfheal`. Clone that sibling of `workspace:orbweaver`
-before enabling. `ORBWEAVER_SELFHEAL_TELEGRAM_CHAT_ID` gets a message when a
+before enabling. A tool result string is not an error: WebSearch used to report
+DuckDuckGo's bot wall as "No results", so intake never saw it. WebSearch now
+logs when every provider returns an unusable page. A genuine empty SERP
+stays a normal tool result. `ORBWEAVER_SELFHEAL_TELEGRAM_CHAT_ID` gets a message when a
 turn is enqueued and again when a PR URL is in the result (not on no-op /
 cooldown skips). Caps:
 `ORBWEAVER_SELFHEAL_DAILY_CAP` (default 3) and `ORBWEAVER_SELFHEAL_COOLDOWN_S`
