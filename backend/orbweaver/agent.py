@@ -446,6 +446,8 @@ TOOL_SPEC = [
         "description": (
             "Search the public web and return titled result URLs with snippets. Use this "
             "instead of guessing documentation URLs. Then WebFetch one or two promising links. "
+            '"No results" means that query had no hits. "WebSearch failed" means the search '
+            "provider itself is down. "
             "Call independent searches in parallel in one round."
         ),
         "input_schema": {
