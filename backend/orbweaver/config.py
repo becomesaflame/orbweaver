@@ -39,6 +39,25 @@ class Settings(BaseSettings):
     orbweaver_vscode_model: str = ""
     orbweaver_telegram_model: str = "auto"
     orbweaver_classifier_model: str = "claude-sonnet-4-6"
+    # Auto-mode permission engine. jev: Earth Runtime Decisions API (one
+    # constrained enum choice per request, no chat). llm: the two-stage
+    # transcript classifier on ORBWEAVER_CLASSIFIER_MODEL. auto (default):
+    # jev when DECISIONS_API_KEY / JEV_API_KEY is set, else llm.
+    orbweaver_classifier_engine: str = "auto"
+    # What a JEV transport/auth failure (401/403 expired key, 429, 5xx,
+    # timeout) falls back to: "llm" runs the transcript classifier, "ask"
+    # holds the action for a human like any other classifier error.
+    orbweaver_jev_fallback: str = "llm"
+    # JEV / Decisions API v1 (https://earthruntime.com/decisions/docs).
+    # DECISIONS_API_KEY is the name the docs use; JEV_API_KEY is an alias.
+    decisions_api_key: str = ""
+    jev_api_key: str = ""
+    decisions_api_url: str = "https://json.earthruntime.com/v1/decisions"
+    decisions_decoding: str = "parallel_constrained"  # or naive
+    # One inference at a time across tenants on the shared backend; be patient.
+    decisions_timeout_s: float = 45.0
+    # Context budget in characters. The API validates 1-16384; keep a margin.
+    decisions_context_chars: int = 16_000
     orbweaver_injection_probe_model: str = "claude-haiku-4-5"
     # Cheap model that classifies an Auto turn's prompt onto a concrete id.
     # Empty disables the LLM pass (ranked fallback only).
@@ -228,6 +247,20 @@ class Settings(BaseSettings):
     @property
     def openrouter_key(self) -> str:
         return self.openrouter_api_key.strip() or self.earthruntime_api_key.strip()
+
+    @property
+    def decisions_key(self) -> str:
+        return self.decisions_api_key.strip() or self.jev_api_key.strip()
+
+    @property
+    def classifier_engine(self) -> str:
+        """Resolved auto-mode engine: ``jev`` or ``llm``."""
+        spec = (self.orbweaver_classifier_engine or "auto").strip().lower()
+        if spec == "jev":
+            return "jev"
+        if spec == "llm":
+            return "llm"
+        return "jev" if self.decisions_key else "llm"
 
     event_budget_override: int | None = None
 

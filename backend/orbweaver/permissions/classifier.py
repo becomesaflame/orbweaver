@@ -90,9 +90,8 @@ def to_classifier_input(name: str, inp: dict[str, Any]) -> Any:
     return inp
 
 
-def build_transcript(
-    events: list[Event], pending_name: str, pending_input: dict[str, Any]
-) -> str:
+def transcript_lines(events: list[Event]) -> list[str]:
+    """JSONL lines of user text and prior tool calls (no assistant text, no results)."""
     lines: list[str] = []
     for ev in events:
         if ev.kind == "user":
@@ -102,6 +101,13 @@ def build_transcript(
             if encoded == "":
                 continue
             lines.append(json.dumps({ev.payload.get("name"): encoded}, ensure_ascii=False))
+    return lines
+
+
+def build_transcript(
+    events: list[Event], pending_name: str, pending_input: dict[str, Any]
+) -> str:
+    lines = transcript_lines(events)
     encoded = to_classifier_input(pending_name, pending_input)
     if encoded != "":
         lines.append(json.dumps({pending_name: encoded}, ensure_ascii=False))
@@ -165,7 +171,50 @@ async def classify_action(
     extra_framing: str = "",
     client=None,
 ) -> dict[str, Any]:
-    """Return {verdict: allow|ask|deny, should_block, should_ask, reason, stage}."""
+    """Return {verdict: allow|ask|deny, should_block, should_ask, reason, stage}.
+
+    Engine selection (``settings.classifier_engine``): ``jev`` routes the
+    decision to the Earth Runtime Decisions API; ``llm`` runs the two-stage
+    transcript classifier below. An explicitly passed ``client`` always means
+    the LLM path (tests and callers that inject a provider).
+    """
+    if client is None and settings.classifier_engine == "jev":
+        from orbweaver.permissions.decisions import decide_action
+
+        result = await decide_action(
+            events, tool_name, tool_input, workspace=workspace, extra_framing=extra_framing
+        )
+        fallback = (settings.orbweaver_jev_fallback or "llm").strip().lower()
+        if result.get("stage") != "jev_error" or fallback != "llm":
+            return result
+        log.warning("jev unavailable (%s); falling back to LLM classifier", result.get("reason"))
+        fallback_from: dict[str, Any] | None = result
+    else:
+        fallback_from = None
+
+    result = await _classify_with_llm(
+        events,
+        tool_name,
+        tool_input,
+        workspace=workspace,
+        extra_framing=extra_framing,
+        client=client,
+    )
+    if fallback_from is not None:
+        result["fallback_from"] = "jev"
+        result["jev_error"] = fallback_from.get("reason")
+    return result
+
+
+async def _classify_with_llm(
+    events: list[Event],
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    workspace=None,
+    extra_framing: str = "",
+    client=None,
+) -> dict[str, Any]:
     transcript = build_transcript(events, tool_name, tool_input)
     intent = load_project_intent(workspace) if workspace is not None else ""
     user_content = transcript
